@@ -37,8 +37,15 @@ class DesktopCapture {
  private:
   bool CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error);
   bool CaptureGdi(DesktopSnapshot& snapshot, std::wstring& error);
-  void EnumerateWindows(DesktopSnapshot& snapshot);
 };
+
+// Rejects an uninitialized/empty capture before it reaches the overlay. Alpha is deliberately
+// ignored because desktop duplication leaves it undefined on SDR outputs.
+bool SnapshotIsBlank(const DesktopSnapshot& snapshot);
+
+// Fills snapshot.windows with candidate windows that overlap the virtual desktop. Only needed
+// for Window mode, so callers run it off the capture path (e.g. the overlay background thread).
+void EnumerateWindows(DesktopSnapshot& snapshot);
 
 float HalfToFloat(uint16_t half);
 uint16_t FloatToHalf(float value);

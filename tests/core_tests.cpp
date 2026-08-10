@@ -1,3 +1,4 @@
+#include "capture.hpp"
 #include "config.hpp"
 #include "editor.hpp"
 #include "exporter.hpp"
@@ -44,6 +45,7 @@ void TestConfigRoundTrip() {
   config.text.size = 42;
   config.text.opacity = 0.75f;
   config.text.vertical = true;
+  config.text.shadow = true;
   config.text.color.rgba = 0x34C759FF;
   std::wstring error;
   CHECK(store.Save(config, &error));
@@ -57,6 +59,7 @@ void TestConfigRoundTrip() {
   CHECK(loaded.text.size == 42);
   CHECK(std::abs(loaded.text.opacity - 0.75f) < 0.001f);
   CHECK(loaded.text.vertical);
+  CHECK(loaded.text.shadow);
   CHECK(loaded.text.color.rgba == 0x34C759FF);
 }
 
@@ -74,7 +77,7 @@ void TestConfigDamagedFieldRecovery() {
   const rc::AppConfig loaded = store.Load();
   CHECK(loaded.launchAtLogin);
   CHECK(loaded.autoSaveOnCopy);
-  CHECK(loaded.jpegQuality == 95);
+  CHECK(loaded.jpegQuality == 80);
   CHECK(loaded.hotkeys.size() == 1);
 }
 
@@ -94,6 +97,41 @@ void TestEditorHistory() {
   CHECK(document.Commands().size() == 2);
   document.Add(rc::TextCommand{{5, 6}, L"文字", {}});
   CHECK(document.Commands().size() == 3);
+}
+
+void TestBlankCaptureGuard() {
+  rc::DesktopSnapshot snapshot;
+  snapshot.virtualBounds = {0, 0, 16, 16};
+  snapshot.width = 16;
+  snapshot.height = 16;
+  snapshot.bgraStride = snapshot.width * 4;
+  snapshot.bgra.assign(static_cast<size_t>(snapshot.bgraStride * snapshot.height), 0);
+  for (size_t index = 3; index < snapshot.bgra.size(); index += 4) snapshot.bgra[index] = 255;
+  CHECK(rc::SnapshotIsBlank(snapshot));
+
+  // Values below four are treated as harmless capture noise; a genuinely visible pixel must
+  // make the snapshot usable.
+  snapshot.bgra[8 * snapshot.bgraStride + 8 * 4 + 1] = 32;
+  CHECK(!rc::SnapshotIsBlank(snapshot));
+
+  rc::DesktopSnapshot invalid;
+  CHECK(rc::SnapshotIsBlank(invalid));
+}
+
+void TestPenPressureCurve() {
+  const float slow = rc::PenWidthScaleForSpeed(0.0f);
+  const float medium = rc::PenWidthScaleForSpeed(500.0f);
+  const float fast = rc::PenWidthScaleForSpeed(1400.0f);
+  CHECK(slow > medium);
+  CHECK(medium > fast);
+  CHECK(fast >= 0.5f);
+
+  rc::StrokeSetting style;
+  style.width = 10.0f;
+  rc::PenCommand pen{{{0, 0}, {20, 0}, {40, 0}}, style, {1.35f, 0.9f, 0.55f}};
+  CHECK(std::abs(rc::PenPointWidth(pen, 0) - 13.5f) < 0.01f);
+  CHECK(std::abs(rc::PenPointWidth(pen, 2) - 5.5f) < 0.01f);
+  CHECK(std::abs(rc::PenMaximumWidth(pen) - 13.5f) < 0.01f);
 }
 
 void TestTextRendering() {
@@ -123,7 +161,8 @@ void TestTextRendering() {
   rc::StrokeSetting penStyle;
   penStyle.color.rgba = 0xFF0000FF;
   penStyle.width = 8.0f;
-  penDocument.Add(rc::PenCommand{{{20, 70}, {60, 70}, {100, 82}}, penStyle});
+  penDocument.Add(rc::PenCommand{{{20, 70}, {60, 70}, {100, 82}}, penStyle,
+                                 {1.35f, 0.9f, 0.55f}});
   error.clear();
   CHECK(exporter.Render(snapshot, snapshot.virtualBounds, penDocument, config, false, image, error));
   size_t penPixels = 0;
@@ -164,6 +203,69 @@ void TestMosaic() {
   mosaic.blurRadius = 6.0f;
   rc::ApplyMosaics(image, width, height, stride, commands);
   CHECK(image[16 * stride + 16 * 4] != original[16 * stride + 16 * 4]);
+}
+
+void TestMosaicBlur() {
+  // A vertical bar (B=200) on a flat background (B=50) makes the blur visibly non-invariant:
+  // a masked pixel just left of the bar blends the two, while far pixels stay untouched.
+  // Keep seven bytes of row padding so the implementation is exercised with a stride
+  // that is not width*4; those bytes must remain untouched by either blur pass.
+  constexpr int width = 48, height = 48, stride = width * 4 + 7;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height), 0xA5);
+  for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+    uint8_t* p = image.data() + static_cast<size_t>(y * stride + x * 4);
+    p[0] = (x >= 16 && x < 32) ? 200 : 50;
+    p[1] = 120; p[2] = 120; p[3] = 255;
+  }
+  const auto original = image;
+  rc::MosaicCommand mosaic;
+  mosaic.brush = false; mosaic.bounds = {8, 8, 40, 40};
+  mosaic.style = rc::MosaicStyle::Blur; mosaic.blurRadius = 5.0f;
+  std::vector<rc::EditCommand> commands{mosaic};
+  rc::ApplyMosaics(image, width, height, stride, commands);
+
+  // (12,24) is inside the mask and 4px left of the bar; blurring must pull the two colors
+  // together, so the channel sits strictly between the background (50) and the bar (200).
+  const uint8_t* blended = image.data() + static_cast<size_t>(24 * stride + 12 * 4);
+  CHECK(blended[0] > 60 && blended[0] < 190);
+  CHECK(blended[0] != original[24 * stride + 12 * 4]);
+  CHECK(blended[1] == 120 && blended[2] == 120 && blended[3] == 255);
+  // Far from the mask nothing changed.
+  for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
+    const uint8_t* p = image.data() + static_cast<size_t>(y * stride + x * 4);
+    const uint8_t* o = original.data() + static_cast<size_t>(y * stride + x * 4);
+    CHECK(p[0] == o[0] && p[1] == o[1] && p[2] == o[2] && p[3] == o[3]);
+  }
+  // Every pixel outside the rectangular mask and every row-padding byte must be
+  // byte-for-byte identical to the source image.
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      if (x >= 8 && x < 40 && y >= 8 && y < 40) continue;
+      const uint8_t* p = image.data() + static_cast<size_t>(y * stride + x * 4);
+      const uint8_t* o = original.data() + static_cast<size_t>(y * stride + x * 4);
+      CHECK(std::equal(p, p + 4, o));
+    }
+    CHECK(std::equal(image.data() + static_cast<size_t>(y * stride + width * 4),
+                     image.data() + static_cast<size_t>((y + 1) * stride),
+                     original.data() + static_cast<size_t>(y * stride + width * 4)));
+  }
+
+  // Brush blur must also alter the stroke pixels without a crash or buffer overrun. (16,16)
+  // sits on the bar edge, so blurring pulls the background into it.
+  image = original;
+  mosaic.brush = true;
+  mosaic.points = {{16, 16}};
+  mosaic.bounds = {};
+  mosaic.brushSize = 10.0f;
+  commands[0] = mosaic;
+  rc::ApplyMosaics(image, width, height, stride, commands);
+  CHECK(image[16 * stride + 16 * 4] != original[16 * stride + 16 * 4]);
+  CHECK(image[0] == original[0]);
+  for (int y = 0; y < height; ++y) {
+    CHECK(std::equal(image.data() + static_cast<size_t>(y * stride + width * 4),
+                     image.data() + static_cast<size_t>((y + 1) * stride),
+                     original.data() + static_cast<size_t>(y * stride + width * 4)));
+  }
 }
 
 void TestUnitDetection() {
@@ -279,8 +381,11 @@ int wmain() {
   TestConfigRoundTrip();
   TestConfigDamagedFieldRecovery();
   TestEditorHistory();
+  TestBlankCaptureGuard();
+  TestPenPressureCurve();
   TestTextRendering();
   TestMosaic();
+  TestMosaicBlur();
   TestUnitDetection();
   TestCoordinatesAndHdrIntersection();
   TestFilenameAndHalfFloat();

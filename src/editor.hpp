@@ -34,6 +34,9 @@ enum class ShapeKind { Rectangle, Ellipse, Line, Arrow };
 struct PenCommand {
   std::vector<PointF> points;
   StrokeSetting style;
+  // Per-point width multipliers generated from pointer velocity. Keeping these relative to the
+  // base style means an existing stroke can still be resized as a whole after it is drawn.
+  std::vector<float> widthScales;
 };
 
 struct ShapeCommand {
@@ -50,7 +53,7 @@ struct MosaicCommand {
   MosaicStyle style = MosaicStyle::Pixel;
   float brushSize = 32.0f;
   int pixelSize = 16;
-  float blurRadius = 12.0f;
+  float blurRadius = 6.0f;
 };
 
 struct TextCommand {
@@ -84,6 +87,9 @@ class EditorDocument {
 RectF NormalizeRect(PointF a, PointF b);
 bool Contains(const RectF& rect, PointF point);
 float DistanceToSegment(PointF point, PointF a, PointF b);
+float PenWidthScaleForSpeed(float pixelsPerSecond);
+float PenPointWidth(const PenCommand& command, size_t index);
+float PenMaximumWidth(const PenCommand& command);
 
 // Applies only the destructive pixel/blur operations. Vector commands are rendered by Direct2D.
 void ApplyMosaics(std::vector<uint8_t>& bgra, int width, int height, int stride,

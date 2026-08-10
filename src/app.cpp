@@ -6,6 +6,7 @@
 #include <shlobj.h>
 #include <windowsx.h>
 
+#include <cwctype>
 #include <sstream>
 
 namespace rc {
@@ -21,21 +22,99 @@ constexpr UINT kCommandExit = 103;
 constexpr UINT kCommandAbout = 104;
 constexpr int kHotkeyBase = 1000;
 
-constexpr int IDC_HOTKEYS = 2001;
 constexpr int IDC_OUTPUT = 2002;
 constexpr int IDC_BROWSE = 2003;
-constexpr int IDC_QUALITY = 2004;
-constexpr int IDC_AUTOSAVE = 2005;
-constexpr int IDC_AUTOSTART = 2006;
-constexpr int IDC_SILENT = 2007;
-constexpr int IDC_SHADOW = 2008;
-constexpr int IDC_FRAME = 2009;
-constexpr int IDC_DEFAULT_ACTION = 2010;
 constexpr int IDC_SAVE_SETTINGS = 2011;
 constexpr int IDC_CANCEL_SETTINGS = 2012;
-constexpr int IDC_HOTKEY_CAPTURE = 2013;
-constexpr int IDC_HOTKEY_ADD = 2014;
-constexpr int IDC_HOTKEY_REMOVE = 2015;
+constexpr int IDC_HOTKEY_PRIMARY = 2016;
+constexpr int IDC_HOTKEY_SECONDARY = 2017;
+constexpr int IDC_TOGGLE_AUTOSAVE = 2101;
+constexpr int IDC_TOGGLE_AUTOSTART = 2102;
+constexpr int IDC_TOGGLE_SILENT = 2103;
+constexpr int IDC_TOGGLE_SHADOW = 2104;
+constexpr int IDC_TOGGLE_FRAME = 2105;
+constexpr int IDC_ACTION_COPY = 2106;
+constexpr int IDC_ACTION_SAVE = 2107;
+
+constexpr int kSettingsWidth = 1040;
+constexpr int kSettingsHeight = 680;
+
+RECT QualitySliderRect() {
+  return {150, 420, 390, 434};
+}
+
+bool IsToggleId(int id) {
+  return id == IDC_TOGGLE_AUTOSAVE || id == IDC_TOGGLE_AUTOSTART || id == IDC_TOGGLE_SILENT ||
+         id == IDC_TOGGLE_SHADOW || id == IDC_TOGGLE_FRAME;
+}
+
+bool IsHotkeyId(int id) { return id == IDC_HOTKEY_PRIMARY || id == IDC_HOTKEY_SECONDARY; }
+
+UINT HotkeyModifierForKey(UINT key) {
+  switch (key) {
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return MOD_CONTROL;
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: return MOD_SHIFT;
+    case VK_MENU: case VK_LMENU: case VK_RMENU: return MOD_ALT;
+    case VK_LWIN: case VK_RWIN: return MOD_WIN;
+    default: return 0;
+  }
+}
+
+UINT CurrentHotkeyModifiers() {
+  UINT modifiers = 0;
+  if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+  if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+  if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+  if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) modifiers |= MOD_WIN;
+  return modifiers;
+}
+
+std::wstring HotkeyModifierPreview(UINT modifiers) {
+  std::wstring text;
+  if (modifiers & MOD_CONTROL) text += L"Ctrl+";
+  if (modifiers & MOD_ALT) text += L"Alt+";
+  if (modifiers & MOD_SHIFT) text += L"Shift+";
+  if (modifiers & MOD_WIN) text += L"Win+";
+  return text + L"…";
+}
+
+bool IsSegmentId(int id) {
+  return id == IDC_ACTION_COPY || id == IDC_ACTION_SAVE;
+}
+
+bool IsSettingsEditId(int id) {
+  return id == IDC_HOTKEY_PRIMARY || id == IDC_HOTKEY_SECONDARY || id == IDC_OUTPUT;
+}
+
+RECT SettingsInputFrameRect(int id) {
+  switch (id) {
+    case IDC_HOTKEY_PRIMARY: return {154, 166, 466, 216};
+    case IDC_HOTKEY_SECONDARY: return {584, 166, 896, 216};
+    case IDC_OUTPUT: return {40, 354, 416, 402};
+    default: return {};
+  }
+}
+
+bool ToggleValue(const AppConfig& config, int id) {
+  switch (id) {
+    case IDC_TOGGLE_AUTOSAVE: return config.autoSaveOnCopy;
+    case IDC_TOGGLE_AUTOSTART: return config.launchAtLogin;
+    case IDC_TOGGLE_SILENT: return config.silentAtLogin;
+    case IDC_TOGGLE_SHADOW: return config.windowShadow;
+    case IDC_TOGGLE_FRAME: return config.frameEnabled;
+  }
+  return false;
+}
+
+void SetToggleValue(AppConfig& config, int id, bool value) {
+  switch (id) {
+    case IDC_TOGGLE_AUTOSAVE: config.autoSaveOnCopy = value; break;
+    case IDC_TOGGLE_AUTOSTART: config.launchAtLogin = value; break;
+    case IDC_TOGGLE_SILENT: config.silentAtLogin = value; break;
+    case IDC_TOGGLE_SHADOW: config.windowShadow = value; break;
+    case IDC_TOGGLE_FRAME: config.frameEnabled = value; break;
+  }
+}
 
 std::wstring GetWindowString(HWND hwnd, int id) {
   HWND control = GetDlgItem(hwnd, id);
@@ -64,6 +143,7 @@ Application::~Application() {
   if (settingsControlBrush_) DeleteObject(settingsControlBrush_);
   if (settingsFont_) DeleteObject(settingsFont_);
   if (settingsTitleFont_) DeleteObject(settingsTitleFont_);
+  if (settingsSectionFont_) DeleteObject(settingsSectionFont_);
   if (settingsSmallFont_) DeleteObject(settingsSmallFont_);
   overlay_.reset();
   if (hwnd_) DestroyWindow(hwnd_);
@@ -87,7 +167,7 @@ bool Application::Initialize(std::span<wchar_t*> arguments, int, std::wstring& e
   config_ = configStore_.Load(&warning);
   if (!CreateMessageWindow(error)) return false;
   AddTrayIcon(); RegisterConfiguredHotkeys(); UpdateAutoStart();
-  if (!std::filesystem::exists(configStore_.path())) SaveConfig();
+  if (!std::filesystem::exists(configStore_.path()) || config_.schemaVersion < 3) SaveConfig();
   if (!warning.empty()) Notify(L"RC-ScreenShot 配置", warning, NIIF_WARNING);
   if (!hotkeyErrors_.empty()) Notify(L"快捷键注册失败", hotkeyErrors_.front(), NIIF_WARNING);
   if (HasArgument(arguments, L"--settings")) PostMessageW(hwnd_, WM_COMMAND, kCommandSettings, 0);
@@ -161,7 +241,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-          std::wstring text = L"RC-ScreenShot 0.2.0\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+          std::wstring text = L"RC-ScreenShot 0.3.3\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);
@@ -255,104 +335,130 @@ void Application::ProcessOverlayResult(std::unique_ptr<OverlayResult> result) {
 
 void Application::ShowSettings() {
   if (settingsWindow_) { ShowWindow(settingsWindow_, SW_RESTORE); SetForegroundWindow(settingsWindow_); return; }
-  if (!settingsBackgroundBrush_) settingsBackgroundBrush_ = CreateSolidBrush(RGB(15, 18, 24));
-  if (!settingsPanelBrush_) settingsPanelBrush_ = CreateSolidBrush(RGB(25, 30, 40));
-  if (!settingsControlBrush_) settingsControlBrush_ = CreateSolidBrush(RGB(32, 38, 50));
+  if (!settingsBackgroundBrush_) settingsBackgroundBrush_ = CreateSolidBrush(RGB(10, 15, 23));
+  if (!settingsPanelBrush_) settingsPanelBrush_ = CreateSolidBrush(RGB(17, 25, 36));
+  if (!settingsControlBrush_) settingsControlBrush_ = CreateSolidBrush(RGB(25, 37, 52));
   if (!settingsFont_) {
-    settingsFont_ = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsFont_ = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
     settingsTitleFont_ = CreateFontW(-27, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
+    settingsSectionFont_ = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                       DEFAULT_PITCH, L"Microsoft YaHei UI");
     settingsSmallFont_ = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
   }
-  WNDCLASSEXW windowClass{sizeof(windowClass)}; windowClass.lpfnWndProc = SettingsProc;
-  windowClass.hInstance = instance_; windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  WNDCLASSEXW windowClass{sizeof(windowClass)};
+  windowClass.lpfnWndProc = SettingsProc; windowClass.hInstance = instance_;
+  windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   windowClass.hIcon = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(102), IMAGE_ICON,
-                                                    0, 0, LR_DEFAULTSIZE | LR_SHARED));
+                                                     0, 0, LR_DEFAULTSIZE | LR_SHARED));
   windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(102), IMAGE_ICON,
-                                                      16, 16, LR_SHARED));
+                                                       16, 16, LR_SHARED));
   windowClass.hbrBackground = settingsBackgroundBrush_; windowClass.lpszClassName = L"RC-ScreenShot.Settings";
   RegisterClassExW(&windowClass);
-  settingsWindow_ = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_CONTROLPARENT, windowClass.lpszClassName, L"RC-ScreenShot 设置",
-                                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                    CW_USEDEFAULT, CW_USEDEFAULT, 760, 640, nullptr, nullptr, instance_, this);
+  const DWORD settingsStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+  const DWORD settingsExStyle = WS_EX_APPWINDOW | WS_EX_CONTROLPARENT;
+  RECT outerRect{0, 0, kSettingsWidth, kSettingsHeight};
+  UINT dpi = hwnd_ ? GetDpiForWindow(hwnd_) : 0;
+  if (dpi == 0) dpi = GetDpiForSystem();
+  if (dpi == 0) dpi = 96;
+  if (!AdjustWindowRectExForDpi(&outerRect, settingsStyle, FALSE, settingsExStyle, dpi)) {
+    AdjustWindowRectEx(&outerRect, settingsStyle, FALSE, settingsExStyle);
+  }
+  const int outerWidth = outerRect.right - outerRect.left;
+  const int outerHeight = outerRect.bottom - outerRect.top;
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  RECT workArea{0, 0, outerWidth, outerHeight};
+  if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) workArea = monitorInfo.rcWork;
+  int left = workArea.left + (workArea.right - workArea.left - outerWidth) / 2;
+  int top = workArea.top + (workArea.bottom - workArea.top - outerHeight) / 2;
+  const int minLeft = static_cast<int>(workArea.left);
+  const int minTop = static_cast<int>(workArea.top);
+  const int maxLeft = std::max(minLeft, static_cast<int>(workArea.right) - outerWidth);
+  const int maxTop = std::max(minTop, static_cast<int>(workArea.bottom) - outerHeight);
+  left = std::clamp(left, minLeft, maxLeft);
+  top = std::clamp(top, minTop, maxTop);
+  settingsWindow_ = CreateWindowExW(settingsExStyle, windowClass.lpszClassName,
+                                    L"RC-ScreenShot 设置",
+                                    settingsStyle, left, top, outerWidth, outerHeight,
+                                    nullptr, nullptr, instance_, this);
   if (!settingsWindow_) return;
   const auto setFont = [&](HWND control, HFONT font = nullptr) {
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : settingsFont_), TRUE);
   };
   const auto label = [&](const wchar_t* text, int x, int y, int w, int h, HFONT font = nullptr) {
-    HWND control = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h,
-                                 settingsWindow_, nullptr, instance_, nullptr);
-    setFont(control, font);
-    return control;
+    HWND control = CreateWindowExW(WS_EX_TRANSPARENT, L"STATIC", text,
+                                   WS_CHILD | WS_VISIBLE | SS_LEFT, x, y, w, h,
+                                   settingsWindow_, nullptr, instance_, nullptr);
+    setFont(control, font); return control;
   };
-  const auto edit = [&](DWORD exStyle, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
-    HWND control = CreateWindowExW(exStyle, L"EDIT", text, style, x, y, w, h, settingsWindow_,
-                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
-    setFont(control);
+  const auto edit = [&](const wchar_t* text, int x, int y, int w, int h, int id) {
+    HWND control = CreateWindowExW(WS_EX_TRANSPARENT, L"EDIT", text,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                   x, y, w, h, settingsWindow_,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+    setFont(control); SendMessageW(control, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(10, 10));
     return control;
   };
   const auto button = [&](const wchar_t* text, int x, int y, int w, int h, int id) {
-    HWND control = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                 x, y, w, h, settingsWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                 instance_, nullptr);
-    setFont(control);
+    HWND control = CreateWindowW(L"BUTTON", text,
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                 x, y, w, h, settingsWindow_,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+    setFont(control); return control;
+  };
+  const auto hotkeyButton = [&](int x, int y, int w, int h, int id) {
+    HWND control = button(L"", x, y, w, h, id);
+    SetWindowSubclass(control, HotkeyCaptureProc, 1, reinterpret_cast<DWORD_PTR>(this));
     return control;
   };
-  const auto check = [&](const wchar_t* text, int x, int y, int w, int h, int id) {
-    HWND control = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                 x, y, w, h, settingsWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                 instance_, nullptr);
-    setFont(control);
-    return control;
+  const auto toggle = [&](int x, int y, int id) {
+    HWND control = CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                 x, y, 70, 30, settingsWindow_,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+    setFont(control, settingsSmallFont_); return control;
   };
-
-  label(L"RC-ScreenShot", 32, 22, 400, 38, settingsTitleFont_);
-  label(L"截图、标注与输出都可以在这里一次配置好", 34, 59, 450, 22, settingsSmallFont_);
-  label(L"快捷键", 32, 101, 150, 26);
-  label(L"按下组合键即可采集，保存后立即生效", 32, 126, 260, 20, settingsSmallFont_);
-  edit(WS_EX_STATICEDGE, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-       32, 151, 246, 32, IDC_HOTKEY_CAPTURE);
-  HWND capture = GetDlgItem(settingsWindow_, IDC_HOTKEY_CAPTURE);
-  SetWindowSubclass(capture, HotkeyCaptureProc, 1, reinterpret_cast<DWORD_PTR>(this));
-  button(L"添加", 288, 151, 82, 32, IDC_HOTKEY_ADD);
-  button(L"移除所选", 380, 151, 94, 32, IDC_HOTKEY_REMOVE);
-  label(L"当前快捷键", 492, 145, 150, 20, settingsSmallFont_);
-  edit(WS_EX_STATICEDGE, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL |
-       ES_READONLY | WS_VSCROLL, 492, 166, 236, 50, IDC_HOTKEYS);
-
-  label(L"输出", 32, 266, 150, 26);
-  label(L"截图目录", 32, 300, 86, 24);
-  edit(WS_EX_STATICEDGE, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-       128, 296, 488, 32, IDC_OUTPUT);
-  button(L"浏览", 628, 296, 100, 32, IDC_BROWSE);
-  label(L"JPEG 质量", 32, 342, 86, 24);
-  edit(WS_EX_STATICEDGE, L"95", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
-       128, 338, 72, 32, IDC_QUALITY);
-  label(L"Enter 默认动作", 246, 342, 120, 24);
-  HWND combo = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-                             376, 338, 150, 180, settingsWindow_,
-                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEFAULT_ACTION)), instance_, nullptr);
-  setFont(combo);
-  SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"复制到剪贴板"));
-  SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"保存到本地"));
-
-  label(L"行为与外观", 32, 412, 180, 26);
-  check(L"复制时自动本地保存", 32, 447, 220, 28, IDC_AUTOSAVE);
-  check(L"登录时启动", 280, 447, 180, 28, IDC_AUTOSTART);
-  check(L"自启时静默", 492, 447, 180, 28, IDC_SILENT);
-  check(L"窗口截图添加阴影", 32, 480, 220, 28, IDC_SHADOW);
-  check(L"启用截图外框", 280, 480, 180, 28, IDC_FRAME);
-  label(L"外框样式仅在设置页控制，不占用截图时的浮动工具栏。", 492, 481, 236, 38, settingsSmallFont_);
-  label(L"截图时可用：空格切换模式 · V 选择对象 · Ctrl+Z / Ctrl+Y 撤销与重做 · Esc 取消", 32, 545, 650, 22, settingsSmallFont_);
-  button(L"保存设置", 548, 577, 100, 34, IDC_SAVE_SETTINGS);
-  button(L"取消", 660, 577, 68, 34, IDC_CANCEL_SETTINGS);
-  BOOL darkTitle = TRUE;
-  DwmSetWindowAttribute(settingsWindow_, 20, &darkTitle, sizeof(darkTitle));
+  label(L"设置中心", 32, 24, 320, 38, settingsTitleFont_);
+  label(L"调整截图、导出和启动行为", 32, 62, 420, 20, settingsSmallFont_);
+    label(L"RCSS · v0.3.3", 900, 36, 110, 20, settingsSmallFont_);
+  label(L"快捷键", 64, 116, 180, 24, settingsSectionFont_);
+  label(L"主快捷键必填，副快捷键可选", 64, 144, 360, 18, settingsSmallFont_);
+  label(L"主快捷键", 64, 180, 90, 18, settingsSmallFont_);
+  hotkeyButton(160, 172, 300, 38, IDC_HOTKEY_PRIMARY);
+  label(L"副快捷键", 490, 180, 90, 18, settingsSmallFont_);
+  hotkeyButton(590, 172, 300, 38, IDC_HOTKEY_SECONDARY);
+  label(L"重复快捷键会被拒绝", 64, 218, 360, 18, settingsSmallFont_);
+  label(L"输出", 64, 278, 180, 24, settingsSectionFont_);
+  label(L"保存位置与导出质量", 64, 306, 260, 18, settingsSmallFont_);
+  label(L"截图目录", 48, 340, 90, 18, settingsSmallFont_);
+  edit(L"", 48, 360, 360, 36, IDC_OUTPUT);
+  button(L"浏览", 420, 360, 64, 36, IDC_BROWSE);
+  label(L"JPEG 质量", 48, 412, 100, 18, settingsSmallFont_);
+  label(L"Enter 默认动作", 48, 450, 100, 18, settingsSmallFont_);
+  button(L"复制", 150, 448, 90, 30, IDC_ACTION_COPY);
+  button(L"保存", 248, 448, 90, 30, IDC_ACTION_SAVE);
+  label(L"编辑器", 556, 278, 180, 24, settingsSectionFont_);
+  label(L"文字与截图层效果", 556, 306, 240, 18, settingsSmallFont_);
+  label(L"窗口截图阴影", 556, 360, 160, 22, settingsFont_); toggle(900, 354, IDC_TOGGLE_SHADOW);
+  label(L"截图外框", 556, 420, 120, 22, settingsFont_); toggle(900, 414, IDC_TOGGLE_FRAME);
+  label(L"行为", 64, 520, 180, 24, settingsSectionFont_);
+  label(L"高频选项，修改后保存即可生效", 64, 548, 300, 18, settingsSmallFont_);
+  label(L"复制后自动保存", 64, 568, 130, 22, settingsFont_); toggle(200, 564, IDC_TOGGLE_AUTOSAVE);
+  label(L"登录时启动", 392, 568, 120, 22, settingsFont_); toggle(528, 564, IDC_TOGGLE_AUTOSTART);
+  label(L"自启时静默", 720, 568, 120, 22, settingsFont_); toggle(856, 564, IDC_TOGGLE_SILENT);
+  label(L"截图提示：V 选择对象 · Ctrl+Z / Ctrl+Y 撤销 · Esc 取消", 64, 638, 680, 20,
+        settingsSmallFont_);
+  button(L"取消", 840, 630, 80, 36, IDC_CANCEL_SETTINGS);
+  button(L"保存设置", 932, 630, 84, 36, IDC_SAVE_SETTINGS);
+  BOOL darkTitle = TRUE; DwmSetWindowAttribute(settingsWindow_, 20, &darkTitle, sizeof(darkTitle));
   PopulateSettings(settingsWindow_); ShowWindow(settingsWindow_, SW_SHOW); UpdateWindow(settingsWindow_);
 }
 
@@ -368,113 +474,213 @@ LRESULT CALLBACK Application::SettingsProc(HWND hwnd, UINT message, WPARAM wPara
 LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
   if (message == WM_ERASEBKGND) return 1;
   if (message == WM_PAINT) {
-    PAINTSTRUCT paint{};
-    BeginPaint(hwnd, &paint);
-    HDC dc = paint.hdc;
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    FillRect(dc, &client, settingsBackgroundBrush_);
-    const auto panel = [&](int top, int bottom) {
-      RECT rect{24, top, client.right - 24, bottom};
-      HGDIOBJ oldBrush = SelectObject(dc, settingsPanelBrush_);
-      HPEN pen = CreatePen(PS_SOLID, 1, RGB(43, 50, 64));
-      HGDIOBJ oldPen = SelectObject(dc, pen);
-      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
-      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen);
+    PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint);
+    HDC dc = paint.hdc; RECT client{}; GetClientRect(hwnd, &client);
+    FillRect(dc, &client, settingsBackgroundBrush_); SetBkMode(dc, TRANSPARENT);
+    const auto rounded = [&](RECT rect, COLORREF fill, COLORREF border, int radius = 14) {
+      HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, border);
+      HGDIOBJ oldBrush = SelectObject(dc, brush); HGDIOBJ oldPen = SelectObject(dc, pen);
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
     };
-    panel(88, 238); panel(250, 386); panel(400, 530);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(116, 171, 245));
-    SelectObject(dc, settingsSmallFont_);
-    const std::wstring badge = L"CONFIGURATION";
-    TextOutW(dc, 32, 83, badge.c_str(), static_cast<int>(badge.size()));
-    EndPaint(hwnd, &paint);
-    return 0;
+    rounded({24, 104, 1016, 250}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({24, 266, 500, 490}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({516, 266, 1016, 490}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({24, 506, 1016, 610}, RGB(17, 25, 36), RGB(34, 48, 67));
+    const auto drawIcon = [&](int type, int x, int y) {
+      HPEN iconPen = CreatePen(PS_SOLID, 1, RGB(91, 160, 255));
+      HGDIOBJ oldPen = SelectObject(dc, iconPen);
+      HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+      if (type == 0) {  // keyboard
+        RoundRect(dc, x, y, x + 22, y + 14, 3, 3);
+        for (int key = 0; key < 4; ++key) {
+          MoveToEx(dc, x + 4 + key * 4, y + 4, nullptr);
+          LineTo(dc, x + 6 + key * 4, y + 4);
+        }
+        MoveToEx(dc, x + 7, y + 10, nullptr); LineTo(dc, x + 15, y + 10);
+      } else if (type == 1) {  // folder
+        MoveToEx(dc, x, y + 4, nullptr); LineTo(dc, x + 7, y + 4); LineTo(dc, x + 10, y + 1);
+        LineTo(dc, x + 17, y + 1); LineTo(dc, x + 20, y + 4); LineTo(dc, x + 22, y + 14);
+        LineTo(dc, x, y + 14); LineTo(dc, x, y + 4);
+      } else if (type == 2) {  // pencil
+        MoveToEx(dc, x + 3, y + 15, nullptr); LineTo(dc, x + 5, y + 10);
+        LineTo(dc, x + 16, y - 1); LineTo(dc, x + 21, y + 4); LineTo(dc, x + 10, y + 15);
+        LineTo(dc, x + 3, y + 15); MoveToEx(dc, x + 14, y + 1, nullptr); LineTo(dc, x + 19, y + 6);
+      } else if (type == 3) {  // rocket
+        Ellipse(dc, x + 7, y, x + 17, y + 12);
+        MoveToEx(dc, x + 7, y + 8, nullptr); LineTo(dc, x + 2, y + 13); LineTo(dc, x + 8, y + 12);
+        MoveToEx(dc, x + 17, y + 8, nullptr); LineTo(dc, x + 22, y + 13); LineTo(dc, x + 16, y + 12);
+        MoveToEx(dc, x + 9, y + 12, nullptr); LineTo(dc, x + 9, y + 17); LineTo(dc, x + 12, y + 14);
+        LineTo(dc, x + 15, y + 17); LineTo(dc, x + 15, y + 12);
+      } else {  // information
+        Ellipse(dc, x + 2, y, x + 18, y + 16);
+        MoveToEx(dc, x + 10, y + 6, nullptr); LineTo(dc, x + 10, y + 12);
+        Ellipse(dc, x + 9, y + 3, x + 11, y + 5);
+      }
+      SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(iconPen);
+    };
+    drawIcon(0, 37, 131);
+    drawIcon(1, 37, 293);
+    drawIcon(2, 529, 293);
+    drawIcon(3, 37, 531);
+    drawIcon(4, 43, 639);
+    const auto drawInputFrame = [&](RECT rect, HWND control) {
+      const bool focused = control && GetFocus() == control;
+      HBRUSH brush = CreateSolidBrush(RGB(25, 37, 52));
+      HPEN pen = CreatePen(PS_SOLID, 1, focused ? RGB(91, 160, 255) : RGB(49, 70, 96));
+      HGDIOBJ oldBrush = SelectObject(dc, brush); HGDIOBJ oldPen = SelectObject(dc, pen);
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
+      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
+    };
+    drawInputFrame({154, 166, 466, 216}, GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY));
+    drawInputFrame({584, 166, 896, 216}, GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY));
+    drawInputFrame({40, 354, 416, 402}, GetDlgItem(hwnd, IDC_OUTPUT));
+    const RECT track = QualitySliderRect(); const int lineY = (track.top + track.bottom) / 2;
+    HBRUSH trackBrush = CreateSolidBrush(RGB(38, 53, 73)); HGDIOBJ old = SelectObject(dc, trackBrush);
+    RoundRect(dc, track.left, lineY - 2, track.right, lineY + 2, 2, 2); SelectObject(dc, old); DeleteObject(trackBrush);
+    const int thumbX = track.left + (track.right - track.left) * (config_.jpegQuality - 1) / 99;
+    HBRUSH fillBrush = CreateSolidBrush(RGB(91, 140, 255)); old = SelectObject(dc, fillBrush);
+    RoundRect(dc, track.left, lineY - 2, thumbX, lineY + 2, 2, 2); SelectObject(dc, old); DeleteObject(fillBrush);
+    HBRUSH thumbBrush = CreateSolidBrush(RGB(233, 241, 255)); old = SelectObject(dc, thumbBrush);
+    Ellipse(dc, thumbX - 7, lineY - 7, thumbX + 7, lineY + 7); SelectObject(dc, old); DeleteObject(thumbBrush);
+    EndPaint(hwnd, &paint); return 0;
   }
+  if (message == WM_LBUTTONDOWN) {
+    POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    if (Contains(QualitySliderRect(), point)) {
+      settingsSliderDragging_ = true; SetCapture(hwnd); UpdateQualitySlider(hwnd, point.x); return 0;
+    }
+  } else if (message == WM_MOUSEMOVE && settingsSliderDragging_) {
+    UpdateQualitySlider(hwnd, GET_X_LPARAM(lParam)); return 0;
+  } else if (message == WM_LBUTTONUP && settingsSliderDragging_) {
+    UpdateQualitySlider(hwnd, GET_X_LPARAM(lParam)); settingsSliderDragging_ = false; ReleaseCapture(); return 0;
+  } else if (message == WM_CAPTURECHANGED && settingsSliderDragging_) { settingsSliderDragging_ = false; return 0; }
   if (message == WM_CTLCOLORSTATIC) {
-    HDC dc = reinterpret_cast<HDC>(wParam);
-    SetTextColor(dc, RGB(224, 230, 241));
-    SetBkMode(dc, TRANSPARENT);
-    return reinterpret_cast<LRESULT>(settingsBackgroundBrush_);
+    HDC dc = reinterpret_cast<HDC>(wParam); HWND control = reinterpret_cast<HWND>(lParam);
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0));
+    SetTextColor(dc, (font == settingsTitleFont_ || font == settingsSectionFont_) ? RGB(241, 246, 253)
+                 : font == settingsFont_ ? RGB(220, 228, 240) : RGB(139, 160, 190));
+    SetBkMode(dc, TRANSPARENT); return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
   }
-  if (message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX) {
+  if (message == WM_CTLCOLOREDIT) {
     HDC dc = reinterpret_cast<HDC>(wParam);
     SetTextColor(dc, RGB(235, 240, 248));
-    SetBkColor(dc, RGB(32, 38, 50));
+    SetBkMode(dc, OPAQUE);
+    SetBkColor(dc, RGB(25, 37, 52));
     return reinterpret_cast<LRESULT>(settingsControlBrush_);
   }
   if (message == WM_CTLCOLORBTN) {
-    HDC dc = reinterpret_cast<HDC>(wParam);
-    SetTextColor(dc, RGB(224, 230, 241));
-    SetBkMode(dc, TRANSPARENT);
-    return reinterpret_cast<LRESULT>(settingsPanelBrush_);
+    HDC dc = reinterpret_cast<HDC>(wParam); SetTextColor(dc, RGB(224, 232, 244));
+    SetBkMode(dc, TRANSPARENT); return reinterpret_cast<LRESULT>(settingsPanelBrush_);
   }
   if (message == WM_DRAWITEM) {
-    const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-    if (item && item->CtlType == ODT_BUTTON) {
-      const bool primary = GetDlgCtrlID(item->hwndItem) == IDC_SAVE_SETTINGS;
-      const bool pressed = (item->itemState & ODS_SELECTED) != 0;
-      const COLORREF fill = primary ? (pressed ? RGB(54, 123, 214) : RGB(70, 143, 235))
-                                    : (pressed ? RGB(48, 57, 73) : RGB(37, 45, 59));
+    const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam); if (!item || item->CtlType != ODT_BUTTON) return 0;
+    const int id = GetDlgCtrlID(item->hwndItem); const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+    if (IsHotkeyId(id)) {
+      const auto& state = HotkeyStateFor(item->hwndItem);
+      const RECT r = item->rcItem;
+      const COLORREF fill = state.listening ? RGB(30, 55, 90) : RGB(25, 37, 52);
+      const COLORREF border = state.listening ? RGB(91, 160, 255) : RGB(49, 70, 96);
       HBRUSH brush = CreateSolidBrush(fill);
-      HPEN pen = CreatePen(PS_SOLID, 1, primary ? RGB(92, 165, 247) : RGB(62, 73, 92));
+      HPEN pen = CreatePen(PS_SOLID, state.listening ? 2 : 1, border);
       HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
       HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-      RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 10, 10);
+      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, 12, 12);
       SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush);
       DeleteObject(pen); DeleteObject(brush);
+      std::wstring display = GetWindowString(settingsWindow_, id);
+      if (state.listening && !state.submitted) {
+        display = state.modifiers ? HotkeyModifierPreview(state.modifiers) : L"按下组合键…";
+      }
+      SetBkMode(item->hDC, TRANSPARENT);
+      SetTextColor(item->hDC, state.listening ? RGB(232, 242, 255) : RGB(220, 228, 240));
+      SelectObject(item->hDC, settingsFont_);
+      RECT textRect = r;
+      DrawTextW(item->hDC, display.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      if (state.listening) {
+        SetTextColor(item->hDC, RGB(130, 175, 235));
+        RECT hintRect{r.right - 62, r.top, r.right - 8, r.bottom};
+        DrawTextW(item->hDC, L"监听中", -1, &hintRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+      }
+      return TRUE;
+    }
+    if (IsToggleId(id)) {
+      const bool on = ToggleValue(config_, id); const RECT r = item->rcItem; const int height = r.bottom - r.top;
+      HBRUSH track = CreateSolidBrush(on ? (pressed ? RGB(48, 101, 205) : RGB(60, 124, 235))
+                                         : (pressed ? RGB(50, 62, 80) : RGB(39, 50, 66)));
+      HPEN border = CreatePen(PS_SOLID, 1, on ? RGB(123, 170, 255) : RGB(95, 113, 137));
+      HGDIOBJ oldBrush = SelectObject(item->hDC, track); HGDIOBJ oldPen = SelectObject(item->hDC, border);
+      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, height / 2, height / 2);
+      SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(border); DeleteObject(track);
+      const int radius = height / 2 - 4; const int knobX = on ? r.right - radius - 4 : r.left + radius + 4;
+      HBRUSH knob = CreateSolidBrush(on ? RGB(255, 255, 255) : RGB(220, 228, 240)); oldBrush = SelectObject(item->hDC, knob);
+      Ellipse(item->hDC, knobX - radius, (r.top + r.bottom) / 2 - radius, knobX + radius, (r.top + r.bottom) / 2 + radius);
+      SelectObject(item->hDC, oldBrush); DeleteObject(knob);
+      SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, on ? RGB(255, 255, 255) : RGB(185, 198, 218));
+      SelectObject(item->hDC, settingsSmallFont_);
+      RECT stateRect = on ? RECT{r.left + 4, r.top, r.left + (r.right - r.left) / 2, r.bottom}
+                          : RECT{r.left + (r.right - r.left) / 2, r.top, r.right - 4, r.bottom};
+      DrawTextW(item->hDC, on ? L"开" : L"关", -1, &stateRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      return TRUE;
+    }
+    if (IsSegmentId(id)) {
+      const bool active = (id == IDC_ACTION_COPY && config_.defaultAction == DefaultAction::Copy) ||
+                          (id == IDC_ACTION_SAVE && config_.defaultAction == DefaultAction::Save);
+      const COLORREF fill = active ? (pressed ? RGB(68, 111, 219) : RGB(91, 140, 255))
+                                   : (pressed ? RGB(31, 49, 77) : RGB(24, 35, 50));
+      const COLORREF borderColor = active ? RGB(123, 170, 255) : RGB(46, 65, 90);
+      HBRUSH brush = CreateSolidBrush(fill);
+      HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
+      HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
+      HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+      RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right,
+                item->rcItem.bottom, 10, 10);
+      SelectObject(item->hDC, oldPen);
+      SelectObject(item->hDC, oldBrush);
+      DeleteObject(pen);
+      DeleteObject(brush);
       wchar_t text[128]{};
       GetWindowTextW(item->hwndItem, text, _countof(text));
       SetBkMode(item->hDC, TRANSPARENT);
-      SetTextColor(item->hDC, RGB(242, 247, 255));
+      SetTextColor(item->hDC, active ? RGB(255, 255, 255) : RGB(185, 198, 218));
       SelectObject(item->hDC, settingsFont_);
       RECT textRect = item->rcItem;
       DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-      if (item->itemState & ODS_FOCUS) DrawFocusRect(item->hDC, &textRect);
       return TRUE;
     }
+    const bool primary = id == IDC_SAVE_SETTINGS; const bool accent = id == IDC_BROWSE;
+    const COLORREF fill = primary ? (pressed ? RGB(68, 111, 219) : RGB(91, 140, 255))
+                                  : accent ? (pressed ? RGB(44, 79, 137) : RGB(36, 61, 101))
+                                           : (pressed ? RGB(31, 49, 77) : RGB(24, 35, 50));
+    HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, RGB(46, 65, 90));
+    HGDIOBJ oldBrush = SelectObject(item->hDC, brush); HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+    RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 10, 10);
+    SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
+    wchar_t text[128]{}; GetWindowTextW(item->hwndItem, text, _countof(text)); SetBkMode(item->hDC, TRANSPARENT);
+    SetTextColor(item->hDC, RGB(242, 247, 255)); SelectObject(item->hDC, settingsFont_); RECT textRect = item->rcItem;
+    DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return TRUE;
   }
   if (message == WM_COMMAND) {
-    if (LOWORD(wParam) == IDC_SAVE_SETTINGS) {
+    const int id = LOWORD(wParam);
+    const int notification = HIWORD(wParam);
+    if (IsSettingsEditId(id) && (notification == EN_SETFOCUS || notification == EN_KILLFOCUS)) {
+      RECT dirty = SettingsInputFrameRect(id);
+      InflateRect(&dirty, 2, 2);
+      InvalidateRect(hwnd, &dirty, FALSE);
+      if (HWND control = GetDlgItem(hwnd, id)) InvalidateRect(control, nullptr, FALSE);
+      return 0;
+    }
+    if (id == IDC_SAVE_SETTINGS) {
       if (ReadSettings(hwnd)) { SaveConfig(); RegisterConfiguredHotkeys(); UpdateAutoStart(); DestroyWindow(hwnd); }
       return 0;
     }
-    if (LOWORD(wParam) == IDC_CANCEL_SETTINGS) { DestroyWindow(hwnd); return 0; }
-    if (LOWORD(wParam) == IDC_HOTKEY_ADD) {
-      const std::wstring captured = GetWindowString(hwnd, IDC_HOTKEY_CAPTURE);
-      if (captured.empty()) return 0;
-      HotkeySetting key;
-      if (!ParseHotkeyText(captured, key)) {
-        MessageBoxW(hwnd, L"请先按下包含 Ctrl、Alt、Shift 或 Win 的快捷键组合。", L"快捷键", MB_ICONWARNING);
-        return 0;
-      }
-      std::wstring list = GetWindowString(hwnd, IDC_HOTKEYS);
-      if (!list.empty()) list += L"\r\n";
-      list += FormatHotkey(key);
-      SetWindowString(hwnd, IDC_HOTKEYS, list);
-      SetWindowString(hwnd, IDC_HOTKEY_CAPTURE, L"");
-      SetFocus(GetDlgItem(hwnd, IDC_HOTKEY_CAPTURE));
-      return 0;
+    if (id == IDC_CANCEL_SETTINGS) { config_ = configStore_.Load(); DestroyWindow(hwnd); return 0; }
+    if (IsToggleId(id)) { SetToggleValue(config_, id, !ToggleValue(config_, id)); InvalidateRect(GetDlgItem(hwnd, id), nullptr, FALSE); return 0; }
+    if (id == IDC_ACTION_COPY || id == IDC_ACTION_SAVE) {
+      config_.defaultAction = id == IDC_ACTION_SAVE ? DefaultAction::Save : DefaultAction::Copy;
+      InvalidateRect(GetDlgItem(hwnd, IDC_ACTION_COPY), nullptr, FALSE); InvalidateRect(GetDlgItem(hwnd, IDC_ACTION_SAVE), nullptr, FALSE); return 0;
     }
-    if (LOWORD(wParam) == IDC_HOTKEY_REMOVE) {
-      HWND list = GetDlgItem(hwnd, IDC_HOTKEYS);
-      DWORD selectionStart = 0, selectionEnd = 0;
-      SendMessageW(list, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
-      const int lineIndex = static_cast<int>(SendMessageW(list, EM_LINEFROMCHAR, selectionStart, 0));
-      std::wstringstream lines(GetWindowString(hwnd, IDC_HOTKEYS));
-      std::vector<std::wstring> values;
-      std::wstring line;
-      while (std::getline(lines, line)) {
-        if (!line.empty() && line.back() == L'\r') line.pop_back();
-        if (!line.empty()) values.push_back(line);
-      }
-      if (lineIndex >= 0 && lineIndex < static_cast<int>(values.size())) values.erase(values.begin() + lineIndex);
-      std::wstring updated;
-      for (const auto& value : values) { if (!updated.empty()) updated += L"\r\n"; updated += value; }
-      SetWindowString(hwnd, IDC_HOTKEYS, updated);
-      return 0;
-    }
-    if (LOWORD(wParam) == IDC_BROWSE) {
+    if (id == IDC_BROWSE) {
       IFileDialog* raw = nullptr;
       if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&raw)))) {
         ComPtr<IFileDialog> dialog; dialog.Attach(raw); DWORD options = 0; dialog->GetOptions(&options);
@@ -490,79 +696,170 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+Application::HotkeyCaptureState& Application::HotkeyStateFor(HWND hwnd) {
+  return GetDlgCtrlID(hwnd) == IDC_HOTKEY_SECONDARY ? hotkeySecondaryState_ : hotkeyPrimaryState_;
+}
+
+const Application::HotkeyCaptureState& Application::HotkeyStateFor(HWND hwnd) const {
+  return GetDlgCtrlID(hwnd) == IDC_HOTKEY_SECONDARY ? hotkeySecondaryState_ : hotkeyPrimaryState_;
+}
+
 LRESULT CALLBACK Application::HotkeyCaptureProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                                 UINT_PTR subclassId, DWORD_PTR referenceData) {
   (void)subclassId;
-  (void)referenceData;
-  if (message == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+  auto* self = reinterpret_cast<Application*>(referenceData);
+  if (!self) return DefSubclassProc(hwnd, message, wParam, lParam);
+  auto& state = self->HotkeyStateFor(hwnd);
+  const auto refresh = [&]() {
+    InvalidateRect(hwnd, nullptr, FALSE);
+  };
+  const auto moveFocusAfterFinish = [&]() {
+    HWND parent = GetParent(hwnd);
+    if (!parent) return;
+    HWND next = GetNextDlgTabItem(parent, hwnd, FALSE);
+    while (next && next != hwnd && IsHotkeyId(GetDlgCtrlID(next))) {
+      HWND candidate = GetNextDlgTabItem(parent, next, FALSE);
+      if (!candidate || candidate == next) break;
+      next = candidate;
+    }
+    if (!next || next == hwnd) next = GetDlgItem(parent, IDC_OUTPUT);
+    if (next && next != hwnd) SetFocus(next);
+  };
+  const auto finish = [&](bool restoreOriginal) {
+    if (restoreOriginal) SetWindowTextW(hwnd, state.originalText.c_str());
+    state.modifiers = 0;
+    state.listening = false;
+    state.submitted = !restoreOriginal;
+    refresh();
+    moveFocusAfterFinish();
+  };
+  if (message == WM_GETDLGCODE) return DLGC_WANTALLKEYS | DLGC_BUTTON;
+  if (message == WM_SETFOCUS) {
+    wchar_t text[256]{};
+    GetWindowTextW(hwnd, text, _countof(text));
+    state.originalText = text;
+    state.modifiers = 0;
+    state.listening = true;
+    state.submitted = false;
+    refresh();
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+  }
+  if (message == WM_LBUTTONDOWN && !state.listening) {
+    wchar_t text[256]{};
+    GetWindowTextW(hwnd, text, _countof(text));
+    state.originalText = text;
+    state.modifiers = 0;
+    state.listening = true;
+    state.submitted = false;
+    refresh();
+  }
+  if (message == WM_KILLFOCUS) {
+    if (state.listening && !state.submitted) SetWindowTextW(hwnd, state.originalText.c_str());
+    state.modifiers = 0;
+    state.listening = false;
+    state.submitted = false;
+    refresh();
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+  }
   if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
     const UINT key = static_cast<UINT>(wParam);
-    if (key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL ||
-        key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT ||
-        key == VK_MENU || key == VK_LMENU || key == VK_RMENU ||
-        key == VK_LWIN || key == VK_RWIN) return 0;
-    HotkeySetting hotkey;
-    hotkey.modifiers = MOD_NOREPEAT;
-    if (GetKeyState(VK_CONTROL) & 0x8000) hotkey.modifiers |= MOD_CONTROL;
-    if (GetKeyState(VK_MENU) & 0x8000) hotkey.modifiers |= MOD_ALT;
-    if (GetKeyState(VK_SHIFT) & 0x8000) hotkey.modifiers |= MOD_SHIFT;
-    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) hotkey.modifiers |= MOD_WIN;
-    hotkey.virtualKey = key;
-    if (!(hotkey.modifiers & (MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN))) {
-      MessageBeep(MB_ICONWARNING);
+    if (key == VK_ESCAPE) {
+      finish(true);
       return 0;
     }
+    if (key == VK_BACK || key == VK_DELETE) {
+      SetWindowTextW(hwnd, L"");
+      finish(false);
+      return 0;
+    }
+    const UINT modifier = HotkeyModifierForKey(key);
+    if (modifier) {
+      state.listening = true;
+      state.submitted = false;
+      state.modifiers |= modifier;
+      refresh();
+      return 0;
+    }
+    const UINT modifiers = state.modifiers | CurrentHotkeyModifiers();
+    if (!(modifiers & (MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN))) return 0;
+    const HotkeySetting hotkey{modifiers | MOD_NOREPEAT, key, true};
     SetWindowTextW(hwnd, FormatHotkey(hotkey).c_str());
-    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+    state.modifiers = hotkey.modifiers;
+    finish(false);
     return 0;
   }
-  if (message == WM_KEYUP || message == WM_SYSKEYUP || message == WM_CHAR) return 0;
+  if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+    if (state.listening) state.modifiers &= ~HotkeyModifierForKey(static_cast<UINT>(wParam));
+    refresh();
+    return 0;
+  }
+  if (message == WM_CHAR || message == WM_SYSCHAR) return 0;
+  if (message == WM_NCDESTROY) {
+    state.modifiers = 0;
+    state.listening = false;
+    state.submitted = false;
+    RemoveWindowSubclass(hwnd, HotkeyCaptureProc, subclassId);
+  }
   return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
 void Application::PopulateSettings(HWND hwnd) {
-  std::wstring hotkeys;
-  for (const auto& key : config_.hotkeys) if (key.enabled) { if (!hotkeys.empty()) hotkeys += L"\r\n"; hotkeys += FormatHotkey(key); }
-  SetWindowString(hwnd, IDC_HOTKEYS, hotkeys);
-  SetWindowString(hwnd, IDC_HOTKEY_CAPTURE, L"");
+  std::vector<HotkeySetting> enabled;
+  for (const auto& key : config_.hotkeys) if (key.enabled && enabled.size() < 2) enabled.push_back(key);
+  if (enabled.empty()) enabled.push_back({});
+  SetWindowString(hwnd, IDC_HOTKEY_PRIMARY, FormatHotkey(enabled[0]));
+  SetWindowString(hwnd, IDC_HOTKEY_SECONDARY, enabled.size() > 1 ? FormatHotkey(enabled[1]) : L"");
+  hotkeyPrimaryState_ = {};
+  hotkeySecondaryState_ = {};
+  hotkeyPrimaryState_.originalText = GetWindowString(hwnd, IDC_HOTKEY_PRIMARY);
+  hotkeySecondaryState_.originalText = GetWindowString(hwnd, IDC_HOTKEY_SECONDARY);
   SetWindowString(hwnd, IDC_OUTPUT, config_.outputDirectory);
-  SetWindowString(hwnd, IDC_QUALITY, std::to_wstring(config_.jpegQuality));
-  SendDlgItemMessageW(hwnd, IDC_DEFAULT_ACTION, CB_SETCURSEL, config_.defaultAction == DefaultAction::Save ? 1 : 0, 0);
-  CheckDlgButton(hwnd, IDC_AUTOSAVE, config_.autoSaveOnCopy ? BST_CHECKED : BST_UNCHECKED);
-  CheckDlgButton(hwnd, IDC_AUTOSTART, config_.launchAtLogin ? BST_CHECKED : BST_UNCHECKED);
-  CheckDlgButton(hwnd, IDC_SILENT, config_.silentAtLogin ? BST_CHECKED : BST_UNCHECKED);
-  CheckDlgButton(hwnd, IDC_SHADOW, config_.windowShadow ? BST_CHECKED : BST_UNCHECKED);
-  CheckDlgButton(hwnd, IDC_FRAME, config_.frameEnabled ? BST_CHECKED : BST_UNCHECKED);
+  CheckDlgButton(hwnd, IDC_TOGGLE_AUTOSAVE, config_.autoSaveOnCopy ? BST_CHECKED : BST_UNCHECKED);
+  CheckDlgButton(hwnd, IDC_TOGGLE_AUTOSTART, config_.launchAtLogin ? BST_CHECKED : BST_UNCHECKED);
+  CheckDlgButton(hwnd, IDC_TOGGLE_SILENT, config_.silentAtLogin ? BST_CHECKED : BST_UNCHECKED);
+  CheckDlgButton(hwnd, IDC_TOGGLE_SHADOW, config_.windowShadow ? BST_CHECKED : BST_UNCHECKED);
+  CheckDlgButton(hwnd, IDC_TOGGLE_FRAME, config_.frameEnabled ? BST_CHECKED : BST_UNCHECKED);
 }
 
 bool Application::ReadSettings(HWND hwnd) {
-  std::wstring hotkeysText = GetWindowString(hwnd, IDC_HOTKEYS);
-  const std::wstring captured = GetWindowString(hwnd, IDC_HOTKEY_CAPTURE);
-  if (!captured.empty()) {
-    if (!hotkeysText.empty()) hotkeysText += L"\r\n";
-    hotkeysText += captured;
+  auto trim = [](std::wstring value) {
+    while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+    while (!value.empty() && iswspace(value.back())) value.pop_back();
+    return value;
+  };
+  const std::wstring primaryText = trim(GetWindowString(hwnd, IDC_HOTKEY_PRIMARY));
+  const std::wstring secondaryText = trim(GetWindowString(hwnd, IDC_HOTKEY_SECONDARY));
+  HotkeySetting primary{}, secondary{};
+  if (!ParseHotkeyText(primaryText, primary)) {
+    MessageBoxW(hwnd, L"请设置有效的主快捷键（例如 Ctrl+\\）。", L"RC-ScreenShot", MB_ICONWARNING);
+    SetFocus(GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY)); return false;
   }
-  std::wstringstream lines(hotkeysText);
-  std::vector<HotkeySetting> hotkeys; std::wstring line;
-  while (std::getline(lines, line)) {
-    if (!line.empty() && line.back() == L'\r') line.pop_back();
-    while (!line.empty() && (line.front() == L' ' || line.front() == L'\t')) line.erase(line.begin());
-    while (!line.empty() && (line.back() == L' ' || line.back() == L'\t')) line.pop_back();
-    if (line.empty()) continue;
-    HotkeySetting key; if (!ParseHotkeyText(line, key)) { MessageBoxW(hwnd, (L"无法识别快捷键：" + line).c_str(), L"RC-ScreenShot", MB_ICONWARNING); return false; }
-    hotkeys.push_back(key);
+  std::vector<HotkeySetting> hotkeys{primary};
+  if (!secondaryText.empty()) {
+    if (!ParseHotkeyText(secondaryText, secondary)) {
+      MessageBoxW(hwnd, L"副快捷键格式无效。", L"RC-ScreenShot", MB_ICONWARNING);
+      SetFocus(GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY)); return false;
+    }
+    if (secondary.modifiers == primary.modifiers && secondary.virtualKey == primary.virtualKey) {
+      MessageBoxW(hwnd, L"主快捷键与副快捷键不能重复。", L"RC-ScreenShot", MB_ICONWARNING); return false;
+    }
+    hotkeys.push_back(secondary);
   }
-  if (hotkeys.empty()) { MessageBoxW(hwnd, L"至少需要一组快捷键。", L"RC-ScreenShot", MB_ICONWARNING); return false; }
-  int quality = _wtoi(GetWindowString(hwnd, IDC_QUALITY).c_str());
-  if (quality < 1 || quality > 100) { MessageBoxW(hwnd, L"JPEG 质量必须为 1–100。", L"RC-ScreenShot", MB_ICONWARNING); return false; }
-  config_.hotkeys = std::move(hotkeys); config_.outputDirectory = GetWindowString(hwnd, IDC_OUTPUT);
-  config_.jpegQuality = quality; config_.defaultAction = SendDlgItemMessageW(hwnd, IDC_DEFAULT_ACTION, CB_GETCURSEL, 0, 0) == 1 ? DefaultAction::Save : DefaultAction::Copy;
-  config_.autoSaveOnCopy = IsDlgButtonChecked(hwnd, IDC_AUTOSAVE) == BST_CHECKED;
-  config_.launchAtLogin = IsDlgButtonChecked(hwnd, IDC_AUTOSTART) == BST_CHECKED;
-  config_.silentAtLogin = IsDlgButtonChecked(hwnd, IDC_SILENT) == BST_CHECKED;
-  config_.windowShadow = IsDlgButtonChecked(hwnd, IDC_SHADOW) == BST_CHECKED;
-  config_.frameEnabled = IsDlgButtonChecked(hwnd, IDC_FRAME) == BST_CHECKED;
+  std::wstring outputDirectory = GetWindowString(hwnd, IDC_OUTPUT);
+  while (!outputDirectory.empty() && iswspace(outputDirectory.front())) outputDirectory.erase(outputDirectory.begin());
+  while (!outputDirectory.empty() && iswspace(outputDirectory.back())) outputDirectory.pop_back();
+  if (outputDirectory.empty()) outputDirectory = DefaultOutputDirectory().wstring();
+  config_.hotkeys = std::move(hotkeys); config_.outputDirectory = std::move(outputDirectory);
   return true;
+}
+
+void Application::UpdateQualitySlider(HWND hwnd, int x) {
+  const RECT track = QualitySliderRect();
+  const float t = std::clamp((x - track.left) / static_cast<float>(track.right - track.left), 0.0f, 1.0f);
+  config_.jpegQuality = std::clamp(static_cast<int>(std::lround(1.0f + t * 99.0f)), 1, 100);
+  RECT dirty = track;
+  InflateRect(&dirty, 8, 8);
+  InvalidateRect(hwnd, &dirty, FALSE);
 }
 
 bool Application::UpdateAutoStart(std::wstring* error) {
@@ -579,7 +876,11 @@ bool Application::UpdateAutoStart(std::wstring* error) {
   return status == ERROR_SUCCESS;
 }
 
-void Application::SaveConfig() { std::wstring error; if (!configStore_.Save(config_, &error)) Notify(L"配置无法保存", error, NIIF_WARNING); }
+void Application::SaveConfig() {
+  std::wstring error;
+  if (!configStore_.Save(config_, &error)) Notify(L"配置无法保存", error, NIIF_WARNING);
+  else config_.schemaVersion = 3;
+}
 
 void Application::Notify(std::wstring_view title, std::wstring_view message, DWORD flags) {
   NOTIFYICONDATAW data = trayIcon_; data.uFlags = NIF_INFO; data.dwInfoFlags = flags;

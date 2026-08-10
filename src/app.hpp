@@ -25,6 +25,14 @@ class Application {
   LRESULT HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK HotkeyCaptureProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                             UINT_PTR subclassId, DWORD_PTR referenceData);
+  struct HotkeyCaptureState {
+    std::wstring originalText;
+    UINT modifiers = 0;
+    bool listening = false;
+    bool submitted = false;
+  };
+  HotkeyCaptureState& HotkeyStateFor(HWND hwnd);
+  const HotkeyCaptureState& HotkeyStateFor(HWND hwnd) const;
   bool CreateMessageWindow(std::wstring& error);
   void AddTrayIcon();
   void RemoveTrayIcon();
@@ -36,6 +44,7 @@ class Application {
   void ShowSettings();
   void PopulateSettings(HWND hwnd);
   bool ReadSettings(HWND hwnd);
+  void UpdateQualitySlider(HWND hwnd, int x);
   bool UpdateAutoStart(std::wstring* error = nullptr);
   void SaveConfig();
   void Notify(std::wstring_view title, std::wstring_view message, DWORD flags = NIIF_INFO);
@@ -60,7 +69,11 @@ class Application {
   HBRUSH settingsControlBrush_ = nullptr;
   HFONT settingsFont_ = nullptr;
   HFONT settingsTitleFont_ = nullptr;
+  HFONT settingsSectionFont_ = nullptr;
   HFONT settingsSmallFont_ = nullptr;
+  bool settingsSliderDragging_ = false;
+  HotkeyCaptureState hotkeyPrimaryState_{};
+  HotkeyCaptureState hotkeySecondaryState_{};
 };
 
 }  // namespace rc

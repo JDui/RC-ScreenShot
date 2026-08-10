@@ -19,6 +19,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   bool completed = false;
   bool copied = false;
   bool textAdded = false;
+  bool textResized = false;
+  bool textRecolored = false;
   bool mosaicAdded = false;
   rc::CaptureOverlay overlay(instance, std::move(snapshot), config,
       [&](rc::OverlayResult result) {
@@ -26,7 +28,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         copied = result.completion == rc::CaptureCompletion::Copy;
         for (const auto& command : result.document.Commands())
           if (const auto* text = std::get_if<rc::TextCommand>(&command))
-            textAdded = text->text == L"横竖文字";
+            if (text->text == L"横竖文字") {
+              textAdded = true;
+              textResized = text->style.size > config.text.size + 1.0f;
+              textRecolored = text->style.color.rgba != config.text.color.rgba;
+            }
         for (const auto& command : result.document.Commands())
           if (const auto* mosaic = std::get_if<rc::MosaicCommand>(&command))
             mosaicAdded = mosaic->brush && !mosaic->points.empty();
@@ -49,6 +55,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (!edit) return 3;
   SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"横竖文字"));
   SendMessageW(edit, WM_KEYDOWN, VK_RETURN, 0);
+  // The text tool can select its own existing text.  The size slider and the
+  // first color swatch then edit that command instead of changing defaults.
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 100));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(100, 100));
+  // The narrow 640x360 test desktop clamps the 620px toolbar to the lower
+  // work-area edge: top=222, size slider y=279..301, first swatch y=279..299.
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(170, 290));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(170, 290));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(236, 290));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(236, 290));
   SendMessageW(overlay.hwnd(), WM_KEYDOWN, VK_RETURN, 0);
   MSG message{};
   for (int i = 0; i < 100 && !completed; ++i) {
@@ -59,6 +75,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   std::cout << "overlayCreated=1 completed=" << completed
             << " copied=" << copied << " textAdded=" << textAdded
+            << " textResized=" << textResized << " textRecolored=" << textRecolored
             << " mosaicAdded=" << mosaicAdded << '\n';
-  return completed && copied && textAdded && mosaicAdded ? 0 : 2;
+  return completed && copied && textAdded && textResized && textRecolored && mosaicAdded ? 0 : 2;
 }

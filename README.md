@@ -1,5 +1,7 @@
 # RC-ScreenShot
 
+当前版本：0.3.3
+
 ![RC-ScreenShot Logo](assets/rc-screenshot-logo.png)
 
 RC-ScreenShot 是面向 Windows 10 1903+ x64 的轻量原生截图工具。它使用 DXGI 1.5/D3D11 捕获 SDR、WCG 和 HDR 桌面，提供普通框选、顶层窗口吸附、原图单元识别、GPU 标注、横排/竖排文字、马赛克、剪贴板输出，以及带 gain map 的 Ultra HDR JPEG 保存。

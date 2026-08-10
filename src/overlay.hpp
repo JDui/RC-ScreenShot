@@ -37,8 +37,9 @@ class CaptureOverlay {
   LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
   bool CreateDeviceResources();
   void DiscardDeviceResources();
+  void EnsureToolbarBackdrop();
   void Paint();
-  void BeginSettingPreview(POINT point);
+  void BeginSettingPreview(POINT point, bool timed = false);
   void EndSettingPreview();
   void DrawSettingPreview();
   void BeginUnitDetection();
@@ -65,19 +66,30 @@ class CaptureOverlay {
   void DrawToolIcon(Tool tool, const RECT& rect, bool active);
   void DrawActionIcon(bool save, const RECT& rect);
   void DrawToolbar();
+  void DrawTooltip();
+  void UpdateTooltip(POINT point);
   void DrawTextCommand(const TextCommand& command);
   void DrawText(std::wstring_view text, const D2D1_RECT_F& rect, float size,
                 D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_CENTER);
   std::optional<Tool> HitTestTool(POINT point) const;
   enum class PropertyAction {
-    SizeDown, SizeUp, Color, Opacity, FillColor, FillOpacity,
-    MosaicStyle, MosaicStrengthDown, MosaicStrengthUp, FrameToggle, TextOrientation
+    SizeDown, SizeUp, Color, Opacity, FillColor, FillOpacity, FillToggle,
+    MosaicStyle, MosaicStrength, FrameToggle, TextOrientation, TextShadow
   };
-  struct PropertyButton { PropertyAction action; RECT rect; std::wstring label; };
+  struct PropertyButton {
+    PropertyAction action;
+    RECT rect;
+    std::wstring label;
+    bool pill = false;
+    bool slider = false;
+  };
   void DrawPropertyIcon(PropertyAction action, const RECT& rect);
   std::vector<PropertyButton> PropertyButtons() const;
   std::optional<PropertyAction> HitTestProperty(POINT point) const;
   void ActivateProperty(PropertyAction action);
+  void SetOpacityFromSlider(POINT point, const RECT& slider);
+  void SetFillOpacityFromSlider(POINT point, const RECT& slider);
+  void SetMosaicStrengthFromSlider(POINT point, const RECT& slider);
   bool HitCopy(POINT point) const;
   bool HitSave(POINT point) const;
   PointF ToSelectionPoint(POINT point) const;
@@ -87,16 +99,29 @@ class CaptureOverlay {
   void ChooseActiveColor();
   void ChooseFillColor();
   void CycleFillOpacity();
+  TextSetting* ActiveTextStyle();
+  const TextSetting* ActiveTextStyle() const;
+  ShapeSetting* ActiveShape();
+  const ShapeSetting* ActiveShape() const;
+  MosaicCommand* ActiveMosaic();
+  const MosaicCommand* ActiveMosaic() const;
   float ActiveSize() const;
   void SetActiveSize(float size);
   ColorSetting* ActiveColor();
   float ActiveOpacity() const;
+  float ActiveFillOpacity() const;
+  void SetActiveOpacity(float opacity);
+  void SetActiveFillOpacity(float opacity);
+  float ActiveMosaicStrength() const;
+  void SetActiveMosaicStrength(float value);
+  bool HasSizeControl() const;
   RECT SizeSliderRect() const;
   void SetSizeFromSlider(POINT point);
   std::optional<size_t> HitTestColorPreset(POINT point) const;
   void SetActivePresetColor(size_t index);
   void ShowEditorContextMenu(POINT point);
-  std::optional<size_t> HitTestCommand(POINT point) const;
+  std::optional<size_t> HitTestCommand(POINT point,
+                                       std::optional<Tool> toolFilter = std::nullopt) const;
   SelectionAdjustment HitTestCommandAdjustment(POINT point) const;
   RectF SelectedCommandBounds() const;
   void ContinueCommandAdjustment(POINT point);
@@ -104,8 +129,20 @@ class CaptureOverlay {
   void CommitTextInput();
   void CancelTextInput();
   static LRESULT CALLBACK TextEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
-                                       UINT_PTR subclassId, DWORD_PTR referenceData);
+                                        UINT_PTR subclassId, DWORD_PTR referenceData);
   RECT ToolbarRect() const;
+  RECT ToolbarWorkArea() const;
+  RECT ToolbarToolRect(size_t index) const;
+  RECT ToolbarCopyRect() const;
+  RECT ToolbarSaveRect() const;
+  RECT ToolbarMoreColorRect() const;
+  RECT ToolbarPresetRect(size_t index) const;
+  RECT ToolbarFillPresetRect(size_t index) const;
+  RECT ToolbarFillMoreColorRect() const;
+  bool HitTestToolbarMoreColor(POINT point) const;
+  bool HitTestToolbarFillMoreColor(POINT point) const;
+  std::optional<size_t> HitTestFillColorPreset(POINT point) const;
+  void SetActiveFillPresetColor(size_t index);
 
   HINSTANCE instance_ = nullptr;
   HWND hwnd_ = nullptr;
@@ -118,6 +155,13 @@ class CaptureOverlay {
   ComPtr<IDWriteFactory> dwriteFactory_;
   ComPtr<ID2D1HwndRenderTarget> renderTarget_;
   ComPtr<ID2D1Bitmap> desktopBitmap_;
+  ComPtr<ID2D1Bitmap> mosaicPreviewBitmap_;
+  ComPtr<ID2D1Bitmap> toolbarBackdropBitmap_;
+  uint64_t mosaicPreviewSignature_ = 0;
+  RECT toolbarBackdropRect_{};
+  bool toolbarBackdropValid_ = false;
+  std::vector<uint8_t> toolbarBackdropPixels_;
+  int toolbarBackdropStride_ = 0;
 
   SelectionMode mode_ = SelectionMode::Normal;
   Tool tool_ = Tool::Pen;
@@ -125,14 +169,22 @@ class CaptureOverlay {
   bool editing_ = false;
   bool drawing_ = false;
   bool sizeSliderDragging_ = false;
+  std::optional<PropertyAction> propertySliderDragging_;
+  bool toolbarDragging_ = false;
+  bool toolbarPositionSet_ = false;
   bool settingPreview_ = false;
+  POINT settingPreviewPoint_{};
   bool windowSelection_ = false;
   SelectionAdjustment selectionAdjustment_ = SelectionAdjustment::None;
   RECT selectionBeforeAdjust_{};
   POINT dragStart_{};
+  POINT toolbarDragStart_{};
+  POINT toolbarPositionStart_{};
+  POINT toolbarPosition_{};
   POINT currentPoint_{};
   POINT lastCanvasPoint_{};
-  POINT settingPreviewPoint_{};
+  std::chrono::steady_clock::time_point penLastSampleTime_{};
+  float penWidthScale_ = 1.0f;
   RECT selection_{};  // overlay-local coordinates
   RECT hoverRect_{};
   EditorDocument document_;
@@ -159,6 +211,10 @@ class CaptureOverlay {
   std::optional<size_t> textEditingCommand_;
   TextSetting textInputStyle_{};
   HFONT textEditFont_ = nullptr;
+  HBRUSH textEditBrush_ = nullptr;
+  bool textImeComposing_ = false;
+  std::wstring tooltipText_;
+  bool tooltipVisible_ = false;
 };
 
 }  // namespace rc

@@ -4,6 +4,11 @@
 
 namespace rc {
 
+// Returns the per-user folder used for automatic screenshot output.  Keeping
+// this in one place makes the default identical for a fresh install, a
+// migrated config, and the exporter fallback path.
+std::filesystem::path DefaultOutputDirectory();
+
 struct ColorSetting {
   uint32_t rgba = 0xFF3B30FF;  // RRGGBBAA
 };
@@ -31,6 +36,7 @@ struct TextSetting {
   float size = 28.0f;
   float opacity = 1.0f;
   bool vertical = false;
+  bool shadow = false;
   std::wstring fontFamily = L"Microsoft YaHei UI";
 };
 
@@ -38,14 +44,14 @@ enum class DefaultAction { Copy, Save };
 enum class MosaicStyle { Pixel, Blur };
 
 struct AppConfig {
-  int schemaVersion = 1;
+  int schemaVersion = 3;
   std::vector<HotkeySetting> hotkeys{{}};
   bool launchAtLogin = false;
   bool silentAtLogin = true;
 
-  std::wstring outputDirectory = L"Screenshots";
+  std::wstring outputDirectory = DefaultOutputDirectory().wstring();
   std::wstring filenameTemplate = L"RC_yyyyMMdd_HHmmss_fff.jpg";
-  int jpegQuality = 95;
+  int jpegQuality = 80;
   DefaultAction defaultAction = DefaultAction::Copy;
   bool autoSaveOnCopy = false;
 
@@ -60,7 +66,7 @@ struct AppConfig {
   MosaicStyle mosaicStyle = MosaicStyle::Pixel;
   float mosaicBrushSize = 32.0f;
   int mosaicPixelSize = 16;
-  float mosaicBlurRadius = 12.0f;
+  float mosaicBlurRadius = 6.0f;
 
   bool windowShadow = true;
   std::wstring language = L"zh-CN";

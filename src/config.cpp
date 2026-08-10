@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <fstream>
+#include <shlobj.h>
 #include <sstream>
 
 namespace rc {
@@ -254,6 +255,22 @@ void WriteShape(std::ostringstream& stream, const ShapeSetting& shape, int inden
 
 }  // namespace
 
+std::filesystem::path DefaultOutputDirectory() {
+  PWSTR raw = nullptr;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DEFAULT, nullptr, &raw)) && raw) {
+    const std::filesystem::path pictures(raw);
+    CoTaskMemFree(raw);
+    return pictures / L"RCSS";
+  }
+
+  wchar_t profile[MAX_PATH]{};
+  const DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, _countof(profile));
+  if (length > 0 && length < _countof(profile)) {
+    return std::filesystem::path(profile) / L"Pictures" / L"RCSS";
+  }
+  return std::filesystem::current_path() / L"RCSS";
+}
+
 ConfigStore::ConfigStore(std::filesystem::path executablePath) {
   executableDirectory_ = std::filesystem::absolute(executablePath).parent_path();
   path_ = executableDirectory_ / L"RC-ScreenShot.config.json";
@@ -274,7 +291,8 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
     return config;
   }
   const Json* root = &*rootValue;
-  config.schemaVersion = ReadInt(root, "schemaVersion", 1, 1, 1);
+  const int storedSchema = ReadInt(root, "schemaVersion", 1, 1, 3);
+  config.schemaVersion = storedSchema;
   if (const Json* keys = root->Find("hotkeys"); keys && keys->AsArray()) {
     std::vector<HotkeySetting> parsed;
     for (const Json& entry : *keys->AsArray()) {
@@ -284,7 +302,12 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
       hotkey.enabled = ReadBool(&entry, "enabled", true);
       parsed.push_back(hotkey);
     }
-    if (!parsed.empty()) config.hotkeys = std::move(parsed);
+    std::vector<HotkeySetting> normalized;
+    for (const HotkeySetting& key : parsed) {
+      if (!key.enabled || normalized.size() >= 2) continue;
+      normalized.push_back(key);
+    }
+    if (!normalized.empty()) config.hotkeys = std::move(normalized);
   }
   if (const Json* startup = root->Find("startup")) {
     config.launchAtLogin = ReadBool(startup, "launchAtLogin", config.launchAtLogin);
@@ -309,6 +332,7 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
       config.text.size = ReadFloat(text, "size", config.text.size, 8.0f, 256.0f);
       config.text.opacity = ReadFloat(text, "opacity", config.text.opacity, 0.0f, 1.0f);
       config.text.vertical = ReadBool(text, "vertical", config.text.vertical);
+      config.text.shadow = ReadBool(text, "shadow", config.text.shadow);
       config.text.fontFamily = ReadWide(text, "fontFamily", config.text.fontFamily);
     }
     LoadStroke(editor->Find("frame"), config.frame);
@@ -329,16 +353,26 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
     config.theme = ReadWide(ui, "theme", config.theme);
     config.toolbarPosition = ReadWide(ui, "toolbarPosition", config.toolbarPosition);
   }
+  // Version 1 used a portable-folder-relative path and JPEG quality 95 as
+  // defaults.  Migrate only those exact legacy defaults so user-customized
+  // settings remain untouched.
+  if (storedSchema < 2) {
+    if (config.outputDirectory.empty() || config.outputDirectory == L"Screenshots")
+      config.outputDirectory = DefaultOutputDirectory().wstring();
+    if (config.jpegQuality == 95) config.jpegQuality = 80;
+  }
+  if (config.outputDirectory.empty()) config.outputDirectory = DefaultOutputDirectory().wstring();
   return config;
 }
 
 bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
   std::ostringstream stream;
-  stream << "{\n  \"schemaVersion\": 1,\n  \"hotkeys\": [";
-  for (size_t i = 0; i < config.hotkeys.size(); ++i) {
-    const auto& key = config.hotkeys[i];
-    if (i) stream << ',';
-    stream << "\n    {\"modifiers\": " << key.modifiers << ", \"virtualKey\": "
+  stream << "{\n  \"schemaVersion\": 3,\n  \"hotkeys\": [";
+  size_t writtenHotkeys = 0;
+  for (const auto& key : config.hotkeys) {
+    if (!key.enabled || writtenHotkeys >= 2) continue;
+    stream << (writtenHotkeys++ == 0 ? "\n    " : ",\n    ");
+    stream << "{\"modifiers\": " << key.modifiers << ", \"virtualKey\": "
            << key.virtualKey << ", \"enabled\": " << (key.enabled ? "true" : "false") << "}";
   }
   stream << "\n  ],\n  \"startup\": {\"launchAtLogin\": "
@@ -359,6 +393,7 @@ bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
          << "\", \"size\": " << config.text.size
          << ", \"opacity\": " << config.text.opacity
          << ", \"vertical\": " << (config.text.vertical ? "true" : "false")
+         << ", \"shadow\": " << (config.text.shadow ? "true" : "false")
          << ", \"fontFamily\": \"" << Escape(ToUtf8(config.text.fontFamily)) << "\"}";
   stream << ",\n    \"frame\": "; WriteStroke(stream, config.frame, 4);
   stream << ",\n    \"frameEnabled\": " << (config.frameEnabled ? "true" : "false");
@@ -396,7 +431,9 @@ bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
 }
 
 std::filesystem::path ConfigStore::ResolveOutputDirectory(const AppConfig& config) const {
-  std::filesystem::path directory(config.outputDirectory);
+  std::filesystem::path directory = config.outputDirectory.empty()
+                                        ? DefaultOutputDirectory()
+                                        : std::filesystem::path(config.outputDirectory);
   return directory.is_absolute() ? directory : executableDirectory_ / directory;
 }
 

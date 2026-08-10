@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RC-ScreenShot VERSION 0.2.0 LANGUAGES C CXX)
+project(RC-ScreenShot VERSION 0.3.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,7 +54,7 @@ target_compile_definitions(RC-ScreenShot PRIVATE
 target_compile_options(RC-ScreenShot PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
 target_link_options(RC-ScreenShot PRIVATE /MANIFEST:NO)
 target_link_libraries(RC-ScreenShot PRIVATE
-  d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 oleaut32 uuid comctl32 gdi32 user32 advapi32 comdlg32
+  d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 oleaut32 uuid comctl32 gdi32 user32 advapi32 comdlg32 imm32
 )
 if(RC_ENABLE_ULTRAHDR)
   target_include_directories(RC-ScreenShot PRIVATE ${libultrahdr_SOURCE_DIR})
@@ -79,7 +79,7 @@ if(RC_BUILD_TESTS)
   target_compile_definitions(rc_core_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(rc_core_tests PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
   target_link_libraries(rc_core_tests PRIVATE
-    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 uuid gdi32 user32
+    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 uuid gdi32 user32 imm32
   )
   add_test(NAME rc_core_tests COMMAND rc_core_tests)
 
@@ -87,7 +87,7 @@ if(RC_BUILD_TESTS)
   target_include_directories(rc_capture_smoke PRIVATE src)
   target_compile_definitions(rc_capture_smoke PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(rc_capture_smoke PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
-  target_link_libraries(rc_capture_smoke PRIVATE d3d11 dxgi dwmapi ole32 gdi32 user32)
+  target_link_libraries(rc_capture_smoke PRIVATE d3d11 dxgi dwmapi ole32 gdi32 user32 imm32)
 
   add_executable(rc_overlay_smoke WIN32 EXCLUDE_FROM_ALL
     tests/overlay_smoke.cpp src/capture.cpp src/config.cpp src/editor.cpp src/overlay.cpp src/unit_detector.cpp
@@ -96,7 +96,7 @@ if(RC_BUILD_TESTS)
   target_compile_definitions(rc_overlay_smoke PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(rc_overlay_smoke PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
   target_link_libraries(rc_overlay_smoke PRIVATE
-    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi ole32 uuid gdi32 user32 comdlg32 comctl32
+    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi ole32 uuid gdi32 user32 comdlg32 comctl32 imm32
   )
 endif()
 

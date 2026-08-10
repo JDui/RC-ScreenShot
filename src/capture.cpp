@@ -105,6 +105,35 @@ void StoreSdrPixel(DesktopSnapshot& snapshot, int x, int y, uint8_t r, uint8_t g
   hdr[3] = FloatToHalf(1.0f);
 }
 
+// BGRA-only variant used on SDR systems where the half-float HDR buffer is never consumed.
+void StoreBgraPixel(DesktopSnapshot& snapshot, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+  if (x < 0 || y < 0 || x >= snapshot.width || y >= snapshot.height) return;
+  uint8_t* pixel = snapshot.bgra.data() + static_cast<size_t>(y * snapshot.bgraStride + x * 4);
+  pixel[0] = b; pixel[1] = g; pixel[2] = r; pixel[3] = 255;
+}
+
+// True when every sampled color is black. Alpha is intentionally ignored: BGRA desktop frames
+// commonly leave it at zero, while an empty HDR frame may still carry an opaque alpha channel.
+bool FrameIsBlack(const D3D11_MAPPED_SUBRESOURCE& mapped, const D3D11_TEXTURE2D_DESC& desc) {
+  const size_t stepX = std::max<size_t>(1, desc.Width / 64);
+  const size_t stepY = std::max<size_t>(1, desc.Height / 64);
+  for (size_t y = 0; y < desc.Height; y += stepY) {
+    const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+    for (size_t x = 0; x < desc.Width; x += stepX) {
+      if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        const uint16_t* pixel = reinterpret_cast<const uint16_t*>(row) + x * 4;
+        if (pixel[0] || pixel[1] || pixel[2]) return false;
+      } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        if ((reinterpret_cast<const uint32_t*>(row)[x] & 0x3FFFFFFFu) != 0) return false;
+      } else {
+        const uint8_t* pixel = row + x * 4;
+        if (pixel[0] || pixel[1] || pixel[2]) return false;
+      }
+    }
+  }
+  return true;
+}
+
 POINT MapRotated(int x, int y, int sourceWidth, int sourceHeight, DXGI_MODE_ROTATION rotation) {
   switch (rotation) {
     case DXGI_MODE_ROTATION_ROTATE90: return {y, sourceHeight - 1 - x};
@@ -131,7 +160,7 @@ BOOL CALLBACK WindowEnumerator(HWND hwnd, LPARAM parameter) {
   return TRUE;
 }
 
-bool LooksLikeEmptyDesktop(const DesktopSnapshot& snapshot) {
+bool SnapshotIsBlankImpl(const DesktopSnapshot& snapshot) {
   if (!snapshot.IsValid()) return true;
   const int stepX = std::max(1, snapshot.width / 64);
   const int stepY = std::max(1, snapshot.height / 64);
@@ -151,6 +180,10 @@ bool LooksLikeEmptyDesktop(const DesktopSnapshot& snapshot) {
 }
 
 }  // namespace
+
+bool SnapshotIsBlank(const DesktopSnapshot& snapshot) {
+  return SnapshotIsBlankImpl(snapshot);
+}
 
 float HalfToFloat(uint16_t half) {
   const uint32_t sign = static_cast<uint32_t>(half & 0x8000) << 16;
@@ -199,9 +232,8 @@ bool DesktopCapture::Capture(DesktopSnapshot& snapshot, std::wstring& error) {
     DesktopSnapshot candidate;
     std::wstring attemptError;
     if (CaptureDxgi(candidate, attemptError)) {
-      if (!LooksLikeEmptyDesktop(candidate)) {
+      if (!SnapshotIsBlank(candidate)) {
         snapshot = std::move(candidate);
-        EnumerateWindows(snapshot);
         return true;
       }
       emptyDxgiFrame = true;
@@ -221,19 +253,36 @@ bool DesktopCapture::Capture(DesktopSnapshot& snapshot, std::wstring& error) {
     return false;
   }
   std::wstring gdiError;
-  if (!CaptureGdi(snapshot, gdiError)) {
-    error += L"\nGDI 回退也失败：" + gdiError;
-    return false;
+  bool emptyGdiFrame = false;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    DesktopSnapshot candidate;
+    std::wstring attemptError;
+    if (CaptureGdi(candidate, attemptError)) {
+      if (!SnapshotIsBlank(candidate)) {
+        candidate.usedGdiFallback = true;
+        snapshot = std::move(candidate);
+        if (emptyDxgiFrame) error += L"\nDXGI 帧为空，已使用 GDI 重新捕获。";
+        return true;
+      }
+      emptyGdiFrame = true;
+    } else {
+      gdiError = std::move(attemptError);
+    }
+    if (attempt < 2) Sleep(40);
   }
-  if (emptyDxgiFrame) error += L"\nDXGI 首帧为空，已使用 GDI 重新捕获。";
-  snapshot.usedGdiFallback = true;
-  EnumerateWindows(snapshot);
-  return true;
+  if (!gdiError.empty()) error += L"\nGDI 回退也失败：" + gdiError;
+  if (emptyGdiFrame) error += L"\nGDI 连续返回空画面，已取消本次截图以避免黑屏。";
+  return false;
 }
 
 bool DesktopCapture::CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error) {
   const auto outputs = EnumerateOutputs();
   if (outputs.empty()) { error = L"没有找到活动显示器。"; return false; }
+  // The half-float HDR buffer is only consumed when at least one output carries an HDR color
+  // space. On plain SDR systems it is never read, so skip allocating and filling it entirely.
+  const bool anyHdr = std::any_of(outputs.begin(), outputs.end(), [](const OutputInfo& info) {
+    return IsHdrColorSpace(info.description.ColorSpace);
+  });
   // Use the same coordinate source as the captured outputs. Mixing GetSystemMetrics with DXGI
   // monitor coordinates under mixed-DPI layouts can shift portrait/negative-coordinate screens.
   RECT virtualBounds = outputs.front().description.DesktopCoordinates;
@@ -247,9 +296,11 @@ bool DesktopCapture::CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error)
   snapshot.height = virtualBounds.bottom - virtualBounds.top;
   snapshot.bgraStride = snapshot.width * 4;
   snapshot.bgra.assign(static_cast<size_t>(snapshot.bgraStride * snapshot.height), 0);
-  snapshot.hdrRgba.assign(static_cast<size_t>(snapshot.width * snapshot.height * 4), 0);
   for (size_t i = 3; i < snapshot.bgra.size(); i += 4) snapshot.bgra[i] = 255;
-  for (size_t i = 3; i < snapshot.hdrRgba.size(); i += 4) snapshot.hdrRgba[i] = FloatToHalf(1.0f);
+  if (anyHdr) {
+    snapshot.hdrRgba.assign(static_cast<size_t>(snapshot.width * snapshot.height * 4), 0);
+    for (size_t i = 3; i < snapshot.hdrRgba.size(); i += 4) snapshot.hdrRgba[i] = FloatToHalf(1.0f);
+  }
 
   for (const OutputInfo& info : outputs) {
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -278,79 +329,113 @@ bool DesktopCapture::CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error)
       if (SUCCEEDED(info.output.As(&output1))) hr = output1->DuplicateOutput(device.Get(), &duplication);
     }
     if (FAILED(hr)) { error = L"创建桌面复制会话失败：" + HResultMessage(hr); return false; }
-    DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-    ComPtr<IDXGIResource> resource;
-    hr = duplication->AcquireNextFrame(250, &frameInfo, &resource);
-    if (FAILED(hr)) { error = L"获取桌面帧失败：" + HResultMessage(hr); return false; }
-    ScopeExit release{[&] { duplication->ReleaseFrame(); }};
-    ComPtr<ID3D11Texture2D> texture;
-    if (FAILED(resource.As(&texture))) { error = L"桌面帧不是 D3D11 纹理。"; return false; }
-    D3D11_TEXTURE2D_DESC desc{};
-    texture->GetDesc(&desc);
-    D3D11_TEXTURE2D_DESC stagingDesc = desc;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    stagingDesc.MiscFlags = 0;
-    ComPtr<ID3D11Texture2D> staging;
-    if (FAILED(device->CreateTexture2D(&stagingDesc, nullptr, &staging))) {
-      error = L"创建桌面帧读回纹理失败。"; return false;
-    }
-    context->CopyResource(staging.Get(), texture.Get());
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) { error = L"读取桌面帧失败：" + HResultMessage(hr); return false; }
-    ScopeExit unmap{[&] { context->Unmap(staging.Get(), 0); }};
-
     DXGI_OUTDUPL_DESC duplicationDesc{};
     duplication->GetDesc(&duplicationDesc);
     const RECT monitor = info.description.DesktopCoordinates;
     const int destinationWidth = monitor.right - monitor.left;
     const int destinationHeight = monitor.bottom - monitor.top;
-    const bool hdrOutput = hdrColorSpace &&
-                           (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                            desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
     const float peakNits = info.description.MaxLuminance > 0 ? info.description.MaxLuminance : 1000.0f;
-    if (hdrOutput) {
-      snapshot.hasHdr = true;
-      snapshot.peakLuminanceNits = std::max(snapshot.peakLuminanceNits, peakNits);
-      snapshot.hdrRegions.push_back(monitor);
-    }
-    for (int dy = 0; dy < destinationHeight; ++dy) {
-      for (int dx = 0; dx < destinationWidth; ++dx) {
-        POINT source = MapRotated(dx, dy, static_cast<int>(desc.Width), static_cast<int>(desc.Height),
-                                  duplicationDesc.Rotation);
-        source.x = std::clamp(source.x, 0L, static_cast<LONG>(desc.Width) - 1);
-        source.y = std::clamp(source.y, 0L, static_cast<LONG>(desc.Height) - 1);
-        float r = 0, g = 0, b = 0;
-        const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
-                             static_cast<size_t>(source.y * mapped.RowPitch);
-        if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-          const uint16_t* pixel = reinterpret_cast<const uint16_t*>(row) + source.x * 4;
-          // Windows scRGB uses 1.0 == 80 nits; Ultra HDR linear RGB uses 1.0 == 203 nits.
-          r = HalfToFloat(pixel[0]) * (80.0f / 203.0f);
-          g = HalfToFloat(pixel[1]) * (80.0f / 203.0f);
-          b = HalfToFloat(pixel[2]) * (80.0f / 203.0f);
-        } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-          const uint32_t packed = reinterpret_cast<const uint32_t*>(row)[source.x];
-          const float pr = static_cast<float>(packed & 0x3FF) / 1023.0f;
-          const float pg = static_cast<float>((packed >> 10) & 0x3FF) / 1023.0f;
-          const float pb = static_cast<float>((packed >> 20) & 0x3FF) / 1023.0f;
-          auto rgb = Rec2020To709(PqToNits(pr) / 203.0f, PqToNits(pg) / 203.0f,
-                                  PqToNits(pb) / 203.0f);
-          r = rgb[0]; g = rgb[1]; b = rgb[2];
-        } else {
-          const uint8_t* pixel = row + source.x * 4;
-          const int vx = monitor.left - virtualBounds.left + dx;
-          const int vy = monitor.top - virtualBounds.top + dy;
-          StoreSdrPixel(snapshot, vx, vy, pixel[2], pixel[1], pixel[0]);
-          continue;
-        }
-        const int vx = monitor.left - virtualBounds.left + dx;
-        const int vy = monitor.top - virtualBounds.top + dy;
-        StorePixel(snapshot, vx, vy, r, g, b, peakNits);
+
+    // The first frame of a fresh duplication session is a known transient all-black frame.
+    // Re-acquiring on the same session fixes it cheaply; only fall back to the outer loop's
+    // device+session rebuild when the black-out persists. A monitor that is legitimately all
+    // black pays at most one extra (short-timeout) acquire.
+    constexpr int kMaximumFrameAttempts = 4;
+    bool capturedOutput = false;
+    for (int frameAttempt = 0; frameAttempt < kMaximumFrameAttempts; ++frameAttempt) {
+      DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+      ComPtr<IDXGIResource> resource;
+      hr = duplication->AcquireNextFrame(frameAttempt == 0 ? 300 : 120, &frameInfo, &resource);
+      if (hr == DXGI_ERROR_WAIT_TIMEOUT && frameAttempt + 1 < kMaximumFrameAttempts) continue;
+      if (FAILED(hr)) { error = L"获取桌面帧失败：" + HResultMessage(hr); return false; }
+      ScopeExit release{[&] { duplication->ReleaseFrame(); }};
+      ComPtr<ID3D11Texture2D> texture;
+      if (FAILED(resource.As(&texture))) { error = L"桌面帧不是 D3D11 纹理。"; return false; }
+      D3D11_TEXTURE2D_DESC desc{};
+      texture->GetDesc(&desc);
+      D3D11_TEXTURE2D_DESC stagingDesc = desc;
+      stagingDesc.Usage = D3D11_USAGE_STAGING;
+      stagingDesc.BindFlags = 0;
+      stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      stagingDesc.MiscFlags = 0;
+      ComPtr<ID3D11Texture2D> staging;
+      if (FAILED(device->CreateTexture2D(&stagingDesc, nullptr, &staging))) {
+        error = L"创建桌面帧读回纹理失败。"; return false;
       }
+      context->CopyResource(staging.Get(), texture.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+      if (FAILED(hr)) { error = L"读取桌面帧失败：" + HResultMessage(hr); return false; }
+      ScopeExit unmap{[&] { context->Unmap(staging.Get(), 0); }};
+
+      if (FrameIsBlack(mapped, desc)) {
+        if (frameAttempt + 1 < kMaximumFrameAttempts) continue;
+        error = L"显示器连续返回空画面，已重建捕获会话。";
+        return false;
+      }
+
+      const bool hdrOutput = hdrColorSpace &&
+                             (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                              desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+      if (hdrOutput) {
+        snapshot.hasHdr = true;
+        snapshot.peakLuminanceNits = std::max(snapshot.peakLuminanceNits, peakNits);
+        snapshot.hdrRegions.push_back(monitor);
+      }
+      if (!anyHdr && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+          duplicationDesc.Rotation == DXGI_MODE_ROTATION_IDENTITY &&
+          static_cast<int>(desc.Width) == destinationWidth &&
+          static_cast<int>(desc.Height) == destinationHeight) {
+        // SDR fast path: the BGRA8 frame maps 1:1 into the virtual-desktop buffer, so copy whole
+        // rows instead of converting every pixel. The desktop alpha byte is undefined (commonly
+        // zero), so force it opaque just like the per-pixel path does.
+        for (int dy = 0; dy < destinationHeight; ++dy) {
+          const auto* source = static_cast<const uint8_t*>(mapped.pData) +
+                               static_cast<size_t>(dy * mapped.RowPitch);
+          uint8_t* destination = snapshot.bgra.data() +
+              static_cast<size_t>((monitor.top - virtualBounds.top + dy) * snapshot.bgraStride +
+                                  (monitor.left - virtualBounds.left) * 4);
+          memcpy(destination, source, static_cast<size_t>(destinationWidth * 4));
+          for (int dx = 0; dx < destinationWidth; ++dx) destination[dx * 4 + 3] = 255;
+        }
+      } else {
+        for (int dy = 0; dy < destinationHeight; ++dy) {
+          for (int dx = 0; dx < destinationWidth; ++dx) {
+            POINT source = MapRotated(dx, dy, static_cast<int>(desc.Width), static_cast<int>(desc.Height),
+                                      duplicationDesc.Rotation);
+            source.x = std::clamp(source.x, 0L, static_cast<LONG>(desc.Width) - 1);
+            source.y = std::clamp(source.y, 0L, static_cast<LONG>(desc.Height) - 1);
+            const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
+                                 static_cast<size_t>(source.y * mapped.RowPitch);
+            const int vx = monitor.left - virtualBounds.left + dx;
+            const int vy = monitor.top - virtualBounds.top + dy;
+            if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+              const uint16_t* pixel = reinterpret_cast<const uint16_t*>(row) + source.x * 4;
+              // Windows scRGB uses 1.0 == 80 nits; Ultra HDR linear RGB uses 1.0 == 203 nits.
+              const float r = HalfToFloat(pixel[0]) * (80.0f / 203.0f);
+              const float g = HalfToFloat(pixel[1]) * (80.0f / 203.0f);
+              const float b = HalfToFloat(pixel[2]) * (80.0f / 203.0f);
+              StorePixel(snapshot, vx, vy, r, g, b, peakNits);
+            } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+              const uint32_t packed = reinterpret_cast<const uint32_t*>(row)[source.x];
+              const float pr = static_cast<float>(packed & 0x3FF) / 1023.0f;
+              const float pg = static_cast<float>((packed >> 10) & 0x3FF) / 1023.0f;
+              const float pb = static_cast<float>((packed >> 20) & 0x3FF) / 1023.0f;
+              const auto rgb = Rec2020To709(PqToNits(pr) / 203.0f, PqToNits(pg) / 203.0f,
+                                            PqToNits(pb) / 203.0f);
+              StorePixel(snapshot, vx, vy, rgb[0], rgb[1], rgb[2], peakNits);
+            } else {
+              const uint8_t* pixel = row + source.x * 4;
+              if (anyHdr) StoreSdrPixel(snapshot, vx, vy, pixel[2], pixel[1], pixel[0]);
+              else StoreBgraPixel(snapshot, vx, vy, pixel[2], pixel[1], pixel[0]);
+            }
+          }
+        }
+      }
+      capturedOutput = true;
+      break;
     }
+    if (!capturedOutput) { error = L"没有取得有效的桌面画面。"; return false; }
   }
   return snapshot.IsValid();
 }
@@ -386,22 +471,16 @@ bool DesktopCapture::CaptureGdi(DesktopSnapshot& snapshot, std::wstring& error) 
   snapshot.width = width; snapshot.height = height; snapshot.bgraStride = width * 4;
   snapshot.bgra.assign(static_cast<uint8_t*>(bits), static_cast<uint8_t*>(bits) +
                        static_cast<size_t>(snapshot.bgraStride * height));
-  snapshot.hdrRgba.resize(static_cast<size_t>(width * height * 4));
+  // The GDI fallback never produces HDR regions, so snapshot.hasHdr stays false and the
+  // half-float HDR buffer is never consumed by the exporter. Just fix the undefined alpha.
   for (int py = 0; py < height; ++py) {
-    for (int px = 0; px < width; ++px) {
-      uint8_t* pixel = snapshot.bgra.data() + static_cast<size_t>(py * snapshot.bgraStride + px * 4);
-      pixel[3] = 255;
-      uint16_t* hdr = snapshot.hdrRgba.data() + static_cast<size_t>((py * width + px) * 4);
-      hdr[0] = FloatToHalf(SrgbToLinear(pixel[2] / 255.0f));
-      hdr[1] = FloatToHalf(SrgbToLinear(pixel[1] / 255.0f));
-      hdr[2] = FloatToHalf(SrgbToLinear(pixel[0] / 255.0f));
-      hdr[3] = FloatToHalf(1.0f);
-    }
+    uint8_t* row = snapshot.bgra.data() + static_cast<size_t>(py * snapshot.bgraStride);
+    for (int px = 0; px < width; ++px) row[px * 4 + 3] = 255;
   }
   return true;
 }
 
-void DesktopCapture::EnumerateWindows(DesktopSnapshot& snapshot) {
+void EnumerateWindows(DesktopSnapshot& snapshot) {
   snapshot.windows.clear();
   EnumWindows(WindowEnumerator, reinterpret_cast<LPARAM>(&snapshot.windows));
   snapshot.windows.erase(std::remove_if(snapshot.windows.begin(), snapshot.windows.end(), [&](const WindowCandidate& candidate) {

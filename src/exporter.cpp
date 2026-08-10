@@ -1,5 +1,7 @@
 #include "exporter.hpp"
 
+#include "arrow.hpp"
+
 #include <d2d1.h>
 #include <dwrite.h>
 #include <objidl.h>
@@ -128,9 +130,31 @@ void DrawVectorCommands(ID2D1RenderTarget* target, ID2D1Factory* d2dFactory,
     if (FAILED(sink->Close())) return;
     target->DrawGeometry(geometry.Get(), brush.Get(), width, roundStroke.Get());
   };
+  const auto drawPressurePath = [&](const PenCommand& pen, const D2D1_COLOR_F& color) {
+    if (pen.points.empty()) return;
+    if (pen.widthScales.empty()) {
+      drawRoundPath(pen.points, color, pen.style.width);
+      return;
+    }
+    ComPtr<ID2D1SolidColorBrush> brush;
+    target->CreateSolidColorBrush(color, &brush);
+    const auto center = [&](size_t index) {
+      return D2D1::Point2F(pen.points[index].x + offsetX, pen.points[index].y + offsetY);
+    };
+    const auto dot = [&](size_t index) {
+      const float radius = PenPointWidth(pen, index) * 0.5f;
+      target->FillEllipse({center(index), radius, radius}, brush.Get());
+    };
+    dot(0);
+    for (size_t index = 1; index < pen.points.size(); ++index) {
+      const float width = (PenPointWidth(pen, index - 1) + PenPointWidth(pen, index)) * 0.5f;
+      target->DrawLine(center(index - 1), center(index), brush.Get(), width, roundStroke.Get());
+      dot(index);
+    }
+  };
   for (const EditCommand& command : commands) {
     if (const auto* pen = std::get_if<PenCommand>(&command)) {
-      drawRoundPath(pen->points, D2DColor(pen->style.color, pen->style.opacity), pen->style.width);
+      drawPressurePath(*pen, D2DColor(pen->style.color, pen->style.opacity));
     } else if (const auto* shape = std::get_if<ShapeCommand>(&command)) {
       const RectF rect = NormalizeRect(shape->start, shape->end);
       const D2D1_RECT_F d2dRect{rect.left + offsetX, rect.top + offsetY,
@@ -151,19 +175,18 @@ void DrawVectorCommands(ID2D1RenderTarget* target, ID2D1Factory* d2dFactory,
           if (fill) target->FillEllipse(ellipse, fill.Get());
           target->DrawEllipse(ellipse, stroke.Get(), shape->style.stroke.width); break;
         }
-        case ShapeKind::Line:
-        case ShapeKind::Arrow: {
+        case ShapeKind::Line: {
           const D2D1_POINT_2F start{shape->start.x + offsetX, shape->start.y + offsetY};
           const D2D1_POINT_2F end{shape->end.x + offsetX, shape->end.y + offsetY};
           target->DrawLine(start, end, stroke.Get(), shape->style.stroke.width);
-          if (shape->kind == ShapeKind::Arrow) {
-            const float angle = std::atan2(end.y - start.y, end.x - start.x);
-            const float size = std::max(10.0f, shape->style.stroke.width * 4.0f);
-            D2D1_POINT_2F left{end.x - size * std::cos(angle - 0.55f), end.y - size * std::sin(angle - 0.55f)};
-            D2D1_POINT_2F right{end.x - size * std::cos(angle + 0.55f), end.y - size * std::sin(angle + 0.55f)};
-            target->DrawLine(end, left, stroke.Get(), shape->style.stroke.width);
-            target->DrawLine(end, right, stroke.Get(), shape->style.stroke.width);
-          }
+          break;
+        }
+        case ShapeKind::Arrow: {
+          const D2D1_POINT_2F start{shape->start.x + offsetX, shape->start.y + offsetY};
+          const D2D1_POINT_2F end{shape->end.x + offsetX, shape->end.y + offsetY};
+          DrawArrow(target, d2dFactory, start, end,
+                    D2DColor(shape->style.stroke.color, shape->style.stroke.opacity),
+                    shape->style.stroke.width);
           break;
         }
       }
@@ -175,23 +198,32 @@ void DrawVectorCommands(ID2D1RenderTarget* target, ID2D1Factory* d2dFactory,
       format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
       format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
       format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-      ComPtr<ID2D1SolidColorBrush> brush;
-      target->CreateSolidColorBrush(D2DColor(text->style.color, text->style.opacity), &brush);
       const float originX = text->origin.x + offsetX, originY = text->origin.y + offsetY;
-      if (!text->style.vertical) {
-        target->DrawTextW(text->text.data(), static_cast<UINT32>(text->text.size()), format.Get(),
-                          D2D1::RectF(originX, originY, originX + 4096, originY + 4096), brush.Get());
-      } else {
-        float x = originX, y = originY;
-        const float advance = text->style.size * 1.16f;
-        for (wchar_t character : text->text) {
-          if (character == L'\r') continue;
-          if (character == L'\n') { x += advance; y = originY; continue; }
-          target->DrawTextW(&character, 1, format.Get(),
-                            D2D1::RectF(x, y, x + advance, y + advance), brush.Get());
-          y += advance;
+      const auto draw = [&](float drawOffsetX, float drawOffsetY, D2D1_COLOR_F color) {
+        ComPtr<ID2D1SolidColorBrush> brush;
+        if (FAILED(target->CreateSolidColorBrush(color, &brush))) return;
+        if (!text->style.vertical) {
+          target->DrawTextW(text->text.data(), static_cast<UINT32>(text->text.size()), format.Get(),
+                            D2D1::RectF(originX + drawOffsetX, originY + drawOffsetY,
+                                         originX + drawOffsetX + 4096, originY + drawOffsetY + 4096),
+                            brush.Get());
+        } else {
+          float x = originX + drawOffsetX, y = originY + drawOffsetY;
+          const float advance = text->style.size * 1.16f;
+          for (wchar_t character : text->text) {
+            if (character == L'\r') continue;
+            if (character == L'\n') { x += advance; y = originY + drawOffsetY; continue; }
+            target->DrawTextW(&character, 1, format.Get(),
+                              D2D1::RectF(x, y, x + advance, y + advance), brush.Get());
+            y += advance;
+          }
         }
+      };
+      if (text->style.shadow) {
+        const float offset = std::clamp(text->style.size * 0.08f, 2.0f, 5.0f);
+        draw(offset, offset, D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.68f));
       }
+      draw(0.0f, 0.0f, D2DColor(text->style.color, text->style.opacity));
     }
   }
 }
@@ -215,7 +247,6 @@ bool ImageExporter::Render(const DesktopSnapshot& snapshot, const RECT& selectio
   image.height = sourceHeight + topMargin + bottomMargin;
   image.stride = image.width * 4;
   image.bgra.assign(static_cast<size_t>(image.stride * image.height), 255);
-  image.hdrRgba.assign(static_cast<size_t>(image.width * image.height * 4), FloatToHalf(1.0f));
   image.hasHdr = false;
   for (const RECT& hdrRegion : snapshot.hdrRegions) {
     RECT intersection{};
@@ -225,20 +256,28 @@ bool ImageExporter::Render(const DesktopSnapshot& snapshot, const RECT& selectio
     }
   }
   image.peakLuminanceNits = snapshot.peakLuminanceNits;
+  // The half-float buffer is only read by the Ultra HDR encoder, which runs solely when the
+  // selection intersects an HDR region. Leave it empty otherwise and skip the merge pass below.
+  if (image.hasHdr) {
+    image.hdrRgba.assign(static_cast<size_t>(image.width * image.height * 4), FloatToHalf(1.0f));
+  }
 
   std::vector<uint8_t> cropped(static_cast<size_t>(sourceWidth * sourceHeight * 4));
-  std::vector<uint16_t> originalHdr(static_cast<size_t>(sourceWidth * sourceHeight * 4));
+  std::vector<uint16_t> originalHdr;
+  if (snapshot.hasHdr) originalHdr.assign(static_cast<size_t>(sourceWidth * sourceHeight * 4), 0);
   const int sourceX = clipped.left - snapshot.virtualBounds.left;
   const int sourceY = clipped.top - snapshot.virtualBounds.top;
   for (int y = 0; y < sourceHeight; ++y) {
     memcpy(cropped.data() + static_cast<size_t>(y * sourceWidth * 4),
            snapshot.bgra.data() + static_cast<size_t>((sourceY + y) * snapshot.bgraStride + sourceX * 4),
            static_cast<size_t>(sourceWidth * 4));
-    memcpy(originalHdr.data() + static_cast<size_t>(y * sourceWidth * 4),
-           snapshot.hdrRgba.data() + static_cast<size_t>(((sourceY + y) * snapshot.width + sourceX) * 4),
-           static_cast<size_t>(sourceWidth * 4 * sizeof(uint16_t)));
+    if (snapshot.hasHdr) {
+      memcpy(originalHdr.data() + static_cast<size_t>(y * sourceWidth * 4),
+             snapshot.hdrRgba.data() + static_cast<size_t>(((sourceY + y) * snapshot.width + sourceX) * 4),
+             static_cast<size_t>(sourceWidth * 4 * sizeof(uint16_t)));
+    }
   }
-  const std::vector<uint8_t> originalSdr = cropped;
+  const std::vector<uint8_t> originalSdr = image.hasHdr ? cropped : std::vector<uint8_t>{};
   ApplyMosaics(cropped, sourceWidth, sourceHeight, sourceWidth * 4, document.Commands());
 
   ComPtr<IWICImagingFactory> factory;
@@ -319,25 +358,27 @@ bool ImageExporter::Render(const DesktopSnapshot& snapshot, const RECT& selectio
 
   // Preserve original HDR pixels where the SDR rendering stayed untouched. Changed pixels are
   // lifted to linear 203-nit reference white so annotations and mosaic remain geometrically exact.
-  for (int y = 0; y < image.height; ++y) {
-    for (int x = 0; x < image.width; ++x) {
-      const int localX = x - leftMargin, localY = y - topMargin;
-      uint16_t* output = image.hdrRgba.data() + static_cast<size_t>((y * image.width + x) * 4);
-      const uint8_t* finalPixel = image.bgra.data() + static_cast<size_t>(y * image.stride + x * 4);
-      bool preserve = localX >= 0 && localY >= 0 && localX < sourceWidth && localY < sourceHeight;
-      if (preserve) {
-        const uint8_t* original = originalSdr.data() + static_cast<size_t>((localY * sourceWidth + localX) * 4);
-        preserve = memcmp(original, finalPixel, 4) == 0;
-      }
-      if (preserve) {
-        const uint16_t* source = originalHdr.data() + static_cast<size_t>((localY * sourceWidth + localX) * 4);
-        memcpy(output, source, 4 * sizeof(uint16_t));
-      } else {
-        const auto linear = [](float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); };
-        output[0] = FloatToHalf(linear(finalPixel[2] / 255.0f));
-        output[1] = FloatToHalf(linear(finalPixel[1] / 255.0f));
-        output[2] = FloatToHalf(linear(finalPixel[0] / 255.0f));
-        output[3] = FloatToHalf(finalPixel[3] / 255.0f);
+  if (image.hasHdr) {
+    for (int y = 0; y < image.height; ++y) {
+      for (int x = 0; x < image.width; ++x) {
+        const int localX = x - leftMargin, localY = y - topMargin;
+        uint16_t* output = image.hdrRgba.data() + static_cast<size_t>((y * image.width + x) * 4);
+        const uint8_t* finalPixel = image.bgra.data() + static_cast<size_t>(y * image.stride + x * 4);
+        bool preserve = localX >= 0 && localY >= 0 && localX < sourceWidth && localY < sourceHeight;
+        if (preserve) {
+          const uint8_t* original = originalSdr.data() + static_cast<size_t>((localY * sourceWidth + localX) * 4);
+          preserve = memcmp(original, finalPixel, 4) == 0;
+        }
+        if (preserve) {
+          const uint16_t* source = originalHdr.data() + static_cast<size_t>((localY * sourceWidth + localX) * 4);
+          memcpy(output, source, 4 * sizeof(uint16_t));
+        } else {
+          const auto linear = [](float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); };
+          output[0] = FloatToHalf(linear(finalPixel[2] / 255.0f));
+          output[1] = FloatToHalf(linear(finalPixel[1] / 255.0f));
+          output[2] = FloatToHalf(linear(finalPixel[0] / 255.0f));
+          output[3] = FloatToHalf(finalPixel[3] / 255.0f);
+        }
       }
     }
   }
