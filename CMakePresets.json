@@ -1,0 +1,36 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-release",
+      "displayName": "Windows x64 Release",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/windows-release",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/windows-release",
+        "RC_ENABLE_ULTRAHDR": "ON",
+        "RC_BUILD_TESTS": "ON",
+        "UHDR_WRITE_XMP": "ON",
+        "UHDR_WRITE_ISO": "ON"
+      }
+    },
+    {
+      "name": "windows-fast",
+      "displayName": "Windows x64 Fast (without libultrahdr)",
+      "inherits": "windows-release",
+      "binaryDir": "${sourceDir}/out/build/windows-fast",
+      "cacheVariables": {
+        "RC_ENABLE_ULTRAHDR": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "windows-release", "configurePreset": "windows-release", "configuration": "Release"},
+    {"name": "windows-fast", "configurePreset": "windows-fast", "configuration": "Release"}
+  ],
+  "testPresets": [
+    {"name": "windows-release", "configurePreset": "windows-release", "configuration": "Release", "output": {"outputOnFailure": true}},
+    {"name": "windows-fast", "configurePreset": "windows-fast", "configuration": "Release", "output": {"outputOnFailure": true}}
+  ]
+}

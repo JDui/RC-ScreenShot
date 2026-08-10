@@ -1,0 +1,9 @@
+/build*/
+/out/
+/dist/
+/.vs/
+/.vscode/
+*.user
+*.suo
+RC-ScreenShot.config.json
+Screenshots/

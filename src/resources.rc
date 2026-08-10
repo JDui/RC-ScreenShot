@@ -1,0 +1,36 @@
+#include <windows.h>
+
+1 RT_MANIFEST "app.manifest"
+101 RCDATA "third_party_notices.txt"
+102 ICON "../assets/rc-screenshot.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "CompanyName", "RC-ScreenShot\0"
+      VALUE "FileDescription", "RC-ScreenShot\0"
+      VALUE "FileVersion", "0.2.0\0"
+      VALUE "InternalName", "RC-ScreenShot\0"
+      VALUE "OriginalFilename", "RC-ScreenShot.exe\0"
+      VALUE "ProductName", "RC-ScreenShot\0"
+      VALUE "ProductVersion", "0.2.0\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 1200
+  END
+END

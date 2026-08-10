@@ -1,0 +1,13 @@
+RC-ScreenShot third-party notices
+
+libultrahdr
+Copyright 2022 The Android Open Source Project
+Licensed under the Apache License 2.0 or the MIT License, at your option.
+Source: https://github.com/google/libultrahdr
+Pinned revision: b2aacb366e1542cfc29605cb0d8a0ebd06bb07f8
+
+libjpeg-turbo (transitive dependency of libultrahdr)
+Distributed under the IJG, modified BSD, and zlib licenses. See the upstream
+LICENSE.md for the terms applying to individual source files.
+Source: https://github.com/libjpeg-turbo/libjpeg-turbo
+Pinned revision: 3.1.0
