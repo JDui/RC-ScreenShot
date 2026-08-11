@@ -37,6 +37,8 @@ void TestConfigRoundTrip() {
   rc::ConfigStore store(directory / L"RC-ScreenShot.exe");
   rc::AppConfig config;
   config.hotkeys.push_back({MOD_ALT | MOD_NOREPEAT, 'Q', true});
+  config.burstCount = 12;
+  config.burstIntervalSeconds = 0.37f;
   config.jpegQuality = 87;
   config.outputDirectory = L"我的截图";
   config.autoSaveOnCopy = true;
@@ -50,7 +52,10 @@ void TestConfigRoundTrip() {
   std::wstring error;
   CHECK(store.Save(config, &error));
   const rc::AppConfig loaded = store.Load(&error);
+  CHECK(loaded.schemaVersion == 4);
   CHECK(loaded.hotkeys.size() == 2);
+  CHECK(loaded.burstCount == 12);
+  CHECK(std::abs(loaded.burstIntervalSeconds - 0.37f) < 0.001f);
   CHECK(loaded.jpegQuality == 87);
   CHECK(loaded.outputDirectory == L"我的截图");
   CHECK(loaded.autoSaveOnCopy);
@@ -79,6 +84,15 @@ void TestConfigDamagedFieldRecovery() {
   CHECK(loaded.autoSaveOnCopy);
   CHECK(loaded.jpegQuality == 80);
   CHECK(loaded.hotkeys.size() == 1);
+  CHECK(loaded.burstCount == 5);
+  CHECK(std::abs(loaded.burstIntervalSeconds - 0.08f) < 0.001f);
+
+  output.open(store.path(), std::ios::binary | std::ios::trunc);
+  output << R"({"schemaVersion":4,"burst":{"count":99,"intervalSeconds":0.001}})";
+  output.close();
+  const rc::AppConfig clamped = store.Load();
+  CHECK(clamped.burstCount == 30);
+  CHECK(std::abs(clamped.burstIntervalSeconds - 0.05f) < 0.001f);
 }
 
 void TestEditorHistory() {

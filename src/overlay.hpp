@@ -25,7 +25,11 @@ class CaptureOverlay {
   using ConfigChangedCallback = std::function<void()>;
 
   CaptureOverlay(HINSTANCE instance, DesktopSnapshot snapshot, AppConfig& config,
-                 CompletionCallback completion, ConfigChangedCallback configChanged);
+                 CompletionCallback completion, ConfigChangedCallback configChanged,
+                 std::optional<RECT> targetWorkArea = std::nullopt);
+  CaptureOverlay(HINSTANCE instance, std::vector<DesktopSnapshot> snapshots, AppConfig& config,
+                 CompletionCallback completion, ConfigChangedCallback configChanged,
+                 std::optional<RECT> targetWorkArea = std::nullopt);
   ~CaptureOverlay();
 
   bool Show(std::wstring& error);
@@ -66,6 +70,33 @@ class CaptureOverlay {
   void DrawToolIcon(Tool tool, const RECT& rect, bool active);
   void DrawActionIcon(bool save, const RECT& rect);
   void DrawToolbar();
+  void DrawSnapshotSwitcher();
+  void EnsureSnapshotThumbnails();
+  void DiscardSnapshotThumbnails();
+  void SetActiveSnapshot(size_t index, bool collapse = false, bool refreshDetection = true);
+  void RestoreHoverSnapshot(bool refreshDetection = true);
+  bool HitSnapshotIcon(POINT point) const;
+  bool HitSnapshotPanel(POINT point) const;
+  std::optional<size_t> HitSnapshotThumbnail(POINT point) const;
+  RECT SnapshotIconRect() const;
+  RECT SnapshotPanelRect() const;
+  RECT SnapshotThumbnailRect(size_t index) const;
+  RECT SnapshotTargetRect() const;
+  struct SnapshotLayout {
+    RECT panel{};
+    int columns = 1;
+    int rows = 1;
+    int thumbWidth = 1;
+    int thumbHeight = 1;
+    int gap = 1;
+  };
+  SnapshotLayout SnapshotLayoutFor() const;
+  const DesktopSnapshot& SnapshotAt(size_t index) const;
+  DesktopSnapshot& SnapshotAt(size_t index);
+  void StopUnitDetection();
+  void ResetUnitDetection();
+  const DesktopSnapshot& ActiveSnapshot() const;
+  DesktopSnapshot& ActiveSnapshot();
   void DrawTooltip();
   void UpdateTooltip(POINT point);
   void DrawTextCommand(const TextCommand& command);
@@ -147,6 +178,22 @@ class CaptureOverlay {
   HINSTANCE instance_ = nullptr;
   HWND hwnd_ = nullptr;
   DesktopSnapshot snapshot_;
+  RECT targetWorkArea_{};  // overlay-local work area used to anchor the switcher
+  std::vector<DesktopSnapshot> snapshots_;
+  size_t activeSnapshot_ = 0;
+  std::optional<size_t> hoverSnapshot_;
+  std::optional<size_t> hoverSnapshotPrevious_;
+  bool snapshotsExpanded_ = false;
+  bool snapshotsAnimating_ = false;
+  float snapshotsAnimationProgress_ = 0.0f;
+  float snapshotsAnimationFromProgress_ = 0.0f;
+  std::chrono::steady_clock::time_point snapshotsAnimationStart_{};
+  struct SnapshotThumbnail {
+    ComPtr<ID2D1Bitmap> bitmap;
+    int width = 0;
+    int height = 0;
+  };
+  std::vector<SnapshotThumbnail> snapshotThumbnails_;
   AppConfig& config_;
   CompletionCallback completion_;
   ConfigChangedCallback configChanged_;

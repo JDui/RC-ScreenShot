@@ -33,6 +33,11 @@ struct DesktopSnapshot {
 class DesktopCapture {
  public:
   bool Capture(DesktopSnapshot& snapshot, std::wstring& error);
+  // Captures a sequence while keeping the DXGI duplication sessions alive
+  // between frames.  The first frame is immediate; subsequent frames are
+  // scheduled from the same steady-clock origin at intervalSeconds.
+  bool CaptureBurst(int frameCount, double intervalSeconds,
+                    std::vector<DesktopSnapshot>& snapshots, std::wstring& error);
 
  private:
   bool CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error);

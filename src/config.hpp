@@ -44,8 +44,12 @@ enum class DefaultAction { Copy, Save };
 enum class MosaicStyle { Pixel, Blur };
 
 struct AppConfig {
-  int schemaVersion = 3;
+  int schemaVersion = 4;
   std::vector<HotkeySetting> hotkeys{{}};
+  // The first configured hotkey is the regular one-shot capture. The optional
+  // second hotkey starts a burst using these values.
+  int burstCount = 5;
+  float burstIntervalSeconds = 0.08f;
   bool launchAtLogin = false;
   bool silentAtLogin = true;
 

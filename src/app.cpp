@@ -6,6 +6,8 @@
 #include <shlobj.h>
 #include <windowsx.h>
 
+#include <climits>
+#include <cstdlib>
 #include <cwctype>
 #include <sstream>
 
@@ -28,6 +30,8 @@ constexpr int IDC_SAVE_SETTINGS = 2011;
 constexpr int IDC_CANCEL_SETTINGS = 2012;
 constexpr int IDC_HOTKEY_PRIMARY = 2016;
 constexpr int IDC_HOTKEY_SECONDARY = 2017;
+constexpr int IDC_BURST_COUNT = 2018;
+constexpr int IDC_BURST_INTERVAL = 2019;
 constexpr int IDC_TOGGLE_AUTOSAVE = 2101;
 constexpr int IDC_TOGGLE_AUTOSTART = 2102;
 constexpr int IDC_TOGGLE_SILENT = 2103;
@@ -37,10 +41,10 @@ constexpr int IDC_ACTION_COPY = 2106;
 constexpr int IDC_ACTION_SAVE = 2107;
 
 constexpr int kSettingsWidth = 1040;
-constexpr int kSettingsHeight = 680;
+constexpr int kSettingsHeight = 760;
 
 RECT QualitySliderRect() {
-  return {150, 420, 390, 434};
+  return {150, 480, 390, 496};
 }
 
 bool IsToggleId(int id) {
@@ -83,14 +87,17 @@ bool IsSegmentId(int id) {
 }
 
 bool IsSettingsEditId(int id) {
-  return id == IDC_HOTKEY_PRIMARY || id == IDC_HOTKEY_SECONDARY || id == IDC_OUTPUT;
+  return id == IDC_HOTKEY_PRIMARY || id == IDC_HOTKEY_SECONDARY || id == IDC_OUTPUT ||
+         id == IDC_BURST_COUNT || id == IDC_BURST_INTERVAL;
 }
 
 RECT SettingsInputFrameRect(int id) {
   switch (id) {
     case IDC_HOTKEY_PRIMARY: return {154, 166, 466, 216};
     case IDC_HOTKEY_SECONDARY: return {584, 166, 896, 216};
-    case IDC_OUTPUT: return {40, 354, 416, 402};
+    case IDC_BURST_COUNT: return {180, 244, 260, 280};
+    case IDC_BURST_INTERVAL: return {520, 244, 610, 280};
+    case IDC_OUTPUT: return {40, 414, 416, 452};
     default: return {};
   }
 }
@@ -167,7 +174,7 @@ bool Application::Initialize(std::span<wchar_t*> arguments, int, std::wstring& e
   config_ = configStore_.Load(&warning);
   if (!CreateMessageWindow(error)) return false;
   AddTrayIcon(); RegisterConfiguredHotkeys(); UpdateAutoStart();
-  if (!std::filesystem::exists(configStore_.path()) || config_.schemaVersion < 3) SaveConfig();
+  if (!std::filesystem::exists(configStore_.path()) || config_.schemaVersion < 4) SaveConfig();
   if (!warning.empty()) Notify(L"RC-ScreenShot 配置", warning, NIIF_WARNING);
   if (!hotkeyErrors_.empty()) Notify(L"快捷键注册失败", hotkeyErrors_.front(), NIIF_WARNING);
   if (HasArgument(arguments, L"--settings")) PostMessageW(hwnd_, WM_COMMAND, kCommandSettings, 0);
@@ -212,7 +219,10 @@ LRESULT CALLBACK Application::WindowProc(HWND hwnd, UINT message, WPARAM wParam,
 LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
   if (taskbarCreated_ && message == taskbarCreated_) { AddTrayIcon(); return 0; }
   switch (message) {
-    case WM_HOTKEY: StartCapture(); return 0;
+    case WM_HOTKEY:
+      if (static_cast<int>(wParam) == kHotkeyBase + 1) StartBurstCapture();
+      else StartCapture();
+      return 0;
     case kDeferredCapture: StartCapture(); return 0;
     case kOverlayDone: ProcessOverlayResult(std::unique_ptr<OverlayResult>(reinterpret_cast<OverlayResult*>(lParam))); return 0;
     case WM_COPYDATA: {
@@ -241,7 +251,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-          std::wstring text = L"RC-ScreenShot 0.3.3\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+          std::wstring text = L"RC-ScreenShot 0.4.0\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);
@@ -304,6 +314,76 @@ void Application::StartCapture() {
       [this](OverlayResult result) { PostMessageW(hwnd_, kOverlayDone, 0, reinterpret_cast<LPARAM>(new OverlayResult(std::move(result)))); },
       [this] { SaveConfig(); });
   if (!overlay_->Show(error)) { overlay_.reset(); Notify(L"截图失败", error, NIIF_ERROR); }
+}
+
+void Application::StartBurstCapture() {
+  if (overlay_) return;
+  std::optional<RECT> targetWorkArea;
+  POINT cursor{};
+  if (GetCursorPos(&cursor)) {
+    if (HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)) {
+      MONITORINFO monitorInfo{sizeof(monitorInfo)};
+      if (GetMonitorInfoW(monitor, &monitorInfo)) targetWorkArea = monitorInfo.rcWork;
+    }
+  }
+  const int requested = std::clamp(config_.burstCount, 2, 30);
+  const double intervalSeconds = std::clamp(static_cast<double>(config_.burstIntervalSeconds), 0.05, 0.99);
+  std::vector<DesktopSnapshot> snapshots;
+  std::wstring captureError;
+  if (!desktopCapture_.CaptureBurst(requested, intervalSeconds, snapshots, captureError)) {
+    Notify(L"连拍失败", captureError.empty() ? L"未能获取首帧。" : captureError, NIIF_ERROR);
+    return;
+  }
+  int skipped = std::max(0, requested - static_cast<int>(snapshots.size()));
+  RECT expectedBounds{};
+  int expectedWidth = 0;
+  int expectedHeight = 0;
+  if (!snapshots.empty()) {
+    expectedBounds = snapshots.front().virtualBounds;
+    expectedWidth = snapshots.front().width;
+    expectedHeight = snapshots.front().height;
+  }
+  std::vector<DesktopSnapshot> validSnapshots;
+  validSnapshots.reserve(snapshots.size());
+  for (DesktopSnapshot& snapshot : snapshots) {
+    if (snapshot.virtualBounds.left != expectedBounds.left || snapshot.virtualBounds.top != expectedBounds.top ||
+        snapshot.virtualBounds.right != expectedBounds.right || snapshot.virtualBounds.bottom != expectedBounds.bottom ||
+        snapshot.width != expectedWidth || snapshot.height != expectedHeight) {
+      ++skipped;
+      continue;
+    }
+    validSnapshots.push_back(std::move(snapshot));
+  }
+  snapshots.swap(validSnapshots);
+  if (snapshots.empty()) {
+    Notify(L"连拍失败", captureError.empty() ? L"未能获取首帧。" : captureError, NIIF_ERROR);
+    return;
+  }
+  if (!captureError.empty()) Notify(L"连拍提示", captureError, NIIF_WARNING);
+  if (snapshots.size() < 2) {
+    Notify(L"连拍提示", L"连拍未获得足够帧，已打开首帧。", NIIF_WARNING);
+  } else if (skipped > 0) {
+    Notify(L"连拍提示", L"部分帧捕获失败或显示器布局变化，已跳过。", NIIF_WARNING);
+  }
+  if (snapshots.size() < 2) {
+    DesktopSnapshot first = std::move(snapshots.front());
+    overlay_ = std::make_unique<CaptureOverlay>(instance_, std::move(first), config_,
+        [this](OverlayResult result) {
+          PostMessageW(hwnd_, kOverlayDone, 0,
+                       reinterpret_cast<LPARAM>(new OverlayResult(std::move(result))));
+        }, [this] { SaveConfig(); }, targetWorkArea);
+  } else {
+    overlay_ = std::make_unique<CaptureOverlay>(instance_, std::move(snapshots), config_,
+        [this](OverlayResult result) {
+          PostMessageW(hwnd_, kOverlayDone, 0,
+                       reinterpret_cast<LPARAM>(new OverlayResult(std::move(result))));
+        }, [this] { SaveConfig(); }, targetWorkArea);
+  }
+  std::wstring error;
+  if (!overlay_->Show(error)) {
+    overlay_.reset();
+    Notify(L"截图失败", error, NIIF_ERROR);
+  }
 }
 
 void Application::ProcessOverlayResult(std::unique_ptr<OverlayResult> result) {
@@ -428,36 +508,42 @@ void Application::ShowSettings() {
   };
   label(L"设置中心", 32, 24, 320, 38, settingsTitleFont_);
   label(L"调整截图、导出和启动行为", 32, 62, 420, 20, settingsSmallFont_);
-    label(L"RCSS · v0.3.3", 900, 36, 110, 20, settingsSmallFont_);
+  label(L"RCSS · v0.4.0", 900, 36, 110, 20, settingsSmallFont_);
   label(L"快捷键", 64, 116, 180, 24, settingsSectionFont_);
   label(L"主快捷键必填，副快捷键可选", 64, 144, 360, 18, settingsSmallFont_);
   label(L"主快捷键", 64, 180, 90, 18, settingsSmallFont_);
   hotkeyButton(160, 172, 300, 38, IDC_HOTKEY_PRIMARY);
   label(L"副快捷键", 490, 180, 90, 18, settingsSmallFont_);
   hotkeyButton(590, 172, 300, 38, IDC_HOTKEY_SECONDARY);
-  label(L"重复快捷键会被拒绝", 64, 218, 360, 18, settingsSmallFont_);
-  label(L"输出", 64, 278, 180, 24, settingsSectionFont_);
-  label(L"保存位置与导出质量", 64, 306, 260, 18, settingsSmallFont_);
-  label(L"截图目录", 48, 340, 90, 18, settingsSmallFont_);
-  edit(L"", 48, 360, 360, 36, IDC_OUTPUT);
-  button(L"浏览", 420, 360, 64, 36, IDC_BROWSE);
-  label(L"JPEG 质量", 48, 412, 100, 18, settingsSmallFont_);
-  label(L"Enter 默认动作", 48, 450, 100, 18, settingsSmallFont_);
-  button(L"复制", 150, 448, 90, 30, IDC_ACTION_COPY);
-  button(L"保存", 248, 448, 90, 30, IDC_ACTION_SAVE);
-  label(L"编辑器", 556, 278, 180, 24, settingsSectionFont_);
-  label(L"文字与截图层效果", 556, 306, 240, 18, settingsSmallFont_);
-  label(L"窗口截图阴影", 556, 360, 160, 22, settingsFont_); toggle(900, 354, IDC_TOGGLE_SHADOW);
-  label(L"截图外框", 556, 420, 120, 22, settingsFont_); toggle(900, 414, IDC_TOGGLE_FRAME);
-  label(L"行为", 64, 520, 180, 24, settingsSectionFont_);
-  label(L"高频选项，修改后保存即可生效", 64, 548, 300, 18, settingsSmallFont_);
-  label(L"复制后自动保存", 64, 568, 130, 22, settingsFont_); toggle(200, 564, IDC_TOGGLE_AUTOSAVE);
-  label(L"登录时启动", 392, 568, 120, 22, settingsFont_); toggle(528, 564, IDC_TOGGLE_AUTOSTART);
-  label(L"自启时静默", 720, 568, 120, 22, settingsFont_); toggle(856, 564, IDC_TOGGLE_SILENT);
-  label(L"截图提示：V 选择对象 · Ctrl+Z / Ctrl+Y 撤销 · Esc 取消", 64, 638, 680, 20,
+  label(L"副快捷键用于连拍；留空则不注册", 64, 218, 430, 18, settingsSmallFont_);
+  label(L"连拍张数", 64, 250, 105, 18, settingsSmallFont_);
+  edit(L"", 180, 244, 80, 36, IDC_BURST_COUNT);
+  label(L"2-30 张，默认 5 张", 272, 250, 120, 18, settingsSmallFont_);
+  label(L"间隔", 410, 250, 95, 18, settingsSmallFont_);
+  edit(L"", 520, 244, 90, 36, IDC_BURST_INTERVAL);
+  label(L"秒（0.05-0.99，默认 0.08）", 622, 250, 260, 18, settingsSmallFont_);
+  label(L"输出", 64, 330, 180, 24, settingsSectionFont_);
+  label(L"保存位置与导出质量", 64, 358, 260, 18, settingsSmallFont_);
+  label(L"截图目录", 48, 394, 90, 18, settingsSmallFont_);
+  edit(L"", 48, 414, 360, 38, IDC_OUTPUT);
+  button(L"浏览", 420, 414, 64, 38, IDC_BROWSE);
+  label(L"JPEG 质量", 48, 466, 100, 18, settingsSmallFont_);
+  label(L"Enter 默认动作", 48, 510, 100, 18, settingsSmallFont_);
+  button(L"复制", 150, 504, 90, 34, IDC_ACTION_COPY);
+  button(L"保存", 248, 504, 90, 34, IDC_ACTION_SAVE);
+  label(L"编辑器", 556, 330, 180, 24, settingsSectionFont_);
+  label(L"文字与截图层效果", 556, 358, 240, 18, settingsSmallFont_);
+  label(L"窗口截图阴影", 556, 404, 160, 22, settingsFont_); toggle(900, 398, IDC_TOGGLE_SHADOW);
+  label(L"截图外框", 556, 464, 120, 22, settingsFont_); toggle(900, 458, IDC_TOGGLE_FRAME);
+  label(L"行为", 64, 578, 180, 24, settingsSectionFont_);
+  label(L"高频选项，修改后保存即可生效", 64, 606, 300, 18, settingsSmallFont_);
+  label(L"复制后自动保存", 64, 642, 130, 22, settingsFont_); toggle(200, 636, IDC_TOGGLE_AUTOSAVE);
+  label(L"登录时启动", 392, 642, 120, 22, settingsFont_); toggle(528, 636, IDC_TOGGLE_AUTOSTART);
+  label(L"自启时静默", 720, 642, 120, 22, settingsFont_); toggle(856, 636, IDC_TOGGLE_SILENT);
+  label(L"截图提示：V 选择对象 · Ctrl+Z / Ctrl+Y 撤销 · Esc 取消", 64, 700, 680, 20,
         settingsSmallFont_);
-  button(L"取消", 840, 630, 80, 36, IDC_CANCEL_SETTINGS);
-  button(L"保存设置", 932, 630, 84, 36, IDC_SAVE_SETTINGS);
+  button(L"取消", 840, 696, 80, 38, IDC_CANCEL_SETTINGS);
+  button(L"保存设置", 932, 696, 84, 38, IDC_SAVE_SETTINGS);
   BOOL darkTitle = TRUE; DwmSetWindowAttribute(settingsWindow_, 20, &darkTitle, sizeof(darkTitle));
   PopulateSettings(settingsWindow_); ShowWindow(settingsWindow_, SW_SHOW); UpdateWindow(settingsWindow_);
 }
@@ -483,10 +569,10 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
       SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
     };
-    rounded({24, 104, 1016, 250}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({24, 266, 500, 490}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({516, 266, 1016, 490}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({24, 506, 1016, 610}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({24, 104, 1016, 300}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({24, 316, 500, 548}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({516, 316, 1016, 548}, RGB(17, 25, 36), RGB(34, 48, 67));
+    rounded({24, 564, 1016, 684}, RGB(17, 25, 36), RGB(34, 48, 67));
     const auto drawIcon = [&](int type, int x, int y) {
       HPEN iconPen = CreatePen(PS_SOLID, 1, RGB(91, 160, 255));
       HGDIOBJ oldPen = SelectObject(dc, iconPen);
@@ -520,10 +606,10 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(iconPen);
     };
     drawIcon(0, 37, 131);
-    drawIcon(1, 37, 293);
-    drawIcon(2, 529, 293);
-    drawIcon(3, 37, 531);
-    drawIcon(4, 43, 639);
+    drawIcon(1, 37, 337);
+    drawIcon(2, 529, 337);
+    drawIcon(3, 37, 585);
+    drawIcon(4, 43, 697);
     const auto drawInputFrame = [&](RECT rect, HWND control) {
       const bool focused = control && GetFocus() == control;
       HBRUSH brush = CreateSolidBrush(RGB(25, 37, 52));
@@ -534,7 +620,9 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     };
     drawInputFrame({154, 166, 466, 216}, GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY));
     drawInputFrame({584, 166, 896, 216}, GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY));
-    drawInputFrame({40, 354, 416, 402}, GetDlgItem(hwnd, IDC_OUTPUT));
+    drawInputFrame({180, 244, 260, 280}, GetDlgItem(hwnd, IDC_BURST_COUNT));
+    drawInputFrame({520, 244, 610, 280}, GetDlgItem(hwnd, IDC_BURST_INTERVAL));
+    drawInputFrame({40, 414, 416, 452}, GetDlgItem(hwnd, IDC_OUTPUT));
     const RECT track = QualitySliderRect(); const int lineY = (track.top + track.bottom) / 2;
     HBRUSH trackBrush = CreateSolidBrush(RGB(38, 53, 73)); HGDIOBJ old = SelectObject(dc, trackBrush);
     RoundRect(dc, track.left, lineY - 2, track.right, lineY + 2, 2, 2); SelectObject(dc, old); DeleteObject(trackBrush);
@@ -813,6 +901,12 @@ void Application::PopulateSettings(HWND hwnd) {
   hotkeySecondaryState_ = {};
   hotkeyPrimaryState_.originalText = GetWindowString(hwnd, IDC_HOTKEY_PRIMARY);
   hotkeySecondaryState_.originalText = GetWindowString(hwnd, IDC_HOTKEY_SECONDARY);
+  SetWindowString(hwnd, IDC_BURST_COUNT, std::to_wstring(std::clamp(config_.burstCount, 2, 30)));
+  {
+    wchar_t interval[32]{};
+    swprintf_s(interval, L"%.2f", std::clamp(config_.burstIntervalSeconds, 0.05f, 0.99f));
+    SetWindowString(hwnd, IDC_BURST_INTERVAL, interval);
+  }
   SetWindowString(hwnd, IDC_OUTPUT, config_.outputDirectory);
   CheckDlgButton(hwnd, IDC_TOGGLE_AUTOSAVE, config_.autoSaveOnCopy ? BST_CHECKED : BST_UNCHECKED);
   CheckDlgButton(hwnd, IDC_TOGGLE_AUTOSTART, config_.launchAtLogin ? BST_CHECKED : BST_UNCHECKED);
@@ -849,7 +943,38 @@ bool Application::ReadSettings(HWND hwnd) {
   while (!outputDirectory.empty() && iswspace(outputDirectory.front())) outputDirectory.erase(outputDirectory.begin());
   while (!outputDirectory.empty() && iswspace(outputDirectory.back())) outputDirectory.pop_back();
   if (outputDirectory.empty()) outputDirectory = DefaultOutputDirectory().wstring();
+  const auto parseInteger = [](const std::wstring& text, int& value) {
+    if (text.empty()) return false;
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(text.c_str(), &end, 10);
+    while (end && iswspace(*end)) ++end;
+    if (!end || *end != L'\0' || parsed < INT_MIN || parsed > INT_MAX) return false;
+    value = static_cast<int>(parsed);
+    return true;
+  };
+  const auto parseFloat = [](const std::wstring& text, float& value) {
+    if (text.empty()) return false;
+    wchar_t* end = nullptr;
+    const float parsed = wcstof(text.c_str(), &end);
+    while (end && iswspace(*end)) ++end;
+    if (!end || *end != L'\0' || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+  };
+  int burstCount = 0;
+  if (!parseInteger(GetWindowString(hwnd, IDC_BURST_COUNT), burstCount) || burstCount < 2 || burstCount > 30) {
+    MessageBoxW(hwnd, L"连拍张数必须是 2 到 30 之间的整数。", L"RC-ScreenShot", MB_ICONWARNING);
+    SetFocus(GetDlgItem(hwnd, IDC_BURST_COUNT)); return false;
+  }
+  float burstInterval = 0.0f;
+  if (!parseFloat(GetWindowString(hwnd, IDC_BURST_INTERVAL), burstInterval) ||
+      burstInterval < 0.05f || burstInterval > 0.99f) {
+    MessageBoxW(hwnd, L"连拍间隔必须是 0.05 到 0.99 秒之间的数字。", L"RC-ScreenShot", MB_ICONWARNING);
+    SetFocus(GetDlgItem(hwnd, IDC_BURST_INTERVAL)); return false;
+  }
   config_.hotkeys = std::move(hotkeys); config_.outputDirectory = std::move(outputDirectory);
+  config_.burstCount = burstCount;
+  config_.burstIntervalSeconds = burstInterval;
   return true;
 }
 
@@ -879,7 +1004,7 @@ bool Application::UpdateAutoStart(std::wstring* error) {
 void Application::SaveConfig() {
   std::wstring error;
   if (!configStore_.Save(config_, &error)) Notify(L"配置无法保存", error, NIIF_WARNING);
-  else config_.schemaVersion = 3;
+  else config_.schemaVersion = 4;
 }
 
 void Application::Notify(std::wstring_view title, std::wstring_view message, DWORD flags) {

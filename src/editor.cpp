@@ -261,7 +261,46 @@ void MipmapBlur(std::vector<uint8_t>& image, int width, int height, int stride,
     levels.push_back(std::move(next));
   }
 
-  const MipLevel& mip = levels.back();
+  MipLevel& mip = levels.back();
+  // Smooth only the final low-resolution mip before upsampling.  A separable
+  // [1,2,1] pass keeps the blur soft without paying a full-resolution
+  // convolution cost, and clamped neighbors preserve crop boundaries.
+  std::vector<uint8_t> horizontal(mip.pixels.size());
+  for (int y = 0; y < mip.height; ++y) {
+    for (int x = 0; x < mip.width; ++x) {
+      uint8_t* output = horizontal.data() +
+          (static_cast<size_t>(y) * mip.width + x) * 4;
+      for (int channel = 0; channel < 4; ++channel) {
+        const int left = std::max(0, x - 1);
+        const int right = std::min(mip.width - 1, x + 1);
+        const uint8_t* a = mip.pixels.data() +
+            (static_cast<size_t>(y) * mip.width + left) * 4;
+        const uint8_t* b = mip.pixels.data() +
+            (static_cast<size_t>(y) * mip.width + x) * 4;
+        const uint8_t* c = mip.pixels.data() +
+            (static_cast<size_t>(y) * mip.width + right) * 4;
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      }
+      output[3] = 255;
+    }
+  }
+  for (int y = 0; y < mip.height; ++y) {
+    for (int x = 0; x < mip.width; ++x) {
+      uint8_t* output = mip.pixels.data() +
+          (static_cast<size_t>(y) * mip.width + x) * 4;
+      const int top = std::max(0, y - 1);
+      const int bottom = std::min(mip.height - 1, y + 1);
+      const uint8_t* a = horizontal.data() +
+          (static_cast<size_t>(top) * mip.width + x) * 4;
+      const uint8_t* b = horizontal.data() +
+          (static_cast<size_t>(y) * mip.width + x) * 4;
+      const uint8_t* c = horizontal.data() +
+          (static_cast<size_t>(bottom) * mip.width + x) * 4;
+      for (int channel = 0; channel < 4; ++channel)
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      output[3] = 255;
+    }
+  }
   // The crop can have a different aspect ratio from the final mip dimensions (for
   // example a thin brush stroke). Keep independent axes so absolute coordinates map
   // back to the correct source pixels without stretching one axis.

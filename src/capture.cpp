@@ -4,6 +4,8 @@
 #include <dwmapi.h>
 #include <dxgi1_6.h>
 
+#include <cstring>
+
 namespace rc {
 namespace {
 
@@ -11,6 +13,33 @@ struct OutputInfo {
   ComPtr<IDXGIAdapter1> adapter;
   ComPtr<IDXGIOutput> output;
   DXGI_OUTPUT_DESC1 description{};
+};
+
+struct BurstOutput {
+  OutputInfo info;
+  ComPtr<ID3D11Device> device;
+  ComPtr<ID3D11DeviceContext> context;
+  ComPtr<IDXGIOutputDuplication> duplication;
+  DXGI_OUTDUPL_DESC duplicationDesc{};
+  ComPtr<ID3D11Texture2D> staging;
+  D3D11_TEXTURE2D_DESC stagingDesc{};
+  RECT monitor{};
+  int width = 0;
+  int height = 0;
+  bool hdrColorSpace = false;
+  float peakLuminanceNits = 203.0f;
+  std::vector<uint8_t> bgra;
+  std::vector<uint16_t> hdr;
+  bool hasFrame = false;
+  bool hasHdr = false;
+};
+
+struct BurstSession {
+  std::vector<BurstOutput> outputs;
+  RECT virtualBounds{};
+  int width = 0;
+  int height = 0;
+  bool anyHdr = false;
 };
 
 std::vector<OutputInfo> EnumerateOutputs() {
@@ -30,6 +59,88 @@ std::vector<OutputInfo> EnumerateOutputs() {
     }
   }
   return outputs;
+}
+
+bool IsHdrColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace);
+
+bool InitializeBurstSession(BurstSession& session, std::wstring& error) {
+  const auto outputs = EnumerateOutputs();
+  if (outputs.empty()) {
+    error = L"No active DXGI outputs were found.";
+    return false;
+  }
+  session.anyHdr = std::any_of(outputs.begin(), outputs.end(), [](const OutputInfo& output) {
+    return IsHdrColorSpace(output.description.ColorSpace);
+  });
+  session.virtualBounds = outputs.front().description.DesktopCoordinates;
+  for (size_t index = 1; index < outputs.size(); ++index) {
+    RECT united{};
+    UnionRect(&united, &session.virtualBounds, &outputs[index].description.DesktopCoordinates);
+    session.virtualBounds = united;
+  }
+  session.width = session.virtualBounds.right - session.virtualBounds.left;
+  session.height = session.virtualBounds.bottom - session.virtualBounds.top;
+  if (session.width <= 0 || session.height <= 0) {
+    error = L"DXGI returned an invalid virtual desktop geometry.";
+    return false;
+  }
+
+  for (const OutputInfo& info : outputs) {
+    BurstOutput output;
+    output.info = info;
+    output.monitor = info.description.DesktopCoordinates;
+    output.width = output.monitor.right - output.monitor.left;
+    output.height = output.monitor.bottom - output.monitor.top;
+    output.hdrColorSpace = IsHdrColorSpace(info.description.ColorSpace);
+    output.peakLuminanceNits = info.description.MaxLuminance > 0 ? info.description.MaxLuminance : 1000.0f;
+    if (output.width <= 0 || output.height <= 0) continue;
+    output.bgra.assign(static_cast<size_t>(output.width * output.height * 4), 0);
+    for (size_t i = 3; i < output.bgra.size(); i += 4) output.bgra[i] = 255;
+    if (session.anyHdr) {
+      output.hdr.assign(static_cast<size_t>(output.width * output.height * 4), 0);
+      for (size_t i = 3; i < output.hdr.size(); i += 4) output.hdr[i] = FloatToHalf(1.0f);
+    }
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL level{};
+    HRESULT hr = D3D11CreateDevice(info.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+                                   nullptr, 0, D3D11_SDK_VERSION, &output.device, &level,
+                                   &output.context);
+    if (FAILED(hr)) {
+      error = L"DXGI burst device creation failed: " + HResultMessage(hr);
+      return false;
+    }
+    ComPtr<IDXGIOutput5> output5;
+    if (FAILED(info.output.As(&output5))) {
+      error = L"DXGI burst output duplication is unavailable.";
+      return false;
+    }
+    const DXGI_FORMAT hdrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                      DXGI_FORMAT_R10G10B10A2_UNORM,
+                                      DXGI_FORMAT_B8G8R8A8_UNORM};
+    const DXGI_FORMAT sdrFormats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+    hr = output5->DuplicateOutput1(output.device.Get(), 0,
+                                   output.hdrColorSpace ? static_cast<UINT>(std::size(hdrFormats))
+                                                        : static_cast<UINT>(std::size(sdrFormats)),
+                                   output.hdrColorSpace ? hdrFormats : sdrFormats,
+                                   &output.duplication);
+    if (FAILED(hr) && !output.hdrColorSpace) {
+      ComPtr<IDXGIOutput1> output1;
+      if (SUCCEEDED(info.output.As(&output1)))
+        hr = output1->DuplicateOutput(output.device.Get(), &output.duplication);
+    }
+    if (FAILED(hr)) {
+      error = L"DXGI burst duplication creation failed: " + HResultMessage(hr);
+      return false;
+    }
+    output.duplication->GetDesc(&output.duplicationDesc);
+    session.outputs.push_back(std::move(output));
+  }
+  if (session.outputs.empty()) {
+    error = L"DXGI burst session has no usable outputs.";
+    return false;
+  }
+  return true;
 }
 
 bool IsHdrColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace) {
@@ -141,6 +252,207 @@ POINT MapRotated(int x, int y, int sourceWidth, int sourceHeight, DXGI_MODE_ROTA
     case DXGI_MODE_ROTATION_ROTATE270: return {sourceWidth - 1 - y, x};
     default: return {x, y};
   }
+}
+
+bool CaptureBurstOutput(BurstSession& session, BurstOutput& output, bool firstFrame,
+                        std::wstring& error) {
+  const int maxAttempts = firstFrame ? 4 : 1;
+  for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+    DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+    ComPtr<IDXGIResource> resource;
+    const UINT timeout = firstFrame ? (attempt == 0 ? 300u : 120u) : 8u;
+    HRESULT hr = output.duplication->AcquireNextFrame(timeout, &frameInfo, &resource);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+      if (firstFrame && attempt + 1 < maxAttempts) continue;
+      if (!output.hasFrame) error = L"DXGI burst output timed out before its first frame.";
+      return output.hasFrame;
+    }
+    if (FAILED(hr)) {
+      error = L"DXGI burst frame acquisition failed: " + HResultMessage(hr);
+      return false;
+    }
+    ScopeExit release{[&] { output.duplication->ReleaseFrame(); }};
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(resource.As(&texture))) {
+      error = L"DXGI burst resource is not a D3D11 texture.";
+      return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    if (!output.staging || std::memcmp(&output.stagingDesc, &stagingDesc, sizeof(stagingDesc)) != 0) {
+      output.staging.Reset();
+      if (FAILED(output.device->CreateTexture2D(&stagingDesc, nullptr, &output.staging))) {
+        error = L"DXGI burst staging texture creation failed.";
+        return false;
+      }
+      output.stagingDesc = stagingDesc;
+    }
+    output.context->CopyResource(output.staging.Get(), texture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    hr = output.context->Map(output.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+      error = L"DXGI burst frame mapping failed: " + HResultMessage(hr);
+      return false;
+    }
+    ScopeExit unmap{[&] { output.context->Unmap(output.staging.Get(), 0); }};
+    if (FrameIsBlack(mapped, desc)) {
+      if (firstFrame && attempt + 1 < maxAttempts) continue;
+      if (!output.hasFrame) error = L"DXGI burst output returned a blank first frame.";
+      return output.hasFrame;
+    }
+
+    DesktopSnapshot converted;
+    converted.virtualBounds = output.monitor;
+    converted.width = output.width;
+    converted.height = output.height;
+    converted.bgraStride = output.width * 4;
+    converted.bgra.assign(static_cast<size_t>(converted.bgraStride * converted.height), 0);
+    for (size_t i = 3; i < converted.bgra.size(); i += 4) converted.bgra[i] = 255;
+    if (session.anyHdr) {
+      converted.hdrRgba.assign(static_cast<size_t>(converted.width * converted.height * 4), 0);
+      for (size_t i = 3; i < converted.hdrRgba.size(); i += 4) converted.hdrRgba[i] = FloatToHalf(1.0f);
+    }
+    const bool hdrOutput = output.hdrColorSpace &&
+        (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+    converted.hasHdr = hdrOutput;
+    converted.peakLuminanceNits = output.peakLuminanceNits;
+    if (hdrOutput) converted.hdrRegions.push_back(output.monitor);
+    const bool fastSdr = !session.anyHdr && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+                         output.duplicationDesc.Rotation == DXGI_MODE_ROTATION_IDENTITY &&
+                         static_cast<int>(desc.Width) == output.width &&
+                         static_cast<int>(desc.Height) == output.height;
+    if (fastSdr) {
+    for (int y = 0; y < output.height; ++y) {
+      const auto* source = static_cast<const uint8_t*>(mapped.pData) +
+                           static_cast<size_t>(y * mapped.RowPitch);
+      uint8_t* destination = converted.bgra.data() + static_cast<size_t>(y * converted.bgraStride);
+      std::memcpy(destination, source, static_cast<size_t>(output.width * 4));
+      for (int x = 0; x < output.width; ++x) destination[x * 4 + 3] = 255;
+    }
+    } else {
+    for (int dy = 0; dy < output.height; ++dy) {
+      for (int dx = 0; dx < output.width; ++dx) {
+        POINT source = MapRotated(dx, dy, static_cast<int>(desc.Width), static_cast<int>(desc.Height),
+                                  output.duplicationDesc.Rotation);
+        source.x = std::clamp(source.x, 0L, static_cast<LONG>(desc.Width) - 1);
+        source.y = std::clamp(source.y, 0L, static_cast<LONG>(desc.Height) - 1);
+        const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
+                             static_cast<size_t>(source.y * mapped.RowPitch);
+        if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+          const uint16_t* pixel = reinterpret_cast<const uint16_t*>(row) + source.x * 4;
+          StorePixel(converted, dx, dy, HalfToFloat(pixel[0]) * (80.0f / 203.0f),
+                     HalfToFloat(pixel[1]) * (80.0f / 203.0f),
+                     HalfToFloat(pixel[2]) * (80.0f / 203.0f), output.peakLuminanceNits);
+        } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+          const uint32_t packed = reinterpret_cast<const uint32_t*>(row)[source.x];
+          const float pr = static_cast<float>(packed & 0x3FF) / 1023.0f;
+          const float pg = static_cast<float>((packed >> 10) & 0x3FF) / 1023.0f;
+          const float pb = static_cast<float>((packed >> 20) & 0x3FF) / 1023.0f;
+          const auto rgb = Rec2020To709(PqToNits(pr) / 203.0f, PqToNits(pg) / 203.0f,
+                                        PqToNits(pb) / 203.0f);
+          StorePixel(converted, dx, dy, rgb[0], rgb[1], rgb[2], output.peakLuminanceNits);
+        } else {
+          const uint8_t* pixel = row + source.x * 4;
+          if (session.anyHdr) StoreSdrPixel(converted, dx, dy, pixel[2], pixel[1], pixel[0]);
+          else StoreBgraPixel(converted, dx, dy, pixel[2], pixel[1], pixel[0]);
+        }
+      }
+    }
+    }
+    output.bgra.swap(converted.bgra);
+    output.hdr.swap(converted.hdrRgba);
+    output.hasHdr = converted.hasHdr;
+    output.hasFrame = true;
+    error.clear();
+    return true;
+  }
+  return output.hasFrame;
+}
+
+bool SnapshotIsBlankImpl(const DesktopSnapshot& snapshot);
+
+bool ComposeBurstFrame(const BurstSession& session, DesktopSnapshot& snapshot, std::wstring& error) {
+  snapshot = {};
+  snapshot.virtualBounds = session.virtualBounds;
+  snapshot.width = session.width;
+  snapshot.height = session.height;
+  snapshot.bgraStride = session.width * 4;
+  snapshot.bgra.assign(static_cast<size_t>(snapshot.bgraStride * snapshot.height), 0);
+  for (size_t i = 3; i < snapshot.bgra.size(); i += 4) snapshot.bgra[i] = 255;
+  if (session.anyHdr) {
+    snapshot.hdrRgba.assign(static_cast<size_t>(session.width * session.height * 4), 0);
+    for (size_t i = 3; i < snapshot.hdrRgba.size(); i += 4) snapshot.hdrRgba[i] = FloatToHalf(1.0f);
+  }
+  for (const BurstOutput& output : session.outputs) {
+    if (!output.hasFrame || output.bgra.size() < static_cast<size_t>(output.width * output.height * 4)) {
+      error = L"DXGI burst frame is missing an output surface.";
+      return false;
+    }
+    const int left = output.monitor.left - session.virtualBounds.left;
+    const int top = output.monitor.top - session.virtualBounds.top;
+    for (int y = 0; y < output.height; ++y) {
+      uint8_t* destination = snapshot.bgra.data() +
+          static_cast<size_t>((top + y) * snapshot.bgraStride + left * 4);
+      const uint8_t* source = output.bgra.data() + static_cast<size_t>(y * output.width * 4);
+      std::memcpy(destination, source, static_cast<size_t>(output.width * 4));
+      if (session.anyHdr && !output.hdr.empty()) {
+        uint16_t* hdrDestination = snapshot.hdrRgba.data() +
+            static_cast<size_t>(((top + y) * snapshot.width + left) * 4);
+        const uint16_t* hdrSource = output.hdr.data() + static_cast<size_t>(y * output.width * 4);
+        std::memcpy(hdrDestination, hdrSource, static_cast<size_t>(output.width * 4 * sizeof(uint16_t)));
+      }
+    }
+    if (output.hasHdr) {
+      snapshot.hasHdr = true;
+      snapshot.peakLuminanceNits = std::max(snapshot.peakLuminanceNits, output.peakLuminanceNits);
+      snapshot.hdrRegions.push_back(output.monitor);
+    }
+  }
+  return snapshot.IsValid();
+}
+
+bool CaptureBurstDxgiFrames(int frameCount, double intervalSeconds,
+                            std::vector<DesktopSnapshot>& snapshots, std::wstring& error) {
+  BurstSession session;
+  if (!InitializeBurstSession(session, error)) return false;
+  const auto start = std::chrono::steady_clock::now();
+  for (int index = 0; index < frameCount; ++index) {
+    if (index > 0) {
+      const auto target = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(intervalSeconds * index));
+      std::this_thread::sleep_until(target);
+    }
+    bool allAvailable = true;
+    std::wstring frameError;
+    for (BurstOutput& output : session.outputs) {
+      if (!CaptureBurstOutput(session, output, index == 0, frameError)) {
+        allAvailable = false;
+        break;
+      }
+    }
+    if (!allAvailable) {
+      if (snapshots.empty()) error = frameError.empty() ? L"DXGI burst first frame failed." : frameError;
+      else if (!frameError.empty()) error = frameError;
+      return !snapshots.empty();
+    }
+    DesktopSnapshot frame;
+    if (!ComposeBurstFrame(session, frame, frameError)) {
+      if (snapshots.empty()) error = frameError;
+      else if (!frameError.empty()) error = frameError;
+      return !snapshots.empty();
+    }
+    if (SnapshotIsBlankImpl(frame)) {
+      if (snapshots.empty()) { error = L"DXGI burst first frame was blank."; return false; }
+      continue;
+    }
+    snapshots.push_back(std::move(frame));
+  }
+  return !snapshots.empty();
 }
 
 BOOL CALLBACK WindowEnumerator(HWND hwnd, LPARAM parameter) {
@@ -272,6 +584,44 @@ bool DesktopCapture::Capture(DesktopSnapshot& snapshot, std::wstring& error) {
   }
   if (!gdiError.empty()) error += L"\nGDI 回退也失败：" + gdiError;
   if (emptyGdiFrame) error += L"\nGDI 连续返回空画面，已取消本次截图以避免黑屏。";
+  return false;
+}
+
+bool DesktopCapture::CaptureBurst(int frameCount, double intervalSeconds,
+                                  std::vector<DesktopSnapshot>& snapshots, std::wstring& error) {
+  snapshots.clear();
+  frameCount = std::clamp(frameCount, 2, 30);
+  intervalSeconds = std::clamp(intervalSeconds, 0.05, 0.99);
+  if (CaptureBurstDxgiFrames(frameCount, intervalSeconds, snapshots, error)) return true;
+  // If DXGI setup fails before a first frame, preserve the existing GDI/HDR
+  // fallback semantics by sampling through Capture.  A partially completed
+  // DXGI sequence is still useful to the caller and is returned as-is.
+  if (!snapshots.empty()) return true;
+  const std::wstring dxgiError = error;
+  const auto start = std::chrono::steady_clock::now();
+  for (int index = 0; index < frameCount; ++index) {
+    if (index > 0) {
+      const auto target = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(intervalSeconds * index));
+      std::this_thread::sleep_until(target);
+    }
+    DesktopSnapshot frame;
+    std::wstring captureError;
+    if (!Capture(frame, captureError)) {
+      if (index == 0) {
+        error = dxgiError.empty() ? captureError : dxgiError + L"\n" + captureError;
+        return false;
+      }
+      if (!captureError.empty()) error = captureError;
+      continue;
+    }
+    snapshots.push_back(std::move(frame));
+  }
+  if (!snapshots.empty()) {
+    error = dxgiError.empty() ? L"DXGI burst session unavailable; GDI/standalone capture used." :
+                                dxgiError + L"\nDXGI burst session unavailable; standalone capture used.";
+    return true;
+  }
   return false;
 }
 

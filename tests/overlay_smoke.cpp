@@ -15,6 +15,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     pixel[0] = static_cast<uint8_t>(80 + x / 8); pixel[1] = static_cast<uint8_t>(80 + y / 4);
     pixel[2] = 120; pixel[3] = 255;
   }
+  rc::DesktopSnapshot secondSnapshot = snapshot;
+  secondSnapshot.bgra[0] = 180;
+  std::vector<rc::DesktopSnapshot> burstSnapshots;
+  burstSnapshots.push_back(std::move(snapshot));
+  burstSnapshots.push_back(std::move(secondSnapshot));
   rc::AppConfig config;
   bool completed = false;
   bool copied = false;
@@ -22,7 +27,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   bool textResized = false;
   bool textRecolored = false;
   bool mosaicAdded = false;
-  rc::CaptureOverlay overlay(instance, std::move(snapshot), config,
+  rc::CaptureOverlay overlay(instance, std::move(burstSnapshots), config,
       [&](rc::OverlayResult result) {
         completed = true;
         copied = result.completion == rc::CaptureCompletion::Copy;
@@ -36,12 +41,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         for (const auto& command : result.document.Commands())
           if (const auto* mosaic = std::get_if<rc::MosaicCommand>(&command))
             mosaicAdded = mosaic->brush && !mosaic->points.empty();
-      }, [] {});
+      }, [] {}, std::optional<RECT>{RECT{100, 40, 560, 320}});
   std::wstring error;
   if (!overlay.Show(error)) {
     std::cerr << "overlayError=" << rc::ToUtf8(error) << '\n';
     return 1;
   }
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(524, 284));
+  Sleep(240);
+  MSG burstMessage{};
+  while (PeekMessageW(&burstMessage, nullptr, 0, 0, PM_REMOVE)) {
+    TranslateMessage(&burstMessage); DispatchMessageW(&burstMessage);
+  }
+  // The target work area is an inset monitor rectangle.  The dynamic
+  // two-column layout places frame 2 at the right-hand thumbnail; exercise
+  // hover and commit through that path without relying on the virtual desktop
+  // origin.
+  SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(490, 220));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(490, 220));
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(40, 40));
   SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(520, 250));
   SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(520, 250));

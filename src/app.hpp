@@ -40,6 +40,7 @@ class Application {
   void RegisterConfiguredHotkeys();
   void UnregisterHotkeys();
   void StartCapture();
+  void StartBurstCapture();
   void ProcessOverlayResult(std::unique_ptr<OverlayResult> result);
   void ShowSettings();
   void PopulateSettings(HWND hwnd);

@@ -16,6 +16,11 @@ namespace {
 constexpr wchar_t kOverlayClass[] = L"RC-ScreenShot.Overlay";
 constexpr UINT_PTR kUnitTimer = 1;
 constexpr UINT_PTR kSettingPreviewTimer = 2;
+constexpr UINT_PTR kSnapshotAnimationTimer = 3;
+constexpr int kSnapshotIconSize = 44;
+constexpr int kSnapshotThumbWidth = 92;
+constexpr int kSnapshotThumbHeight = 58;
+constexpr int kSnapshotThumbGap = 7;
 constexpr int kToolbarMargin = 8;
 constexpr int kToolbarSelectHeight = 54;
 constexpr int kToolbarEditHeight = 138;
@@ -329,14 +334,54 @@ uint64_t MosaicSignature(std::span<const EditCommand> commands, const RECT& sele
   return hash;
 }
 
+RECT LocalTargetWorkArea(const DesktopSnapshot& snapshot, std::optional<RECT> targetWorkArea) {
+  const RECT full{0, 0, snapshot.width, snapshot.height};
+  if (!targetWorkArea) return full;
+  RECT local = *targetWorkArea;
+  OffsetRect(&local, -snapshot.virtualBounds.left, -snapshot.virtualBounds.top);
+  RECT clipped{};
+  if (!IntersectRect(&clipped, &local, &full) || clipped.right <= clipped.left || clipped.bottom <= clipped.top)
+    return full;
+  return clipped;
+}
+
 }  // namespace
 
 CaptureOverlay::CaptureOverlay(HINSTANCE instance, DesktopSnapshot snapshot, AppConfig& config,
-                               CompletionCallback completion, ConfigChangedCallback configChanged)
+                               CompletionCallback completion, ConfigChangedCallback configChanged,
+                               std::optional<RECT> targetWorkArea)
     : instance_(instance), snapshot_(std::move(snapshot)), config_(config),
-      completion_(std::move(completion)), configChanged_(std::move(configChanged)) {}
+      completion_(std::move(completion)), configChanged_(std::move(configChanged)) {
+  targetWorkArea_ = LocalTargetWorkArea(snapshot_, targetWorkArea);
+}
+
+CaptureOverlay::CaptureOverlay(HINSTANCE instance, std::vector<DesktopSnapshot> snapshots,
+                               AppConfig& config, CompletionCallback completion,
+                               ConfigChangedCallback configChanged,
+                               std::optional<RECT> targetWorkArea)
+    : instance_(instance), snapshots_(std::move(snapshots)), config_(config),
+      completion_(std::move(completion)), configChanged_(std::move(configChanged)) {
+  if (snapshots_.empty()) snapshots_.emplace_back();
+  if (snapshots_.size() > 30) snapshots_.resize(30);
+  snapshot_ = std::move(snapshots_.front());
+  targetWorkArea_ = LocalTargetWorkArea(snapshot_, targetWorkArea);
+}
+
+const DesktopSnapshot& CaptureOverlay::ActiveSnapshot() const { return snapshot_; }
+DesktopSnapshot& CaptureOverlay::ActiveSnapshot() { return snapshot_; }
+
+const DesktopSnapshot& CaptureOverlay::SnapshotAt(size_t index) const {
+  return index == activeSnapshot_ ? snapshot_ : snapshots_.at(index);
+}
+
+DesktopSnapshot& CaptureOverlay::SnapshotAt(size_t index) {
+  return index == activeSnapshot_ ? snapshot_ : snapshots_.at(index);
+}
 
 CaptureOverlay::~CaptureOverlay() {
+  KillTimer(hwnd_, kSnapshotAnimationTimer);
+  KillTimer(hwnd_, kUnitTimer);
+  KillTimer(hwnd_, kSettingPreviewTimer);
   if (unitThread_.joinable()) unitThread_.request_stop();
   CancelTextInput();
   if (hwnd_) DestroyWindow(hwnd_);
@@ -409,10 +454,40 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_TIMER:
       if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
+      else if (wParam == kSnapshotAnimationTimer && snapshotsAnimating_) {
+        const float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - snapshotsAnimationStart_).count();
+        const float t = std::clamp(elapsed / 0.2f, 0.0f, 1.0f);
+        const float target = snapshotsExpanded_ ? 1.0f : 0.0f;
+        snapshotsAnimationProgress_ = snapshotsAnimationFromProgress_ +
+            (target - snapshotsAnimationFromProgress_) * t;
+        if (t >= 1.0f) {
+          snapshotsAnimating_ = false;
+          snapshotsAnimationProgress_ = target;
+          snapshotsAnimationFromProgress_ = target;
+          KillTimer(hwnd_, kSnapshotAnimationTimer);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
       return 0;
     case WM_MOUSEMOVE: {
       POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       currentPoint_ = point;
+      if (snapshots_.size() > 1) {
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd_, 0};
+        TrackMouseEvent(&track);
+        if (HitSnapshotIcon(point) || HitSnapshotPanel(point)) {
+          if (const auto thumb = HitSnapshotThumbnail(point)) {
+            if (!hoverSnapshot_) hoverSnapshotPrevious_ = activeSnapshot_;
+            hoverSnapshot_ = *thumb;
+            SetActiveSnapshot(*thumb, false, false);
+          } else {
+            RestoreHoverSnapshot();
+          }
+          InvalidateRect(hwnd_, nullptr, FALSE);
+          return 0;
+        }
+        RestoreHoverSnapshot();
+      }
       if (settingPreview_ && !selectedCommand_ && Contains(selection_, point)) {
         settingPreviewPoint_ = point;
       }
@@ -443,6 +518,23 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_LBUTTONDOWN: {
         SetFocus(hwnd_);
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      if (snapshots_.size() > 1) {
+        if (HitSnapshotIcon(point)) {
+          snapshotsAnimationFromProgress_ = snapshotsAnimationProgress_;
+          snapshotsExpanded_ = !snapshotsExpanded_;
+          snapshotsAnimating_ = true;
+          snapshotsAnimationStart_ = std::chrono::steady_clock::now();
+          SetTimer(hwnd_, kSnapshotAnimationTimer, 16, nullptr);
+          return 0;
+        }
+        if (const auto thumb = HitSnapshotThumbnail(point)) {
+          hoverSnapshot_.reset();
+          hoverSnapshotPrevious_.reset();
+          SetActiveSnapshot(*thumb, true, true);
+          return 0;
+        }
+        if (HitSnapshotPanel(point)) return 0;
+      }
       if (editing_) {
         if (textEdit_) CommitTextInput();
         if (HasSizeControl() && Contains(SizeSliderRect(), point)) {
@@ -538,6 +630,10 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       if (sizeSliderDragging_) { sizeSliderDragging_ = false; EndSettingPreview(); }
       if (propertySliderDragging_) { propertySliderDragging_.reset(); EndSettingPreview(); }
       InvalidateRect(hwnd_, nullptr, FALSE); return 0;
+    case WM_MOUSELEAVE:
+      RestoreHoverSnapshot();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+      return 0;
     case WM_LBUTTONDBLCLK: {
       if (editing_ && (tool_ == Tool::Select || tool_ == Tool::Text)) {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -646,6 +742,7 @@ bool CaptureOverlay::CreateDeviceResources() {
                                            snapshot_.bgra.data(), static_cast<UINT32>(snapshot_.bgraStride),
                                            bitmapProperties, &desktopBitmap_))) return false;
   }
+  EnsureSnapshotThumbnails();
   return true;
 }
 
@@ -656,7 +753,44 @@ void CaptureOverlay::DiscardDeviceResources() {
   toolbarBackdropPixels_.clear();
   toolbarBackdropValid_ = false;
   desktopBitmap_.Reset();
+  DiscardSnapshotThumbnails();
   renderTarget_.Reset();
+}
+
+void CaptureOverlay::DiscardSnapshotThumbnails() {
+  snapshotThumbnails_.clear();
+}
+
+void CaptureOverlay::EnsureSnapshotThumbnails() {
+  if (!renderTarget_ || snapshots_.size() <= 1 || snapshotThumbnails_.size() == snapshots_.size()) return;
+  snapshotThumbnails_.clear();
+  snapshotThumbnails_.resize(snapshots_.size());
+  const SnapshotLayout layout = SnapshotLayoutFor();
+  const auto properties = D2D1::BitmapProperties(
+      D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+  for (size_t index = 0; index < snapshots_.size(); ++index) {
+    const DesktopSnapshot& source = SnapshotAt(index);
+    if (!source.IsValid()) continue;
+    const float scale = std::min(static_cast<float>(layout.thumbWidth) / source.width,
+                                 static_cast<float>(layout.thumbHeight) / source.height);
+    const int width = std::max(1, static_cast<int>(std::lround(source.width * scale)));
+    const int height = std::max(1, static_cast<int>(std::lround(source.height * scale)));
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4, 0);
+    for (int y = 0; y < height; ++y) {
+      const int sourceY = std::clamp(static_cast<int>((y + 0.5f) * source.height / height), 0, source.height - 1);
+      for (int x = 0; x < width; ++x) {
+        const int sourceX = std::clamp(static_cast<int>((x + 0.5f) * source.width / width), 0, source.width - 1);
+        const uint8_t* input = source.bgra.data() + static_cast<size_t>(sourceY * source.bgraStride + sourceX * 4);
+        uint8_t* output = pixels.data() + static_cast<size_t>((y * width + x) * 4);
+        std::memcpy(output, input, 4); output[3] = 255;
+      }
+    }
+    auto& thumbnail = snapshotThumbnails_[index];
+    thumbnail.width = width; thumbnail.height = height;
+    renderTarget_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), static_cast<UINT32>(height)),
+                                pixels.data(), static_cast<UINT32>(width * 4), properties,
+                                &thumbnail.bitmap);
+  }
 }
 
 void CaptureOverlay::EnsureToolbarBackdrop() {
@@ -715,6 +849,37 @@ void CaptureOverlay::EnsureToolbarBackdrop() {
     mip.swap(next);
     mipWidth = nextWidth;
     mipHeight = nextHeight;
+  }
+  // Finish the low-resolution mip with one separable [1,2,1] smoothing pass
+  // before bilinear enlargement.  This avoids a high-resolution convolution
+  // while keeping the translucent toolbar backdrop pleasantly soft.
+  std::vector<uint8_t> horizontal(mip.size());
+  for (int y = 0; y < mipHeight; ++y) {
+    for (int x = 0; x < mipWidth; ++x) {
+      uint8_t* output = horizontal.data() +
+          (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const int left = std::max(0, x - 1);
+      const int right = std::min(mipWidth - 1, x + 1);
+      const uint8_t* a = mip.data() + (static_cast<size_t>(y) * mipWidth + left) * 4;
+      const uint8_t* b = mip.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const uint8_t* c = mip.data() + (static_cast<size_t>(y) * mipWidth + right) * 4;
+      for (int channel = 0; channel < 4; ++channel)
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      output[3] = 255;
+    }
+  }
+  for (int y = 0; y < mipHeight; ++y) {
+    for (int x = 0; x < mipWidth; ++x) {
+      uint8_t* output = mip.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const int top = std::max(0, y - 1);
+      const int bottom = std::min(mipHeight - 1, y + 1);
+      const uint8_t* a = horizontal.data() + (static_cast<size_t>(top) * mipWidth + x) * 4;
+      const uint8_t* b = horizontal.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const uint8_t* c = horizontal.data() + (static_cast<size_t>(bottom) * mipWidth + x) * 4;
+      for (int channel = 0; channel < 4; ++channel)
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      output[3] = 255;
+    }
   }
   toolbarBackdropPixels_.assign(static_cast<size_t>(width) * height * 4, 0);
   for (int y = 0; y < height; ++y) {
@@ -777,12 +942,304 @@ void CaptureOverlay::Paint() {
   if (editing_) {
     DrawDocument(); DrawSettingPreview(); DrawToolbar(); DrawTooltip();
   }
+  DrawSnapshotSwitcher();
   const wchar_t* modeName = mode_ == SelectionMode::Normal ? L"普通模式" : mode_ == SelectionMode::Window ? L"窗口模式" : L"单元模式";
   std::wstring status = std::wstring(L"空格切换  ·  ") + modeName;
   if (mode_ == SelectionMode::Unit && !unitReady_) status += L"（正在分析区域…）";
   DrawText(status, D2D1::RectF(16, 14, 330, 48), 15, D2D1::ColorF(D2D1::ColorF::White), DWRITE_TEXT_ALIGNMENT_LEADING);
   HRESULT hr = renderTarget_->EndDraw();
   if (hr == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+}
+
+RECT CaptureOverlay::SnapshotIconRect() const {
+  const RECT target = SnapshotTargetRect();
+  const int targetWidth = std::max(1, static_cast<int>(target.right - target.left));
+  const int targetHeight = std::max(1, static_cast<int>(target.bottom - target.top));
+  const int iconSize = std::max(1, std::min(kSnapshotIconSize, std::min(targetWidth, targetHeight)));
+  int right = std::max(static_cast<int>(target.left) + iconSize, static_cast<int>(target.right) - 14);
+  int bottom = std::max(static_cast<int>(target.top) + iconSize, static_cast<int>(target.bottom) - 14);
+  right = std::min(static_cast<int>(target.right), right);
+  bottom = std::min(static_cast<int>(target.bottom), bottom);
+  return {std::max(static_cast<int>(target.left), right - iconSize),
+          std::max(static_cast<int>(target.top), bottom - iconSize), right, bottom};
+}
+
+RECT CaptureOverlay::SnapshotPanelRect() const {
+  return SnapshotLayoutFor().panel;
+}
+
+RECT CaptureOverlay::SnapshotThumbnailRect(size_t index) const {
+  const SnapshotLayout layout = SnapshotLayoutFor();
+  if (layout.panel.right <= layout.panel.left || layout.panel.bottom <= layout.panel.top ||
+      layout.columns <= 0) return {};
+  constexpr int padding = 9;
+  const int column = static_cast<int>(index % static_cast<size_t>(layout.columns));
+  const int row = static_cast<int>(index / static_cast<size_t>(layout.columns));
+  const int panelLeft = static_cast<int>(layout.panel.left);
+  const int panelTop = static_cast<int>(layout.panel.top);
+  const int panelRight = static_cast<int>(layout.panel.right);
+  const int panelBottom = static_cast<int>(layout.panel.bottom);
+  const int x = panelLeft + padding + column * (layout.thumbWidth + layout.gap);
+  const int y = panelTop + padding + row * (layout.thumbHeight + layout.gap);
+  return {x, y, std::min(panelRight, x + layout.thumbWidth),
+          std::min(panelBottom, y + layout.thumbHeight)};
+}
+
+CaptureOverlay::SnapshotLayout CaptureOverlay::SnapshotLayoutFor() const {
+  SnapshotLayout result{};
+  const size_t count = snapshots_.size();
+  if (count <= 1) return result;
+
+  const RECT target = SnapshotTargetRect();
+  const int targetLeft = static_cast<int>(target.left);
+  const int targetTop = static_cast<int>(target.top);
+  const int targetRight = static_cast<int>(target.right);
+  const int targetBottom = static_cast<int>(target.bottom);
+  const int width = std::max(1, targetRight - targetLeft);
+  const int height = std::max(1, targetBottom - targetTop);
+  const RECT icon = SnapshotIconRect();
+  constexpr int padding = 9;
+  constexpr int minThumbWidth = 24;
+  constexpr int minThumbHeight = 18;
+  const int right = std::clamp(static_cast<int>(icon.right), targetLeft, targetRight);
+  const int bottom = std::clamp(static_cast<int>(icon.top) - 8, targetTop, targetBottom);
+  const int leftMargin = std::min(padding, std::max(0, width / 4));
+  const int topMargin = std::min(padding, std::max(0, height / 4));
+  const int availableWidth = std::max(1, right - (targetLeft + leftMargin));
+  const int availableHeight = std::max(1, bottom - (targetTop + topMargin));
+
+  int bestColumns = 1;
+  int bestRows = static_cast<int>(count);
+  int bestWidth = 1;
+  int bestHeight = 1;
+  int bestArea = -1;
+  int bestDistance = std::numeric_limits<int>::max();
+  const int preferredColumns = std::max(1, static_cast<int>(std::ceil(std::sqrt(
+      static_cast<double>(count)))));
+  for (size_t columnsValue = 1; columnsValue <= count; ++columnsValue) {
+    const int columns = static_cast<int>(columnsValue);
+    const int rows = static_cast<int>((count + columnsValue - 1) / columnsValue);
+    const int innerWidth = availableWidth - 2 * padding - (columns - 1) * kSnapshotThumbGap;
+    const int innerHeight = availableHeight - 2 * padding - (rows - 1) * kSnapshotThumbGap;
+    if (innerWidth <= 0 || innerHeight <= 0) continue;
+    const int thumbWidth = std::min(kSnapshotThumbWidth, std::max(1, innerWidth / columns));
+    const int thumbHeight = std::min(kSnapshotThumbHeight, std::max(1, innerHeight / rows));
+    if (thumbWidth < minThumbWidth || thumbHeight < minThumbHeight) continue;
+    const int area = thumbWidth * thumbHeight;
+    const int distance = std::abs(columns - preferredColumns);
+    if (area > bestArea || (area == bestArea && distance < bestDistance)) {
+      bestArea = area;
+      bestDistance = distance;
+      bestColumns = columns;
+      bestRows = rows;
+      bestWidth = thumbWidth;
+      bestHeight = thumbHeight;
+    }
+  }
+  if (bestArea < 0) {
+    bestColumns = std::max(1, std::min(static_cast<int>(count), availableWidth / (minThumbWidth + kSnapshotThumbGap)));
+    bestRows = static_cast<int>((count + static_cast<size_t>(bestColumns) - 1) /
+                                static_cast<size_t>(bestColumns));
+    bestWidth = std::max(1, (availableWidth - 2 * padding -
+                             (bestColumns - 1) * kSnapshotThumbGap) / bestColumns);
+    bestHeight = std::max(1, (availableHeight - 2 * padding -
+                              (bestRows - 1) * kSnapshotThumbGap) / bestRows);
+  }
+
+  const int panelWidth = 2 * padding + bestColumns * bestWidth +
+                         (bestColumns - 1) * kSnapshotThumbGap;
+  const int panelHeight = 2 * padding + bestRows * bestHeight +
+                          (bestRows - 1) * kSnapshotThumbGap;
+  int panelRight = std::clamp(right, targetLeft, targetRight);
+  int panelBottom = std::clamp(bottom, targetTop, targetBottom);
+  int panelLeft = panelRight - panelWidth;
+  int panelTop = panelBottom - panelHeight;
+  if (panelLeft < targetLeft) { panelLeft = targetLeft; panelRight = std::min(targetRight, targetLeft + panelWidth); }
+  if (panelTop < targetTop) { panelTop = targetTop; panelBottom = std::min(targetBottom, targetTop + panelHeight); }
+  result.panel = {panelLeft, panelTop, panelRight, panelBottom};
+  result.columns = bestColumns;
+  result.rows = bestRows;
+  result.thumbWidth = bestWidth;
+  result.thumbHeight = bestHeight;
+  result.gap = kSnapshotThumbGap;
+  return result;
+}
+
+RECT CaptureOverlay::SnapshotTargetRect() const {
+  if (targetWorkArea_.right > targetWorkArea_.left && targetWorkArea_.bottom > targetWorkArea_.top)
+    return targetWorkArea_;
+  return {0, 0, snapshot_.width, snapshot_.height};
+}
+
+bool CaptureOverlay::HitSnapshotIcon(POINT point) const {
+  return snapshots_.size() > 1 && Contains(SnapshotIconRect(), point);
+}
+
+bool CaptureOverlay::HitSnapshotPanel(POINT point) const {
+  if (snapshots_.size() <= 1 || snapshotsAnimationProgress_ <= 0.01f) return false;
+  RECT panel = SnapshotLayoutFor().panel;
+  if (panel.right <= panel.left || panel.bottom <= panel.top) return false;
+  const int panelBottom = static_cast<int>(panel.bottom);
+  const int panelTop = static_cast<int>(panel.top);
+  panel.top = panelBottom - static_cast<int>(std::lround(
+      (panelBottom - panelTop) * snapshotsAnimationProgress_));
+  return Contains(panel, point);
+}
+
+std::optional<size_t> CaptureOverlay::HitSnapshotThumbnail(POINT point) const {
+  if (!HitSnapshotPanel(point)) return std::nullopt;
+  const RECT panel = SnapshotLayoutFor().panel;
+  const int panelBottom = static_cast<int>(panel.bottom);
+  const int panelTop = static_cast<int>(panel.top);
+  const int animatedTop = panelBottom - static_cast<int>(std::lround(
+      (panelBottom - panelTop) * snapshotsAnimationProgress_));
+  for (size_t index = 0; index < snapshots_.size(); ++index) {
+    const RECT thumb = SnapshotThumbnailRect(index);
+    if (thumb.top < animatedTop || thumb.bottom > panelBottom) continue;
+    if (Contains(thumb, point)) return index;
+  }
+  return std::nullopt;
+}
+
+void CaptureOverlay::StopUnitDetection() {
+  KillTimer(hwnd_, kUnitTimer);
+  if (unitThread_.joinable()) {
+    unitThread_.request_stop();
+    unitThread_ = std::jthread{};
+  }
+}
+
+void CaptureOverlay::ResetUnitDetection() {
+  unitReady_ = false;
+  std::scoped_lock lock(unitMutex_);
+  unitCandidates_.clear();
+  hoverUnitChain_.clear();
+  hoverUnitIndex_ = 0;
+}
+
+void CaptureOverlay::SetActiveSnapshot(size_t index, bool collapse, bool refreshDetection) {
+  if (index >= snapshots_.size()) return;
+  StopUnitDetection();
+  ResetUnitDetection();
+  if (index != activeSnapshot_) {
+    // Keep ownership of the full-resolution frame in exactly one place.  The
+    // vector slot for the active frame is intentionally moved-from, so a
+    // preview or commit never duplicates a potentially multi-gigabyte buffer.
+    const bool sameGeometry = snapshot_.width == snapshots_[index].width &&
+                              snapshot_.height == snapshots_[index].height &&
+                              snapshot_.virtualBounds.left == snapshots_[index].virtualBounds.left &&
+                              snapshot_.virtualBounds.top == snapshots_[index].virtualBounds.top &&
+                              snapshot_.virtualBounds.right == snapshots_[index].virtualBounds.right &&
+                              snapshot_.virtualBounds.bottom == snapshots_[index].virtualBounds.bottom;
+    std::swap(snapshot_, snapshots_[activeSnapshot_]);
+    std::swap(snapshot_, snapshots_[index]);
+    activeSnapshot_ = index;
+    if (!sameGeometry) {
+      DiscardDeviceResources();
+    } else {
+      // Keep thumbnail bitmaps on the existing render target.  Only resources
+      // derived from the active full-resolution frame need rebuilding during a
+      // hover preview or committed frame switch.
+      mosaicPreviewBitmap_.Reset();
+      mosaicPreviewSignature_ = 0;
+      toolbarBackdropBitmap_.Reset();
+      toolbarBackdropPixels_.clear();
+      toolbarBackdropValid_ = false;
+      desktopBitmap_.Reset();
+    }
+    CreateDeviceResources();
+  }
+  if (refreshDetection && hwnd_) BeginUnitDetection();
+  if (collapse) {
+    snapshotsAnimationFromProgress_ = snapshotsAnimationProgress_;
+    snapshotsExpanded_ = false;
+    snapshotsAnimating_ = true;
+    snapshotsAnimationStart_ = std::chrono::steady_clock::now();
+    SetTimer(hwnd_, kSnapshotAnimationTimer, 16, nullptr);
+  }
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::RestoreHoverSnapshot(bool refreshDetection) {
+  if (!hoverSnapshot_) return;
+  const std::optional<size_t> previous = hoverSnapshotPrevious_;
+  hoverSnapshot_.reset();
+  hoverSnapshotPrevious_.reset();
+  if (previous && *previous < snapshots_.size())
+    SetActiveSnapshot(*previous, false, refreshDetection);
+}
+
+void CaptureOverlay::DrawSnapshotSwitcher() {
+  if (!renderTarget_ || snapshots_.size() <= 1) return;
+  const RECT icon = SnapshotIconRect();
+  const auto brush = [&](D2D1_COLOR_F color) {
+    ComPtr<ID2D1SolidColorBrush> value;
+    renderTarget_->CreateSolidColorBrush(color, &value);
+    return value;
+  };
+  if (snapshotsAnimationProgress_ > 0.01f) {
+    const SnapshotLayout layout = SnapshotLayoutFor();
+    const RECT panel = layout.panel;
+    const int panelLeft = static_cast<int>(panel.left);
+    const int panelTop = static_cast<int>(panel.top);
+    const int panelRight = static_cast<int>(panel.right);
+    const int panelBottom = static_cast<int>(panel.bottom);
+    const int animatedTop = panelBottom - static_cast<int>(std::lround(
+        (panelBottom - panelTop) * snapshotsAnimationProgress_));
+    const auto panelBrush = brush(D2D1::ColorF(0.035f, 0.07f, 0.12f, 0.94f));
+    const auto panelBorder = brush(D2D1::ColorF(0.35f, 0.55f, 0.84f, 0.9f));
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
+        D2D1::RectF(static_cast<float>(panelLeft), static_cast<float>(animatedTop),
+                    static_cast<float>(panelRight), static_cast<float>(panelBottom)), 10, 10), panelBrush.Get());
+    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
+        D2D1::RectF(static_cast<float>(panelLeft), static_cast<float>(animatedTop),
+                    static_cast<float>(panelRight), static_cast<float>(panelBottom)), 10, 10), panelBorder.Get(), 1.0f);
+    for (size_t index = 0; index < snapshots_.size(); ++index) {
+      const RECT rect = SnapshotThumbnailRect(index);
+      if (rect.top < animatedTop || rect.bottom > panelBottom) continue;
+      const auto& thumbnail = snapshotThumbnails_[index];
+      if (thumbnail.bitmap) {
+        const float x = rect.left + (layout.thumbWidth - thumbnail.width) * 0.5f;
+        const float y = rect.top + (layout.thumbHeight - thumbnail.height) * 0.5f;
+        renderTarget_->DrawBitmap(thumbnail.bitmap.Get(), D2D1::RectF(x, y, x + thumbnail.width, y + thumbnail.height),
+                                  1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+      }
+      const bool active = index == activeSnapshot_;
+      const auto border = brush(active ? D2D1::ColorF(0.25f, 0.7f, 1.0f, 1.0f)
+                                       : D2D1::ColorF(0.55f, 0.65f, 0.78f, 0.65f));
+      renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
+          D2D1::RectF(static_cast<float>(rect.left), static_cast<float>(rect.top),
+                      static_cast<float>(rect.right), static_cast<float>(rect.bottom)), 5, 5), border.Get(), active ? 2.0f : 1.0f);
+      DrawText(std::to_wstring(index + 1), D2D1::RectF(static_cast<float>(rect.left + 3), static_cast<float>(rect.top + 2),
+                                                       static_cast<float>(rect.left + 24), static_cast<float>(rect.top + 22)),
+               12, D2D1::ColorF(D2D1::ColorF::White));
+    }
+  }
+  const auto shadow = brush(D2D1::ColorF(0, 0, 0, 0.48f));
+  const auto cardBack = brush(D2D1::ColorF(0.15f, 0.22f, 0.32f, 0.96f));
+  const auto cardFront = brush(D2D1::ColorF(0.25f, 0.55f, 0.92f, 0.98f));
+  const int canvasWidth = std::max(1, static_cast<int>(snapshot_.width));
+  const int canvasHeight = std::max(1, static_cast<int>(snapshot_.height));
+  const int iconLeft = static_cast<int>(icon.left);
+  const int iconTop = static_cast<int>(icon.top);
+  const int iconRight = static_cast<int>(icon.right);
+  const int iconBottom = static_cast<int>(icon.bottom);
+  for (int offset = 10; offset >= 0; offset -= 5) {
+    const RECT card{std::clamp(iconLeft + offset, 0, canvasWidth),
+                    std::clamp(iconTop + offset, 0, canvasHeight),
+                    std::clamp(iconRight + offset, 0, canvasWidth),
+                    std::clamp(iconBottom + offset, 0, canvasHeight)};
+    if (card.right <= card.left || card.bottom <= card.top) continue;
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
+        D2D1::RectF(static_cast<float>(card.left), static_cast<float>(card.top),
+                    static_cast<float>(card.right), static_cast<float>(card.bottom)), 8, 8), offset ? cardBack.Get() : cardFront.Get());
+  }
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
+      D2D1::RectF(static_cast<float>(icon.left), static_cast<float>(icon.top),
+                  static_cast<float>(icon.right), static_cast<float>(icon.bottom)), 8, 8), shadow.Get(), 1.0f);
+  DrawText(std::to_wstring(snapshots_.size()), D2D1::RectF(static_cast<float>(icon.left), static_cast<float>(icon.top + 8),
+                                                           static_cast<float>(icon.right), static_cast<float>(icon.bottom - 5)),
+           16, D2D1::ColorF(D2D1::ColorF::White));
 }
 
 void CaptureOverlay::BeginSettingPreview(POINT point, bool timed) {
@@ -884,6 +1341,8 @@ void CaptureOverlay::DrawSettingPreview() {
 }
 
 void CaptureOverlay::BeginUnitDetection() {
+  StopUnitDetection();
+  ResetUnitDetection();
   SetTimer(hwnd_, kUnitTimer, 50, nullptr);
   unitThread_ = std::jthread([this](std::stop_token token) {
     // Window candidates are only consumed in Window mode, so enumerate them off the capture
@@ -1097,6 +1556,10 @@ void CaptureOverlay::SelectTool(Tool tool) {
 }
 
 void CaptureOverlay::Complete(CaptureCompletion completion) {
+  // A thumbnail hover is only a preview.  Restore the last committed frame
+  // before producing the export result so keyboard shortcuts cannot silently
+  // change the document's source snapshot.
+  RestoreHoverSnapshot(false);
   if (textEdit_) CommitTextInput();
   OverlayResult result;
   result.completion = completion; result.selection = selection_;

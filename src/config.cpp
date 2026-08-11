@@ -291,7 +291,7 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
     return config;
   }
   const Json* root = &*rootValue;
-  const int storedSchema = ReadInt(root, "schemaVersion", 1, 1, 3);
+  const int storedSchema = ReadInt(root, "schemaVersion", 1, 1, 4);
   config.schemaVersion = storedSchema;
   if (const Json* keys = root->Find("hotkeys"); keys && keys->AsArray()) {
     std::vector<HotkeySetting> parsed;
@@ -308,6 +308,10 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
       normalized.push_back(key);
     }
     if (!normalized.empty()) config.hotkeys = std::move(normalized);
+  }
+  if (const Json* burst = root->Find("burst")) {
+    config.burstCount = ReadInt(burst, "count", config.burstCount, 2, 30);
+    config.burstIntervalSeconds = ReadFloat(burst, "intervalSeconds", config.burstIntervalSeconds, 0.05f, 0.99f);
   }
   if (const Json* startup = root->Find("startup")) {
     config.launchAtLogin = ReadBool(startup, "launchAtLogin", config.launchAtLogin);
@@ -367,7 +371,7 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
 
 bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
   std::ostringstream stream;
-  stream << "{\n  \"schemaVersion\": 3,\n  \"hotkeys\": [";
+  stream << "{\n  \"schemaVersion\": 4,\n  \"hotkeys\": [";
   size_t writtenHotkeys = 0;
   for (const auto& key : config.hotkeys) {
     if (!key.enabled || writtenHotkeys >= 2) continue;
@@ -375,7 +379,11 @@ bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
     stream << "{\"modifiers\": " << key.modifiers << ", \"virtualKey\": "
            << key.virtualKey << ", \"enabled\": " << (key.enabled ? "true" : "false") << "}";
   }
-  stream << "\n  ],\n  \"startup\": {\"launchAtLogin\": "
+  stream << "\n  ],\n  \"burst\": {\"count\": "
+         << std::clamp(config.burstCount, 2, 30)
+         << ", \"intervalSeconds\": "
+         << std::clamp(config.burstIntervalSeconds, 0.05f, 0.99f)
+         << "},\n  \"startup\": {\"launchAtLogin\": "
          << (config.launchAtLogin ? "true" : "false") << ", \"silentAtLogin\": "
          << (config.silentAtLogin ? "true" : "false") << "},\n  \"output\": {\n"
          << "    \"directory\": \"" << Escape(ToUtf8(config.outputDirectory)) << "\",\n"
