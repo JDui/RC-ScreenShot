@@ -35,6 +35,14 @@ class CaptureOverlay {
   bool Show(std::wstring& error);
   HWND hwnd() const { return hwnd_; }
   const DesktopSnapshot& snapshot() const { return snapshot_; }
+  // Lightweight geometry/state accessors used by the native smoke test.  They
+  // intentionally expose no mutable overlay state and keep hit-testing on the
+  // same dynamic icon rect used by production input handling.
+  RECT SnapshotIconRectForTest() const { return SnapshotIconRect(); }
+  RECT SnapshotThumbnailRectForTest(size_t index) const { return SnapshotThumbnailRect(index); }
+  bool SnapshotSwitcherExpandedForTest() const {
+    return snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.01f;
+  }
 
  private:
   static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -74,11 +82,13 @@ class CaptureOverlay {
   void EnsureSnapshotThumbnails();
   void DiscardSnapshotThumbnails();
   void SetActiveSnapshot(size_t index, bool collapse = false, bool refreshDetection = true);
-  void RestoreHoverSnapshot(bool refreshDetection = true);
+  void RestoreHoverSnapshot(bool refreshDetection = false);
   bool HitSnapshotIcon(POINT point) const;
   bool HitSnapshotPanel(POINT point) const;
   std::optional<size_t> HitSnapshotThumbnail(POINT point) const;
   RECT SnapshotIconRect() const;
+  RECT SnapshotDockTargetRect() const;
+  void BeginSnapshotDockAnimation();
   RECT SnapshotPanelRect() const;
   RECT SnapshotThumbnailRect(size_t index) const;
   RECT SnapshotTargetRect() const;
@@ -95,6 +105,8 @@ class CaptureOverlay {
   DesktopSnapshot& SnapshotAt(size_t index);
   void StopUnitDetection();
   void ResetUnitDetection();
+  void SuppressUnitDetection();
+  void FinishUnitDetectionMessage();
   const DesktopSnapshot& ActiveSnapshot() const;
   DesktopSnapshot& ActiveSnapshot();
   void DrawTooltip();
@@ -188,6 +200,11 @@ class CaptureOverlay {
   float snapshotsAnimationProgress_ = 0.0f;
   float snapshotsAnimationFromProgress_ = 0.0f;
   std::chrono::steady_clock::time_point snapshotsAnimationStart_{};
+  bool snapshotDocked_ = false;
+  bool snapshotDockAnimating_ = false;
+  float snapshotDockProgress_ = 0.0f;
+  RECT snapshotDockStartRect_{};
+  std::chrono::steady_clock::time_point snapshotDockAnimationStart_{};
   struct SnapshotThumbnail {
     ComPtr<ID2D1Bitmap> bitmap;
     int width = 0;
@@ -240,9 +257,20 @@ class CaptureOverlay {
   PointF textOrigin_{};
 
   std::mutex unitMutex_;
+  std::vector<WindowCandidate> windowCandidates_;
   std::vector<UnitCandidate> unitCandidates_;
   std::atomic<bool> unitReady_{false};
+  std::atomic<bool> unitDetectionRunning_{false};
+  std::atomic<bool> unitDetectionFinished_{false};
+  bool unitDetectionSuppressed_ = false;
   std::jthread unitThread_;
+  struct PendingSnapshotSwitch {
+    size_t index = 0;
+    bool collapse = false;
+    bool refreshDetection = false;
+  };
+  std::optional<PendingSnapshotSwitch> pendingSnapshotSwitch_;
+  std::optional<CaptureCompletion> pendingCompletion_;
   std::vector<size_t> hoverUnitChain_;
   size_t hoverUnitIndex_ = 0;
 

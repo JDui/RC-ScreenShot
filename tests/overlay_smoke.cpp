@@ -48,7 +48,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     return 1;
   }
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(524, 284));
-  Sleep(240);
+  // Expansion uses the 280 ms ease-out transition; leave a little headroom so
+  // this smoke path verifies the settled hit-test geometry as well as the
+  // in-flight animation timer cleanup.
+  Sleep(360);
   MSG burstMessage{};
   while (PeekMessageW(&burstMessage, nullptr, 0, 0, PM_REMOVE)) {
     TranslateMessage(&burstMessage); DispatchMessageW(&burstMessage);
@@ -62,6 +65,48 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(40, 40));
   SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(520, 250));
   SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(520, 250));
+  const RECT cornerIcon = overlay.SnapshotIconRectForTest();
+  bool dockTimerSettled = false;
+  for (int i = 0; i < 80; ++i) {
+    MSG dockMessage{};
+    while (PeekMessageW(&dockMessage, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&dockMessage); DispatchMessageW(&dockMessage);
+    }
+    Sleep(8);
+    const RECT current = overlay.SnapshotIconRectForTest();
+    if (current.left != cornerIcon.left || current.top != cornerIcon.top) dockTimerSettled = true;
+  }
+  const RECT dockIcon = overlay.SnapshotIconRectForTest();
+  if (!dockTimerSettled || (dockIcon.left == cornerIcon.left && dockIcon.top == cornerIcon.top)) return 4;
+  // The old work-area corner must no longer consume the switcher click once
+  // the dock animation has settled; the dynamically derived dock point does.
+  const POINT oldCorner{cornerIcon.left + 2, cornerIcon.top + 2};
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(oldCorner.x, oldCorner.y));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(oldCorner.x, oldCorner.y));
+  if (overlay.SnapshotSwitcherExpandedForTest()) return 5;
+  const POINT dockPoint{(dockIcon.left + dockIcon.right) / 2, (dockIcon.top + dockIcon.bottom) / 2};
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(dockPoint.x, dockPoint.y));
+  if (!overlay.SnapshotSwitcherExpandedForTest()) return 6;
+  Sleep(340);
+  MSG previewMessage{};
+  while (PeekMessageW(&previewMessage, nullptr, 0, 0, PM_REMOVE)) {
+    TranslateMessage(&previewMessage); DispatchMessageW(&previewMessage);
+  }
+  const RECT thumb0 = overlay.SnapshotThumbnailRectForTest(0);
+  const RECT thumb1 = overlay.SnapshotThumbnailRectForTest(1);
+  const POINT previewPoints[2]{
+      {(thumb0.left + thumb0.right) / 2, (thumb0.top + thumb0.bottom) / 2},
+      {(thumb1.left + thumb1.right) / 2, (thumb1.top + thumb1.bottom) / 2}};
+  bool previewResponsive = true;
+  for (int cycle = 0; cycle < 20 && previewResponsive; ++cycle) {
+    for (const POINT point : previewPoints) {
+      const ULONGLONG started = GetTickCount64();
+      SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(point.x, point.y));
+      if (GetTickCount64() - started >= 100) previewResponsive = false;
+    }
+  }
+  if (!previewResponsive) return 7;
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(dockPoint.x, dockPoint.y));
   SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'M', 0);
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(180, 140));
   SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(260, 170));
@@ -93,6 +138,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   std::cout << "overlayCreated=1 completed=" << completed
             << " copied=" << copied << " textAdded=" << textAdded
             << " textResized=" << textResized << " textRecolored=" << textRecolored
-            << " mosaicAdded=" << mosaicAdded << '\n';
-  return completed && copied && textAdded && textResized && textRecolored && mosaicAdded ? 0 : 2;
+            << " mosaicAdded=" << mosaicAdded
+            << " previewResponsive=" << previewResponsive << '\n';
+  return completed && copied && textAdded && textResized && textRecolored && mosaicAdded && previewResponsive ? 0 : 2;
 }

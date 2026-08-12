@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RC-ScreenShot VERSION 0.4.0 LANGUAGES C CXX)
+project(RC-ScreenShot VERSION 0.4.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,7 +54,7 @@ target_compile_definitions(RC-ScreenShot PRIVATE
 target_compile_options(RC-ScreenShot PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
 target_link_options(RC-ScreenShot PRIVATE /MANIFEST:NO)
 target_link_libraries(RC-ScreenShot PRIVATE
-  d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 oleaut32 uuid comctl32 gdi32 user32 advapi32 comdlg32 imm32
+  d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 oleaut32 uuid comctl32 gdi32 msimg32 user32 advapi32 comdlg32 imm32
 )
 if(RC_ENABLE_ULTRAHDR)
   target_include_directories(RC-ScreenShot PRIVATE ${libultrahdr_SOURCE_DIR})

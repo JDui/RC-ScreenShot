@@ -244,6 +244,18 @@ void TestMosaicBlur() {
   CHECK(blended[0] > 60 && blended[0] < 190);
   CHECK(blended[0] != original[24 * stride + 12 * 4]);
   CHECK(blended[1] == 120 && blended[2] == 120 && blended[3] == 255);
+  // The final low-resolution [1,2,1] pass should spread the transition over
+  // neighboring samples rather than leave a one-pixel pulse.  Keep this
+  // assertion in channel space so it also catches accidental alpha/stride
+  // writes without depending on a particular mip level count.
+  const auto blueAt = [&](int x) -> int {
+    return image[static_cast<size_t>(24 * stride + x * 4)];
+  };
+  const int edge0 = blueAt(12);
+  const int edge1 = blueAt(13);
+  const int edge2 = blueAt(14);
+  CHECK(edge0 < edge1 && edge1 < edge2);
+  CHECK(edge1 - edge0 < 48 && edge2 - edge1 < 48);
   // Far from the mask nothing changed.
   for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
     const uint8_t* p = image.data() + static_cast<size_t>(y * stride + x * 4);

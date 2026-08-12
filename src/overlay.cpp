@@ -17,10 +17,15 @@ constexpr wchar_t kOverlayClass[] = L"RC-ScreenShot.Overlay";
 constexpr UINT_PTR kUnitTimer = 1;
 constexpr UINT_PTR kSettingPreviewTimer = 2;
 constexpr UINT_PTR kSnapshotAnimationTimer = 3;
+constexpr UINT_PTR kSnapshotDockTimer = 4;
+constexpr UINT kUnitDetectionFinishedMessage = WM_APP + 0x431;
 constexpr int kSnapshotIconSize = 44;
 constexpr int kSnapshotThumbWidth = 92;
 constexpr int kSnapshotThumbHeight = 58;
 constexpr int kSnapshotThumbGap = 7;
+// Thumbnail reveal is intentionally staggered, but capped so a 30-frame burst
+// still becomes visible within the single expand transition.
+constexpr float kSnapshotStaggerProgress = 0.055f;
 constexpr int kToolbarMargin = 8;
 constexpr int kToolbarSelectHeight = 54;
 constexpr int kToolbarEditHeight = 138;
@@ -37,6 +42,52 @@ constexpr int kToolbarPresetSize = 20;
 constexpr int kToolbarPropertyGap = 5;
 constexpr int kToolbarPropertySize = 36;
 constexpr int kToolbarPillWidth = 54;
+
+float SnapshotAnimationEase(float rawProgress, bool expanding) {
+  const float raw = std::clamp(rawProgress, 0.0f, 1.0f);
+  if (!expanding) return raw * raw * raw;  // ease-in-cubic for a decisive collapse
+  // Ease-out-back with a deliberately small overshoot.  Callers clamp the
+  // reveal geometry to the panel bounds while the raw value remains useful
+  // for the visual settle of the icon.
+  constexpr float c1 = 1.25f;
+  constexpr float c3 = c1 + 1.0f;
+  const float x = raw - 1.0f;
+  return 1.0f + c3 * x * x * x + c1 * x * x;
+}
+
+float SnapshotDockEase(float rawProgress) {
+  const float raw = std::clamp(rawProgress, 0.0f, 1.0f);
+  // Standard ease-out-back: it starts at the corner (0), settles at the
+  // toolbar (1), and only overshoots by a few pixels near the end.
+  constexpr float c1 = 1.15f;
+  constexpr float c3 = c1 + 1.0f;
+  const float x = raw - 1.0f;
+  return std::clamp(1.0f + c3 * x * x * x + c1 * x * x, 0.0f, 1.035f);
+}
+
+float SnapshotRevealProgress(float progress) {
+  return std::clamp(progress, 0.0f, 1.0f);
+}
+
+float SnapshotItemProgress(size_t index, size_t count, float revealProgress) {
+  if (count <= 1) return 1.0f;
+  // The panel uncovers the bottom row first, so stagger in that same order.
+  const size_t reverseIndex = count - 1 - std::min(index, count - 1);
+  const float delay = std::min(0.35f, static_cast<float>(reverseIndex) * kSnapshotStaggerProgress);
+  const float span = std::max(0.01f, 1.0f - delay);
+  return std::clamp((revealProgress - delay) / span, 0.0f, 1.0f);
+}
+
+RECT AnimatedSnapshotPanelRect(const RECT& panel, float revealProgress) {
+  const float reveal = SnapshotRevealProgress(revealProgress);
+  const float panelScale = 0.985f + 0.015f * reveal;
+  const int panelHeight = std::max(0, static_cast<int>(panel.bottom - panel.top));
+  const int scaledHeight = std::clamp(static_cast<int>(std::lround(
+      panelHeight * panelScale * reveal)), 0, panelHeight);
+  RECT animated = panel;
+  animated.top = animated.bottom - scaledHeight;
+  return animated;
+}
 
 constexpr std::array<uint32_t, 9> kPresetColors{{
     0xFF3B30FF, 0xFF9500FF, 0xFFCC00FF, 0x34C759FF, 0x32ADE6FF,
@@ -380,6 +431,7 @@ DesktopSnapshot& CaptureOverlay::SnapshotAt(size_t index) {
 
 CaptureOverlay::~CaptureOverlay() {
   KillTimer(hwnd_, kSnapshotAnimationTimer);
+  KillTimer(hwnd_, kSnapshotDockTimer);
   KillTimer(hwnd_, kUnitTimer);
   KillTimer(hwnd_, kSettingPreviewTimer);
   if (unitThread_.joinable()) unitThread_.request_stop();
@@ -456,10 +508,12 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
       else if (wParam == kSnapshotAnimationTimer && snapshotsAnimating_) {
         const float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - snapshotsAnimationStart_).count();
-        const float t = std::clamp(elapsed / 0.2f, 0.0f, 1.0f);
+        const float duration = snapshotsExpanded_ ? 0.28f : 0.19f;
+        const float t = std::clamp(elapsed / duration, 0.0f, 1.0f);
+        const float eased = SnapshotAnimationEase(t, snapshotsExpanded_);
         const float target = snapshotsExpanded_ ? 1.0f : 0.0f;
         snapshotsAnimationProgress_ = snapshotsAnimationFromProgress_ +
-            (target - snapshotsAnimationFromProgress_) * t;
+            (target - snapshotsAnimationFromProgress_) * eased;
         if (t >= 1.0f) {
           snapshotsAnimating_ = false;
           snapshotsAnimationProgress_ = target;
@@ -468,6 +522,23 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
+      else if (wParam == kSnapshotDockTimer && snapshotDockAnimating_) {
+        const float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - snapshotDockAnimationStart_).count();
+        const float t = std::clamp(elapsed / 0.46f, 0.0f, 1.0f);
+        // Keep the timer value linear; SnapshotIconRect applies the easing
+        // exactly once so a reversed animation remains position-continuous.
+        snapshotDockProgress_ = t;
+        if (t >= 1.0f) {
+          snapshotDockAnimating_ = false;
+          snapshotDockProgress_ = 1.0f;
+          snapshotDocked_ = true;
+          KillTimer(hwnd_, kSnapshotDockTimer);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    case kUnitDetectionFinishedMessage:
+      FinishUnitDetectionMessage();
       return 0;
     case WM_MOUSEMOVE: {
       POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -481,12 +552,12 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
             hoverSnapshot_ = *thumb;
             SetActiveSnapshot(*thumb, false, false);
           } else {
-            RestoreHoverSnapshot();
+            RestoreHoverSnapshot(false);
           }
           InvalidateRect(hwnd_, nullptr, FALSE);
           return 0;
         }
-        RestoreHoverSnapshot();
+        RestoreHoverSnapshot(false);
       }
       if (settingPreview_ && !selectedCommand_ && Contains(selection_, point)) {
         settingPreviewPoint_ = point;
@@ -520,7 +591,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       if (snapshots_.size() > 1) {
         if (HitSnapshotIcon(point)) {
-          snapshotsAnimationFromProgress_ = snapshotsAnimationProgress_;
+          snapshotsAnimationFromProgress_ = std::clamp(snapshotsAnimationProgress_, 0.0f, 1.0f);
           snapshotsExpanded_ = !snapshotsExpanded_;
           snapshotsAnimating_ = true;
           snapshotsAnimationStart_ = std::chrono::steady_clock::now();
@@ -530,7 +601,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         if (const auto thumb = HitSnapshotThumbnail(point)) {
           hoverSnapshot_.reset();
           hoverSnapshotPrevious_.reset();
-          SetActiveSnapshot(*thumb, true, true);
+          SetActiveSnapshot(*thumb, true, false);
           return 0;
         }
         if (HitSnapshotPanel(point)) return 0;
@@ -631,7 +702,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       if (propertySliderDragging_) { propertySliderDragging_.reset(); EndSettingPreview(); }
       InvalidateRect(hwnd_, nullptr, FALSE); return 0;
     case WM_MOUSELEAVE:
-      RestoreHoverSnapshot();
+      RestoreHoverSnapshot(false);
       InvalidateRect(hwnd_, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK: {
@@ -953,15 +1024,57 @@ void CaptureOverlay::Paint() {
 
 RECT CaptureOverlay::SnapshotIconRect() const {
   const RECT target = SnapshotTargetRect();
-  const int targetWidth = std::max(1, static_cast<int>(target.right - target.left));
-  const int targetHeight = std::max(1, static_cast<int>(target.bottom - target.top));
+  const int targetLeft = static_cast<int>(target.left);
+  const int targetTop = static_cast<int>(target.top);
+  const int targetRight = static_cast<int>(target.right);
+  const int targetBottom = static_cast<int>(target.bottom);
+  const int targetWidth = std::max(1, targetRight - targetLeft);
+  const int targetHeight = std::max(1, targetBottom - targetTop);
   const int iconSize = std::max(1, std::min(kSnapshotIconSize, std::min(targetWidth, targetHeight)));
-  int right = std::max(static_cast<int>(target.left) + iconSize, static_cast<int>(target.right) - 14);
-  int bottom = std::max(static_cast<int>(target.top) + iconSize, static_cast<int>(target.bottom) - 14);
-  right = std::min(static_cast<int>(target.right), right);
-  bottom = std::min(static_cast<int>(target.bottom), bottom);
-  return {std::max(static_cast<int>(target.left), right - iconSize),
-          std::max(static_cast<int>(target.top), bottom - iconSize), right, bottom};
+  const int maxLeft = std::max(targetLeft, targetRight - iconSize);
+  const int maxTop = std::max(targetTop, targetBottom - iconSize);
+  const int cornerLeft = std::clamp(targetRight - iconSize - 14, targetLeft, maxLeft);
+  const int cornerTop = std::clamp(targetBottom - iconSize - 14, targetTop, maxTop);
+  RECT corner{cornerLeft, cornerTop, cornerLeft + iconSize, cornerTop + iconSize};
+  if (!snapshotDocked_ && !snapshotDockAnimating_) return corner;
+  RECT dock = SnapshotDockTargetRect();
+  const float progress = snapshotDockAnimating_ ? SnapshotDockEase(snapshotDockProgress_) : 1.0f;
+  const int left = static_cast<int>(std::lround(corner.left + (dock.left - corner.left) * progress));
+  const int top = static_cast<int>(std::lround(corner.top + (dock.top - corner.top) * progress));
+  const int rightDock = left + iconSize;
+  const int bottomDock = top + iconSize;
+  return {left, top, rightDock, bottomDock};
+}
+
+RECT CaptureOverlay::SnapshotDockTargetRect() const {
+  const RECT work = ToolbarWorkArea();
+  const RECT toolbar = ToolbarRect();
+  const int workLeft = static_cast<int>(work.left);
+  const int workTop = static_cast<int>(work.top);
+  const int workRight = static_cast<int>(work.right);
+  const int workBottom = static_cast<int>(work.bottom);
+  const int workWidth = std::max(1, workRight - workLeft);
+  const int workHeight = std::max(1, workBottom - workTop);
+  const int size = std::max(1, std::min(kSnapshotIconSize, std::min(workWidth, workHeight)));
+  const int maxLeft = std::max(workLeft, workRight - size);
+  const int maxTop = std::max(workTop, workBottom - size);
+  const int centerY = toolbar.top + kToolbarSelectHeight / 2;
+  const int rightCandidate = toolbar.right + 8;
+  const int leftCandidate = toolbar.left - 8 - size;
+  int left = rightCandidate;
+  if (left + size > workRight) left = leftCandidate;
+  left = std::clamp(left, workLeft, maxLeft);
+  const int top = std::clamp(centerY - size / 2, workTop, maxTop);
+  return {left, top, left + size, top + size};
+}
+
+void CaptureOverlay::BeginSnapshotDockAnimation() {
+  if (snapshots_.size() <= 1 || !HasArea(selection_)) return;
+  snapshotDocked_ = false;
+  snapshotDockAnimating_ = true;
+  snapshotDockProgress_ = 0.0f;
+  snapshotDockAnimationStart_ = std::chrono::steady_clock::now();
+  SetTimer(hwnd_, kSnapshotDockTimer, 16, nullptr);
 }
 
 RECT CaptureOverlay::SnapshotPanelRect() const {
@@ -1079,24 +1192,33 @@ bool CaptureOverlay::HitSnapshotPanel(POINT point) const {
   if (snapshots_.size() <= 1 || snapshotsAnimationProgress_ <= 0.01f) return false;
   RECT panel = SnapshotLayoutFor().panel;
   if (panel.right <= panel.left || panel.bottom <= panel.top) return false;
-  const int panelBottom = static_cast<int>(panel.bottom);
-  const int panelTop = static_cast<int>(panel.top);
-  panel.top = panelBottom - static_cast<int>(std::lround(
-      (panelBottom - panelTop) * snapshotsAnimationProgress_));
+  const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
+  panel = AnimatedSnapshotPanelRect(panel, reveal);
   return Contains(panel, point);
 }
 
 std::optional<size_t> CaptureOverlay::HitSnapshotThumbnail(POINT point) const {
   if (!HitSnapshotPanel(point)) return std::nullopt;
   const RECT panel = SnapshotLayoutFor().panel;
-  const int panelBottom = static_cast<int>(panel.bottom);
-  const int panelTop = static_cast<int>(panel.top);
-  const int animatedTop = panelBottom - static_cast<int>(std::lround(
-      (panelBottom - panelTop) * snapshotsAnimationProgress_));
+  const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
+  const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal);
+  const int animatedTop = animatedPanel.top;
+  const int animatedBottom = animatedPanel.bottom;
   for (size_t index = 0; index < snapshots_.size(); ++index) {
     const RECT thumb = SnapshotThumbnailRect(index);
-    if (thumb.top < animatedTop || thumb.bottom > panelBottom) continue;
-    if (Contains(thumb, point)) return index;
+    const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal);
+    if (thumb.top < animatedTop || thumb.bottom > animatedBottom || itemProgress < 0.55f) continue;
+    const float itemScale = 0.96f + 0.04f * itemProgress;
+    const int centerX = (thumb.left + thumb.right) / 2;
+    const int centerY = (thumb.top + thumb.bottom) / 2;
+    const int animatedWidth = std::max(1, static_cast<int>(std::lround((thumb.right - thumb.left) * itemScale)));
+    const int animatedHeight = std::max(1, static_cast<int>(std::lround((thumb.bottom - thumb.top) * itemScale)));
+    const int lift = static_cast<int>(std::lround((1.0f - itemProgress) * 8.0f));
+    const RECT animatedRect{centerX - animatedWidth / 2, centerY - animatedHeight / 2 - lift,
+                            centerX + (animatedWidth + 1) / 2, centerY + (animatedHeight + 1) / 2 - lift};
+    RECT clippedThumb{};
+    if (!IntersectRect(&clippedThumb, &animatedRect, &animatedPanel)) continue;
+    if (Contains(clippedThumb, point)) return index;
   }
   return std::nullopt;
 }
@@ -1105,20 +1227,83 @@ void CaptureOverlay::StopUnitDetection() {
   KillTimer(hwnd_, kUnitTimer);
   if (unitThread_.joinable()) {
     unitThread_.request_stop();
-    unitThread_ = std::jthread{};
+    // A detector may currently be inside EnumWindows/GetWindowTextW.  Never
+    // synchronously join that worker from an input message; its completion
+    // message performs the join once the worker has naturally returned.
+    if (unitDetectionFinished_.load(std::memory_order_acquire)) {
+      unitThread_.join();
+      unitDetectionRunning_.store(false, std::memory_order_release);
+    }
   }
 }
 
 void CaptureOverlay::ResetUnitDetection() {
   unitReady_ = false;
   std::scoped_lock lock(unitMutex_);
+  windowCandidates_.clear();
   unitCandidates_.clear();
   hoverUnitChain_.clear();
   hoverUnitIndex_ = 0;
 }
 
+void CaptureOverlay::SuppressUnitDetection() {
+  unitDetectionSuppressed_ = true;
+  // Preserve a queued collapse=true switch: it represents an explicit
+  // thumbnail click and must not be lost if the user starts selecting before
+  // the detector's completion message is dispatched.  Only transient hover
+  // previews are discarded when a selection starts.
+  if (pendingSnapshotSwitch_ && !pendingSnapshotSwitch_->collapse)
+    pendingSnapshotSwitch_.reset();
+  unitReady_.store(false, std::memory_order_release);
+  StopUnitDetection();
+}
+
+void CaptureOverlay::FinishUnitDetectionMessage() {
+  // The worker marks itself finished before posting this message.  Joining is
+  // therefore bounded and cannot block on a hung window enumeration.
+  if (unitThread_.joinable() && unitDetectionFinished_.load(std::memory_order_acquire)) {
+    unitThread_.join();
+    unitDetectionRunning_.store(false, std::memory_order_release);
+  }
+  if (hwnd_) {
+    KillTimer(hwnd_, kUnitTimer);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+  if (pendingSnapshotSwitch_) {
+    const PendingSnapshotSwitch request = *pendingSnapshotSwitch_;
+    pendingSnapshotSwitch_.reset();
+    SetActiveSnapshot(request.index, request.collapse, request.refreshDetection);
+  }
+  if (pendingCompletion_) {
+    const CaptureCompletion completion = *pendingCompletion_;
+    pendingCompletion_.reset();
+    Complete(completion);
+  }
+}
+
 void CaptureOverlay::SetActiveSnapshot(size_t index, bool collapse, bool refreshDetection) {
   if (index >= snapshots_.size()) return;
+  if (index == activeSnapshot_ && !collapse && !refreshDetection) {
+    pendingSnapshotSwitch_.reset();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (index == activeSnapshot_ && !refreshDetection) {
+    if (collapse) {
+      snapshotsAnimationFromProgress_ = std::clamp(snapshotsAnimationProgress_, 0.0f, 1.0f);
+      snapshotsExpanded_ = false;
+      snapshotsAnimating_ = true;
+      snapshotsAnimationStart_ = std::chrono::steady_clock::now();
+      SetTimer(hwnd_, kSnapshotAnimationTimer, 16, nullptr);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (unitDetectionRunning_.load(std::memory_order_acquire)) {
+    pendingSnapshotSwitch_ = PendingSnapshotSwitch{index, collapse, refreshDetection};
+    unitThread_.request_stop();
+    return;
+  }
   StopUnitDetection();
   ResetUnitDetection();
   if (index != activeSnapshot_) {
@@ -1149,9 +1334,9 @@ void CaptureOverlay::SetActiveSnapshot(size_t index, bool collapse, bool refresh
     }
     CreateDeviceResources();
   }
-  if (refreshDetection && hwnd_) BeginUnitDetection();
+  if (refreshDetection && hwnd_ && !unitDetectionSuppressed_ && !editing_) BeginUnitDetection();
   if (collapse) {
-    snapshotsAnimationFromProgress_ = snapshotsAnimationProgress_;
+    snapshotsAnimationFromProgress_ = std::clamp(snapshotsAnimationProgress_, 0.0f, 1.0f);
     snapshotsExpanded_ = false;
     snapshotsAnimating_ = true;
     snapshotsAnimationStart_ = std::chrono::steady_clock::now();
@@ -1165,6 +1350,9 @@ void CaptureOverlay::RestoreHoverSnapshot(bool refreshDetection) {
   const std::optional<size_t> previous = hoverSnapshotPrevious_;
   hoverSnapshot_.reset();
   hoverSnapshotPrevious_.reset();
+  // Leaving the panel cancels an in-flight preview request.  The committed
+  // frame is still active until the deferred worker completion is processed.
+  pendingSnapshotSwitch_.reset();
   if (previous && *previous < snapshots_.size())
     SetActiveSnapshot(*previous, false, refreshDetection);
 }
@@ -1181,11 +1369,11 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
     const SnapshotLayout layout = SnapshotLayoutFor();
     const RECT panel = layout.panel;
     const int panelLeft = static_cast<int>(panel.left);
-    const int panelTop = static_cast<int>(panel.top);
     const int panelRight = static_cast<int>(panel.right);
     const int panelBottom = static_cast<int>(panel.bottom);
-    const int animatedTop = panelBottom - static_cast<int>(std::lround(
-        (panelBottom - panelTop) * snapshotsAnimationProgress_));
+    const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
+    const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal);
+    const int animatedTop = animatedPanel.top;
     const auto panelBrush = brush(D2D1::ColorF(0.035f, 0.07f, 0.12f, 0.94f));
     const auto panelBorder = brush(D2D1::ColorF(0.35f, 0.55f, 0.84f, 0.9f));
     renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
@@ -1194,26 +1382,69 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
     renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
         D2D1::RectF(static_cast<float>(panelLeft), static_cast<float>(animatedTop),
                     static_cast<float>(panelRight), static_cast<float>(panelBottom)), 10, 10), panelBorder.Get(), 1.0f);
+    renderTarget_->PushAxisAlignedClip(
+        D2D1::RectF(static_cast<float>(animatedPanel.left), static_cast<float>(animatedPanel.top),
+                    static_cast<float>(animatedPanel.right), static_cast<float>(animatedPanel.bottom)),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    const auto activeBorder = brush(D2D1::ColorF(0.25f, 0.7f, 1.0f, 1.0f));
+    const auto hoverBorder = brush(D2D1::ColorF(0.45f, 0.85f, 1.0f, 0.98f));
+    const auto inactiveBorder = brush(D2D1::ColorF(0.55f, 0.65f, 0.78f, 0.65f));
+    const auto thumbnailTextBrush = brush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.96f));
+    ComPtr<IDWriteTextFormat> thumbnailTextFormat;
+    if (dwriteFactory_) {
+      dwriteFactory_->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+          DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-CN", &thumbnailTextFormat);
+      if (thumbnailTextFormat) {
+        thumbnailTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        thumbnailTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+      }
+    }
     for (size_t index = 0; index < snapshots_.size(); ++index) {
       const RECT rect = SnapshotThumbnailRect(index);
-      if (rect.top < animatedTop || rect.bottom > panelBottom) continue;
+      const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal);
+      if (rect.top < animatedTop || rect.bottom > animatedPanel.bottom || itemProgress <= 0.01f) continue;
+      const float itemOpacity = 0.48f + 0.52f * itemProgress;
+      const float itemScale = 0.96f + 0.04f * itemProgress;
+      const int centerX = (rect.left + rect.right) / 2;
+      const int centerY = (rect.top + rect.bottom) / 2;
+      const int animatedWidth = std::max(1, static_cast<int>(std::lround((rect.right - rect.left) * itemScale)));
+      const int animatedHeight = std::max(1, static_cast<int>(std::lround((rect.bottom - rect.top) * itemScale)));
+      const int lift = static_cast<int>(std::lround((1.0f - itemProgress) * 8.0f));
+      const RECT animatedRect{centerX - animatedWidth / 2, centerY - animatedHeight / 2 - lift,
+                              centerX + (animatedWidth + 1) / 2, centerY + (animatedHeight + 1) / 2 - lift};
       const auto& thumbnail = snapshotThumbnails_[index];
       if (thumbnail.bitmap) {
-        const float x = rect.left + (layout.thumbWidth - thumbnail.width) * 0.5f;
-        const float y = rect.top + (layout.thumbHeight - thumbnail.height) * 0.5f;
-        renderTarget_->DrawBitmap(thumbnail.bitmap.Get(), D2D1::RectF(x, y, x + thumbnail.width, y + thumbnail.height),
-                                  1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        const int baseWidth = std::max(1, static_cast<int>(rect.right - rect.left));
+        const int baseHeight = std::max(1, static_cast<int>(rect.bottom - rect.top));
+        const float destinationWidth = (animatedRect.right - animatedRect.left) *
+            static_cast<float>(thumbnail.width) / static_cast<float>(baseWidth);
+        const float destinationHeight = (animatedRect.bottom - animatedRect.top) *
+            static_cast<float>(thumbnail.height) / static_cast<float>(baseHeight);
+        const float x = animatedRect.left + (animatedRect.right - animatedRect.left - destinationWidth) * 0.5f;
+        const float y = animatedRect.top + (animatedRect.bottom - animatedRect.top - destinationHeight) * 0.5f;
+        renderTarget_->DrawBitmap(thumbnail.bitmap.Get(), D2D1::RectF(x, y, x + destinationWidth, y + destinationHeight),
+                                  itemOpacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
       }
       const bool active = index == activeSnapshot_;
-      const auto border = brush(active ? D2D1::ColorF(0.25f, 0.7f, 1.0f, 1.0f)
-                                       : D2D1::ColorF(0.55f, 0.65f, 0.78f, 0.65f));
+      const bool hovered = hoverSnapshot_ && *hoverSnapshot_ == index;
+      ID2D1SolidColorBrush* border = hovered ? hoverBorder.Get() :
+          (active ? activeBorder.Get() : inactiveBorder.Get());
       renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(static_cast<float>(rect.left), static_cast<float>(rect.top),
-                      static_cast<float>(rect.right), static_cast<float>(rect.bottom)), 5, 5), border.Get(), active ? 2.0f : 1.0f);
-      DrawText(std::to_wstring(index + 1), D2D1::RectF(static_cast<float>(rect.left + 3), static_cast<float>(rect.top + 2),
-                                                       static_cast<float>(rect.left + 24), static_cast<float>(rect.top + 22)),
-               12, D2D1::ColorF(D2D1::ColorF::White));
+          D2D1::RectF(static_cast<float>(animatedRect.left), static_cast<float>(animatedRect.top),
+                      static_cast<float>(animatedRect.right), static_cast<float>(animatedRect.bottom)), 5, 5), border,
+          (active || hovered) ? 2.0f : 1.0f);
+      if (thumbnailTextFormat) {
+        const std::wstring label = std::to_wstring(index + 1);
+        const D2D1_RECT_F labelRect = D2D1::RectF(static_cast<float>(animatedRect.left + 3),
+                                                  static_cast<float>(animatedRect.top + 2),
+                                                  static_cast<float>(animatedRect.left + 24),
+                                                  static_cast<float>(animatedRect.top + 22));
+        renderTarget_->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()),
+                                 thumbnailTextFormat.Get(), labelRect, thumbnailTextBrush.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+      }
     }
+    renderTarget_->PopAxisAlignedClip();
   }
   const auto shadow = brush(D2D1::ColorF(0, 0, 0, 0.48f));
   const auto cardBack = brush(D2D1::ColorF(0.15f, 0.22f, 0.32f, 0.96f));
@@ -1237,9 +1468,34 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
   renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
       D2D1::RectF(static_cast<float>(icon.left), static_cast<float>(icon.top),
                   static_cast<float>(icon.right), static_cast<float>(icon.bottom)), 8, 8), shadow.Get(), 1.0f);
-  DrawText(std::to_wstring(snapshots_.size()), D2D1::RectF(static_cast<float>(icon.left), static_cast<float>(icon.top + 8),
-                                                           static_cast<float>(icon.right), static_cast<float>(icon.bottom - 5)),
-           16, D2D1::ColorF(D2D1::ColorF::White));
+  const auto glyph = brush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.86f));
+  // Three compact offset cards communicate that this is a frame group even
+  // when the count badge is small.  They are drawn once per frame from the
+  // already-created brush, avoiding thumbnail-sized brush churn.
+  for (int index = 0; index < 3; ++index) {
+    const float x = static_cast<float>(iconLeft + 9 + index * 3);
+    const float y = static_cast<float>(iconTop + 15 - index * 2);
+    renderTarget_->DrawRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(x, y, x + 17.0f, y + 13.0f), 2.5f, 2.5f),
+        glyph.Get(), index == 2 ? 1.8f : 1.1f);
+  }
+  const auto badge = brush(D2D1::ColorF(0.04f, 0.10f, 0.18f, 0.92f));
+  const D2D1_RECT_F badgeRect = D2D1::RectF(static_cast<float>(iconRight - 21),
+                                             static_cast<float>(iconTop + 3),
+                                             static_cast<float>(iconRight - 3),
+                                             static_cast<float>(iconTop + 20));
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(badgeRect, 6.0f, 6.0f), badge.Get());
+  DrawText(std::to_wstring(snapshots_.size()), badgeRect, 11,
+           D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.96f));
+  const float chevronY = static_cast<float>(iconBottom - 9);
+  const float chevronX = static_cast<float>(iconRight - 14);
+  const bool expanded = snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.55f;
+  const float chevronDirection = expanded ? -1.0f : 1.0f;
+  renderTarget_->DrawLine(D2D1::Point2F(chevronX, chevronY),
+                          D2D1::Point2F(chevronX + 4.0f, chevronY + chevronDirection * 4.0f),
+                          glyph.Get(), 1.6f);
+  renderTarget_->DrawLine(D2D1::Point2F(chevronX + 4.0f, chevronY + chevronDirection * 4.0f),
+                          D2D1::Point2F(chevronX + 8.0f, chevronY), glyph.Get(), 1.6f);
 }
 
 void CaptureOverlay::BeginSettingPreview(POINT point, bool timed) {
@@ -1341,20 +1597,33 @@ void CaptureOverlay::DrawSettingPreview() {
 }
 
 void CaptureOverlay::BeginUnitDetection() {
+  if (unitDetectionSuppressed_ || editing_ || !hwnd_) return;
+  if (unitDetectionRunning_.load(std::memory_order_acquire)) return;
   StopUnitDetection();
   ResetUnitDetection();
+  unitDetectionFinished_.store(false, std::memory_order_release);
+  unitDetectionRunning_.store(true, std::memory_order_release);
   SetTimer(hwnd_, kUnitTimer, 50, nullptr);
-  unitThread_ = std::jthread([this](std::stop_token token) {
+  const HWND detectionWindow = hwnd_;
+  unitThread_ = std::jthread([this, detectionWindow](std::stop_token token) {
     // Window candidates are only consumed in Window mode, so enumerate them off the capture
     // path. GetWindowTextW crosses process boundaries and can block on hung windows; running
     // it here keeps the hotkey-to-overlay path free of that variable latency.
-    { std::scoped_lock lock(unitMutex_); EnumerateWindows(snapshot_); }
+    DesktopSnapshot windowSnapshot;
+    windowSnapshot.virtualBounds = snapshot_.virtualBounds;
+    if (!token.stop_requested()) EnumerateWindows(windowSnapshot);
     UnitDetector detector;
-    auto candidates = detector.Detect(snapshot_.bgra, snapshot_.width, snapshot_.height, snapshot_.bgraStride);
-    if (token.stop_requested()) return;
-    { std::scoped_lock lock(unitMutex_); unitCandidates_ = std::move(candidates); }
-    unitReady_ = true;
-    if (hwnd_) PostMessageW(hwnd_, WM_TIMER, kUnitTimer, 0);
+    auto candidates = token.stop_requested()
+        ? std::vector<UnitCandidate>{}
+        : detector.Detect(snapshot_.bgra, snapshot_.width, snapshot_.height, snapshot_.bgraStride);
+    if (!token.stop_requested()) {
+      std::scoped_lock lock(unitMutex_);
+      windowCandidates_ = std::move(windowSnapshot.windows);
+      unitCandidates_ = std::move(candidates);
+      unitReady_.store(true, std::memory_order_release);
+    }
+    unitDetectionFinished_.store(true, std::memory_order_release);
+    if (detectionWindow) PostMessageW(detectionWindow, kUnitDetectionFinishedMessage, 0, 0);
   });
 }
 
@@ -1363,7 +1632,7 @@ void CaptureOverlay::UpdateHover(POINT point) {
   hoverRect_ = {};
   if (mode_ == SelectionMode::Window) {
     std::scoped_lock lock(unitMutex_);
-    for (const auto& window : snapshot_.windows) {
+    for (const auto& window : windowCandidates_) {
       RECT local = ToLocal(window.bounds, snapshot_.virtualBounds);
       if (Contains(local, point)) { hoverRect_ = local; break; }
     }
@@ -1389,6 +1658,8 @@ void CaptureOverlay::BeginSelection(POINT point) {
     selection_ = hoverRect_;
     windowSelection_ = mode_ == SelectionMode::Window;
     editing_ = true;
+    SuppressUnitDetection();
+    BeginSnapshotDockAnimation();
     InvalidateRect(hwnd_, nullptr, FALSE);
     return;
   }
@@ -1406,7 +1677,11 @@ void CaptureOverlay::ContinueSelection(POINT point) {
 
 void CaptureOverlay::EndSelection(POINT point) {
   ContinueSelection(point); selecting_ = false; ReleaseCapture();
-  if (HasArea(selection_)) editing_ = true;
+  if (HasArea(selection_)) {
+    editing_ = true;
+    SuppressUnitDetection();
+    BeginSnapshotDockAnimation();
+  }
   else selection_ = {};
   InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -1556,6 +1831,16 @@ void CaptureOverlay::SelectTool(Tool tool) {
 }
 
 void CaptureOverlay::Complete(CaptureCompletion completion) {
+  if (unitDetectionRunning_.load(std::memory_order_acquire)) {
+    // A committed thumbnail click must win over any in-flight hover request.
+    // Defer completion until the detector posts its finished message so the
+    // full-resolution frame can be swapped without joining on the UI path.
+    if (pendingSnapshotSwitch_ && !pendingSnapshotSwitch_->collapse) {
+      pendingSnapshotSwitch_ = PendingSnapshotSwitch{activeSnapshot_, false, false};
+    }
+    pendingCompletion_ = completion;
+    return;
+  }
   // A thumbnail hover is only a preview.  Restore the last committed frame
   // before producing the export result so keyboard shortcuts cannot silently
   // change the document's source snapshot.
@@ -1571,6 +1856,7 @@ void CaptureOverlay::Complete(CaptureCompletion completion) {
 }
 
 void CaptureOverlay::Cancel() {
+  SuppressUnitDetection();
   CancelTextInput();
   OverlayResult result; result.completion = CaptureCompletion::Cancel;
   ShowWindow(hwnd_, SW_HIDE);

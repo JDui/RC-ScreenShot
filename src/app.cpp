@@ -28,6 +28,7 @@ constexpr int IDC_OUTPUT = 2002;
 constexpr int IDC_BROWSE = 2003;
 constexpr int IDC_SAVE_SETTINGS = 2011;
 constexpr int IDC_CANCEL_SETTINGS = 2012;
+constexpr int IDC_RESET_SETTINGS = 2013;
 constexpr int IDC_HOTKEY_PRIMARY = 2016;
 constexpr int IDC_HOTKEY_SECONDARY = 2017;
 constexpr int IDC_BURST_COUNT = 2018;
@@ -39,12 +40,16 @@ constexpr int IDC_TOGGLE_SHADOW = 2104;
 constexpr int IDC_TOGGLE_FRAME = 2105;
 constexpr int IDC_ACTION_COPY = 2106;
 constexpr int IDC_ACTION_SAVE = 2107;
+constexpr int IDC_BURST_COUNT_MINUS = 2020;
+constexpr int IDC_BURST_COUNT_PLUS = 2021;
+constexpr int IDC_BURST_INTERVAL_MINUS = 2022;
+constexpr int IDC_BURST_INTERVAL_PLUS = 2023;
 
-constexpr int kSettingsWidth = 1040;
-constexpr int kSettingsHeight = 760;
+constexpr int kSettingsWidth = 620;
+constexpr int kSettingsHeight = 426;
 
 RECT QualitySliderRect() {
-  return {150, 480, 390, 496};
+  return {86, 265, 216, 277};
 }
 
 bool IsToggleId(int id) {
@@ -53,6 +58,11 @@ bool IsToggleId(int id) {
 }
 
 bool IsHotkeyId(int id) { return id == IDC_HOTKEY_PRIMARY || id == IDC_HOTKEY_SECONDARY; }
+
+bool IsStepId(int id) {
+  return id == IDC_BURST_COUNT_MINUS || id == IDC_BURST_COUNT_PLUS ||
+         id == IDC_BURST_INTERVAL_MINUS || id == IDC_BURST_INTERVAL_PLUS;
+}
 
 UINT HotkeyModifierForKey(UINT key) {
   switch (key) {
@@ -93,11 +103,11 @@ bool IsSettingsEditId(int id) {
 
 RECT SettingsInputFrameRect(int id) {
   switch (id) {
-    case IDC_HOTKEY_PRIMARY: return {154, 166, 466, 216};
-    case IDC_HOTKEY_SECONDARY: return {584, 166, 896, 216};
-    case IDC_BURST_COUNT: return {180, 244, 260, 280};
-    case IDC_BURST_INTERVAL: return {520, 244, 610, 280};
-    case IDC_OUTPUT: return {40, 414, 416, 452};
+    case IDC_HOTKEY_PRIMARY: return {92, 57, 291, 89};
+    case IDC_HOTKEY_SECONDARY: return {397, 57, 596, 89};
+    case IDC_BURST_COUNT: return {110, 104, 152, 130};
+    case IDC_BURST_INTERVAL: return {418, 104, 460, 130};
+    case IDC_OUTPUT: return {20, 237, 238, 260};
     default: return {};
   }
 }
@@ -251,7 +261,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-          std::wstring text = L"RC-ScreenShot 0.4.0\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+          std::wstring text = L"RC-ScreenShot 0.4.1\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);
@@ -419,16 +429,16 @@ void Application::ShowSettings() {
   if (!settingsPanelBrush_) settingsPanelBrush_ = CreateSolidBrush(RGB(17, 25, 36));
   if (!settingsControlBrush_) settingsControlBrush_ = CreateSolidBrush(RGB(25, 37, 52));
   if (!settingsFont_) {
-    settingsFont_ = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsFont_ = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsTitleFont_ = CreateFontW(-27, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsTitleFont_ = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsSectionFont_ = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsSectionFont_ = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsSmallFont_ = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsSmallFont_ = CreateFontW(-10, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
   }
@@ -502,48 +512,49 @@ void Application::ShowSettings() {
   };
   const auto toggle = [&](int x, int y, int id) {
     HWND control = CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                 x, y, 70, 30, settingsWindow_,
+                                 x, y, 44, 22, settingsWindow_,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
     setFont(control, settingsSmallFont_); return control;
   };
-  label(L"设置中心", 32, 24, 320, 38, settingsTitleFont_);
-  label(L"调整截图、导出和启动行为", 32, 62, 420, 20, settingsSmallFont_);
-  label(L"RCSS · v0.4.0", 900, 36, 110, 20, settingsSmallFont_);
-  label(L"快捷键", 64, 116, 180, 24, settingsSectionFont_);
-  label(L"主快捷键必填，副快捷键可选", 64, 144, 360, 18, settingsSmallFont_);
-  label(L"主快捷键", 64, 180, 90, 18, settingsSmallFont_);
-  hotkeyButton(160, 172, 300, 38, IDC_HOTKEY_PRIMARY);
-  label(L"副快捷键", 490, 180, 90, 18, settingsSmallFont_);
-  hotkeyButton(590, 172, 300, 38, IDC_HOTKEY_SECONDARY);
-  label(L"副快捷键用于连拍；留空则不注册", 64, 218, 430, 18, settingsSmallFont_);
-  label(L"连拍张数", 64, 250, 105, 18, settingsSmallFont_);
-  edit(L"", 180, 244, 80, 36, IDC_BURST_COUNT);
-  label(L"2-30 张，默认 5 张", 272, 250, 120, 18, settingsSmallFont_);
-  label(L"间隔", 410, 250, 95, 18, settingsSmallFont_);
-  edit(L"", 520, 244, 90, 36, IDC_BURST_INTERVAL);
-  label(L"秒（0.05-0.99，默认 0.08）", 622, 250, 260, 18, settingsSmallFont_);
-  label(L"输出", 64, 330, 180, 24, settingsSectionFont_);
-  label(L"保存位置与导出质量", 64, 358, 260, 18, settingsSmallFont_);
-  label(L"截图目录", 48, 394, 90, 18, settingsSmallFont_);
-  edit(L"", 48, 414, 360, 38, IDC_OUTPUT);
-  button(L"浏览", 420, 414, 64, 38, IDC_BROWSE);
-  label(L"JPEG 质量", 48, 466, 100, 18, settingsSmallFont_);
-  label(L"Enter 默认动作", 48, 510, 100, 18, settingsSmallFont_);
-  button(L"复制", 150, 504, 90, 34, IDC_ACTION_COPY);
-  button(L"保存", 248, 504, 90, 34, IDC_ACTION_SAVE);
-  label(L"编辑器", 556, 330, 180, 24, settingsSectionFont_);
-  label(L"文字与截图层效果", 556, 358, 240, 18, settingsSmallFont_);
-  label(L"窗口截图阴影", 556, 404, 160, 22, settingsFont_); toggle(900, 398, IDC_TOGGLE_SHADOW);
-  label(L"截图外框", 556, 464, 120, 22, settingsFont_); toggle(900, 458, IDC_TOGGLE_FRAME);
-  label(L"行为", 64, 578, 180, 24, settingsSectionFont_);
-  label(L"高频选项，修改后保存即可生效", 64, 606, 300, 18, settingsSmallFont_);
-  label(L"复制后自动保存", 64, 642, 130, 22, settingsFont_); toggle(200, 636, IDC_TOGGLE_AUTOSAVE);
-  label(L"登录时启动", 392, 642, 120, 22, settingsFont_); toggle(528, 636, IDC_TOGGLE_AUTOSTART);
-  label(L"自启时静默", 720, 642, 120, 22, settingsFont_); toggle(856, 636, IDC_TOGGLE_SILENT);
-  label(L"截图提示：V 选择对象 · Ctrl+Z / Ctrl+Y 撤销 · Esc 取消", 64, 700, 680, 20,
-        settingsSmallFont_);
-  button(L"取消", 840, 696, 80, 38, IDC_CANCEL_SETTINGS);
-  button(L"保存设置", 932, 696, 84, 38, IDC_SAVE_SETTINGS);
+  label(L"快捷键", 20, 12, 150, 24, settingsTitleFont_);
+  label(L"截图快捷键负责单张截图；连拍快捷键可选", 20, 34, 270, 16, settingsSmallFont_);
+  button(L"↻  重置默认", 520, 10, 88, 24, IDC_RESET_SETTINGS);
+  label(L"截图快捷键", 26, 59, 68, 16, settingsSmallFont_);
+  hotkeyButton(92, 57, 199, 32, IDC_HOTKEY_PRIMARY);
+  label(L"连拍快捷键", 330, 59, 68, 16, settingsSmallFont_);
+  hotkeyButton(397, 57, 199, 32, IDC_HOTKEY_SECONDARY);
+  label(L"连拍张数", 20, 109, 62, 16, settingsSmallFont_);
+  button(L"−", 88, 104, 22, 26, IDC_BURST_COUNT_MINUS);
+  edit(L"", 111, 105, 40, 24, IDC_BURST_COUNT);
+  button(L"+", 152, 104, 22, 26, IDC_BURST_COUNT_PLUS);
+  label(L"2-30 张，默认 5 张", 184, 109, 110, 16, settingsSmallFont_);
+  label(L"间隔（秒）", 328, 109, 68, 16, settingsSmallFont_);
+  button(L"−", 396, 104, 22, 26, IDC_BURST_INTERVAL_MINUS);
+  edit(L"", 419, 105, 40, 24, IDC_BURST_INTERVAL);
+  button(L"+", 460, 104, 22, 26, IDC_BURST_INTERVAL_PLUS);
+  label(L"0.05-0.99，默认 0.08", 490, 109, 118, 16, settingsSmallFont_);
+  label(L"输出", 40, 163, 90, 20, settingsSectionFont_);
+  label(L"保存位置与导出质量", 40, 184, 140, 14, settingsSmallFont_);
+  label(L"截图目录", 20, 216, 60, 14, settingsSmallFont_);
+  edit(L"", 21, 238, 216, 21, IDC_OUTPUT);
+  button(L"浏览", 246, 237, 42, 23, IDC_BROWSE);
+  label(L"JPEG 质量", 20, 263, 60, 14, settingsSmallFont_);
+  label(L"", 266, 263, 24, 14, settingsSmallFont_);
+  label(L"Enter 默认动作", 20, 282, 74, 14, settingsSmallFont_);
+  button(L"复制", 102, 278, 58, 24, IDC_ACTION_COPY);
+  button(L"保存", 166, 278, 58, 24, IDC_ACTION_SAVE);
+  label(L"编辑器", 350, 163, 90, 20, settingsSectionFont_);
+  label(L"文字与截图层效果", 350, 184, 140, 14, settingsSmallFont_);
+  label(L"窗口截图阴影", 328, 220, 100, 16, settingsSmallFont_); toggle(554, 211, IDC_TOGGLE_SHADOW);
+  label(L"截图外框", 328, 253, 100, 16, settingsSmallFont_); toggle(554, 242, IDC_TOGGLE_FRAME);
+  label(L"行为", 40, 318, 90, 20, settingsSectionFont_);
+  label(L"高频选项，修改后保存即可生效", 40, 339, 190, 14, settingsSmallFont_);
+  label(L"复制后自动保存", 20, 367, 90, 14, settingsSmallFont_); toggle(110, 363, IDC_TOGGLE_AUTOSAVE);
+  label(L"登录时启动", 244, 367, 80, 14, settingsSmallFont_); toggle(326, 363, IDC_TOGGLE_AUTOSTART);
+  label(L"自启动静默", 450, 367, 80, 14, settingsSmallFont_); toggle(536, 363, IDC_TOGGLE_SILENT);
+  label(L"截图提示：V 选择对象 · Ctrl+Z / Ctrl+Y 撤销 · Esc 取消", 8, 399, 310, 16, settingsSmallFont_);
+  button(L"取消", 452, 392, 62, 28, IDC_CANCEL_SETTINGS);
+  button(L"保存设置", 522, 392, 90, 28, IDC_SAVE_SETTINGS);
   BOOL darkTitle = TRUE; DwmSetWindowAttribute(settingsWindow_, 20, &darkTitle, sizeof(darkTitle));
   PopulateSettings(settingsWindow_); ShowWindow(settingsWindow_, SW_SHOW); UpdateWindow(settingsWindow_);
 }
@@ -563,16 +574,36 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint);
     HDC dc = paint.hdc; RECT client{}; GetClientRect(hwnd, &client);
     FillRect(dc, &client, settingsBackgroundBrush_); SetBkMode(dc, TRANSPARENT);
-    const auto rounded = [&](RECT rect, COLORREF fill, COLORREF border, int radius = 14) {
-      HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, border);
-      HGDIOBJ oldBrush = SelectObject(dc, brush); HGDIOBJ oldPen = SelectObject(dc, pen);
-      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
+    const auto gradientCard = [&](RECT rect, COLORREF start, COLORREF finish) {
+      TRIVERTEX vertices[2]{};
+      vertices[0].x = rect.left; vertices[0].y = rect.top;
+      vertices[0].Red = static_cast<COLOR16>(GetRValue(start) << 8);
+      vertices[0].Green = static_cast<COLOR16>(GetGValue(start) << 8);
+      vertices[0].Blue = static_cast<COLOR16>(GetBValue(start) << 8);
+      vertices[0].Alpha = 0xff00;
+      vertices[1].x = rect.right; vertices[1].y = rect.bottom;
+      vertices[1].Red = static_cast<COLOR16>(GetRValue(finish) << 8);
+      vertices[1].Green = static_cast<COLOR16>(GetGValue(finish) << 8);
+      vertices[1].Blue = static_cast<COLOR16>(GetBValue(finish) << 8);
+      vertices[1].Alpha = 0xff00;
+      GRADIENT_RECT mesh{0, 1};
+      HRGN clip = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 10, 10);
+      const int saved = SaveDC(dc);
+      SelectClipRgn(dc, clip);
+      if (!GradientFill(dc, vertices, 2, &mesh, 1, GRADIENT_FILL_RECT_H)) {
+        HBRUSH fallback = CreateSolidBrush(start); FillRect(dc, &rect, fallback); DeleteObject(fallback);
+      }
+      RestoreDC(dc, saved);
+      DeleteObject(clip);
+      HPEN pen = CreatePen(PS_SOLID, 1, RGB(63, 65, 91));
+      HGDIOBJ oldPen = SelectObject(dc, pen); HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 10, 10);
+      SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
     };
-    rounded({24, 104, 1016, 300}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({24, 316, 500, 548}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({516, 316, 1016, 548}, RGB(17, 25, 36), RGB(34, 48, 67));
-    rounded({24, 564, 1016, 684}, RGB(17, 25, 36), RGB(34, 48, 67));
+    gradientCard({5, 4, 615, 148}, RGB(50, 50, 73), RGB(55, 65, 88));
+    gradientCard({5, 155, 305, 302}, RGB(61, 54, 78), RGB(45, 54, 75));
+    gradientCard({313, 155, 615, 302}, RGB(52, 54, 78), RGB(28, 42, 66));
+    gradientCard({5, 310, 615, 388}, RGB(57, 50, 76), RGB(32, 48, 70));
     const auto drawIcon = [&](int type, int x, int y) {
       HPEN iconPen = CreatePen(PS_SOLID, 1, RGB(91, 160, 255));
       HGDIOBJ oldPen = SelectObject(dc, iconPen);
@@ -605,24 +636,23 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       }
       SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(iconPen);
     };
-    drawIcon(0, 37, 131);
-    drawIcon(1, 37, 337);
-    drawIcon(2, 529, 337);
-    drawIcon(3, 37, 585);
-    drawIcon(4, 43, 697);
+    drawIcon(1, 12, 167);
+    drawIcon(2, 320, 167);
+    drawIcon(3, 12, 322);
+    drawIcon(4, 8, 398);
     const auto drawInputFrame = [&](RECT rect, HWND control) {
       const bool focused = control && GetFocus() == control;
       HBRUSH brush = CreateSolidBrush(RGB(25, 37, 52));
       HPEN pen = CreatePen(PS_SOLID, 1, focused ? RGB(91, 160, 255) : RGB(49, 70, 96));
       HGDIOBJ oldBrush = SelectObject(dc, brush); HGDIOBJ oldPen = SelectObject(dc, pen);
-      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
       SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
     };
-    drawInputFrame({154, 166, 466, 216}, GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY));
-    drawInputFrame({584, 166, 896, 216}, GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY));
-    drawInputFrame({180, 244, 260, 280}, GetDlgItem(hwnd, IDC_BURST_COUNT));
-    drawInputFrame({520, 244, 610, 280}, GetDlgItem(hwnd, IDC_BURST_INTERVAL));
-    drawInputFrame({40, 414, 416, 452}, GetDlgItem(hwnd, IDC_OUTPUT));
+    drawInputFrame({92, 57, 291, 89}, GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY));
+    drawInputFrame({397, 57, 596, 89}, GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY));
+    drawInputFrame({110, 104, 152, 130}, GetDlgItem(hwnd, IDC_BURST_COUNT));
+    drawInputFrame({418, 104, 460, 130}, GetDlgItem(hwnd, IDC_BURST_INTERVAL));
+    drawInputFrame({20, 237, 238, 260}, GetDlgItem(hwnd, IDC_OUTPUT));
     const RECT track = QualitySliderRect(); const int lineY = (track.top + track.bottom) / 2;
     HBRUSH trackBrush = CreateSolidBrush(RGB(38, 53, 73)); HGDIOBJ old = SelectObject(dc, trackBrush);
     RoundRect(dc, track.left, lineY - 2, track.right, lineY + 2, 2, 2); SelectObject(dc, old); DeleteObject(trackBrush);
@@ -630,7 +660,10 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     HBRUSH fillBrush = CreateSolidBrush(RGB(91, 140, 255)); old = SelectObject(dc, fillBrush);
     RoundRect(dc, track.left, lineY - 2, thumbX, lineY + 2, 2, 2); SelectObject(dc, old); DeleteObject(fillBrush);
     HBRUSH thumbBrush = CreateSolidBrush(RGB(233, 241, 255)); old = SelectObject(dc, thumbBrush);
-    Ellipse(dc, thumbX - 7, lineY - 7, thumbX + 7, lineY + 7); SelectObject(dc, old); DeleteObject(thumbBrush);
+    Ellipse(dc, thumbX - 5, lineY - 5, thumbX + 5, lineY + 5); SelectObject(dc, old); DeleteObject(thumbBrush);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(225, 230, 245)); SelectObject(dc, settingsSmallFont_);
+    RECT quality{266, 263, 290, 279}; DrawTextW(dc, std::to_wstring(config_.jpegQuality).c_str(), -1, &quality,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     EndPaint(hwnd, &paint); return 0;
   }
   if (message == WM_LBUTTONDOWN) {
@@ -667,13 +700,13 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     if (IsHotkeyId(id)) {
       const auto& state = HotkeyStateFor(item->hwndItem);
       const RECT r = item->rcItem;
-      const COLORREF fill = state.listening ? RGB(30, 55, 90) : RGB(25, 37, 52);
-      const COLORREF border = state.listening ? RGB(91, 160, 255) : RGB(49, 70, 96);
+      const COLORREF fill = state.listening ? RGB(61, 52, 112) : RGB(49, 54, 75);
+      const COLORREF border = state.listening ? RGB(133, 113, 255) : RGB(77, 82, 109);
       HBRUSH brush = CreateSolidBrush(fill);
       HPEN pen = CreatePen(PS_SOLID, state.listening ? 2 : 1, border);
       HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
       HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, 12, 12);
+      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, 6, 6);
       SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush);
       DeleteObject(pen); DeleteObject(brush);
       std::wstring display = GetWindowString(settingsWindow_, id);
@@ -694,13 +727,13 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     }
     if (IsToggleId(id)) {
       const bool on = ToggleValue(config_, id); const RECT r = item->rcItem; const int height = r.bottom - r.top;
-      HBRUSH track = CreateSolidBrush(on ? (pressed ? RGB(48, 101, 205) : RGB(60, 124, 235))
-                                         : (pressed ? RGB(50, 62, 80) : RGB(39, 50, 66)));
-      HPEN border = CreatePen(PS_SOLID, 1, on ? RGB(123, 170, 255) : RGB(95, 113, 137));
+      HBRUSH track = CreateSolidBrush(on ? (pressed ? RGB(100, 75, 230) : RGB(119, 91, 248))
+                                         : (pressed ? RGB(58, 63, 84) : RGB(43, 48, 68)));
+      HPEN border = CreatePen(PS_SOLID, 1, on ? RGB(162, 143, 255) : RGB(82, 87, 112));
       HGDIOBJ oldBrush = SelectObject(item->hDC, track); HGDIOBJ oldPen = SelectObject(item->hDC, border);
       RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, height / 2, height / 2);
       SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(border); DeleteObject(track);
-      const int radius = height / 2 - 4; const int knobX = on ? r.right - radius - 4 : r.left + radius + 4;
+      const int radius = std::max(3, height / 2 - 3); const int knobX = on ? r.right - radius - 3 : r.left + radius + 3;
       HBRUSH knob = CreateSolidBrush(on ? RGB(255, 255, 255) : RGB(220, 228, 240)); oldBrush = SelectObject(item->hDC, knob);
       Ellipse(item->hDC, knobX - radius, (r.top + r.bottom) / 2 - radius, knobX + radius, (r.top + r.bottom) / 2 + radius);
       SelectObject(item->hDC, oldBrush); DeleteObject(knob);
@@ -714,9 +747,9 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     if (IsSegmentId(id)) {
       const bool active = (id == IDC_ACTION_COPY && config_.defaultAction == DefaultAction::Copy) ||
                           (id == IDC_ACTION_SAVE && config_.defaultAction == DefaultAction::Save);
-      const COLORREF fill = active ? (pressed ? RGB(68, 111, 219) : RGB(91, 140, 255))
+      const COLORREF fill = active ? (pressed ? RGB(92, 56, 196) : RGB(115, 75, 235))
                                    : (pressed ? RGB(31, 49, 77) : RGB(24, 35, 50));
-      const COLORREF borderColor = active ? RGB(123, 170, 255) : RGB(46, 65, 90);
+      const COLORREF borderColor = active ? RGB(151, 120, 255) : RGB(46, 65, 90);
       HBRUSH brush = CreateSolidBrush(fill);
       HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
       HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
@@ -736,13 +769,23 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
       return TRUE;
     }
-    const bool primary = id == IDC_SAVE_SETTINGS; const bool accent = id == IDC_BROWSE;
-    const COLORREF fill = primary ? (pressed ? RGB(68, 111, 219) : RGB(91, 140, 255))
+    if (IsStepId(id)) {
+      const COLORREF fill = pressed ? RGB(84, 69, 164) : RGB(57, 61, 85);
+      HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, RGB(86, 89, 119));
+      HGDIOBJ oldBrush = SelectObject(item->hDC, brush); HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+      RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 6, 6);
+      SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
+      SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, RGB(238, 238, 255)); SelectObject(item->hDC, settingsFont_);
+      wchar_t text[8]{}; GetWindowTextW(item->hwndItem, text, _countof(text)); RECT textRect = item->rcItem;
+      DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return TRUE;
+    }
+    const bool primary = id == IDC_SAVE_SETTINGS; const bool accent = id == IDC_BROWSE || id == IDC_RESET_SETTINGS;
+    const COLORREF fill = primary ? (pressed ? RGB(92, 56, 196) : RGB(115, 75, 235))
                                   : accent ? (pressed ? RGB(44, 79, 137) : RGB(36, 61, 101))
                                            : (pressed ? RGB(31, 49, 77) : RGB(24, 35, 50));
     HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, RGB(46, 65, 90));
     HGDIOBJ oldBrush = SelectObject(item->hDC, brush); HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-    RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 10, 10);
+    RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 6, 6);
     SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
     wchar_t text[128]{}; GetWindowTextW(item->hwndItem, text, _countof(text)); SetBkMode(item->hDC, TRANSPARENT);
     SetTextColor(item->hDC, RGB(242, 247, 255)); SelectObject(item->hDC, settingsFont_); RECT textRect = item->rcItem;
@@ -757,6 +800,37 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       InvalidateRect(hwnd, &dirty, FALSE);
       if (HWND control = GetDlgItem(hwnd, id)) InvalidateRect(control, nullptr, FALSE);
       return 0;
+    }
+    if (IsStepId(id)) {
+      if (id == IDC_BURST_COUNT_MINUS || id == IDC_BURST_COUNT_PLUS) {
+        int value = config_.burstCount;
+        const std::wstring text = GetWindowString(hwnd, IDC_BURST_COUNT);
+        wchar_t* end = nullptr;
+        const long parsed = text.empty() ? 0L : wcstol(text.c_str(), &end, 10);
+        while (end && iswspace(*end)) ++end;
+        if (!text.empty() && end && *end == L'\0' && parsed >= INT_MIN && parsed <= INT_MAX)
+          value = static_cast<int>(parsed);
+        value = std::clamp(value + (id == IDC_BURST_COUNT_PLUS ? 1 : -1), 2, 30);
+        SetWindowString(hwnd, IDC_BURST_COUNT, std::to_wstring(value));
+        config_.burstCount = value;
+      } else {
+        const float delta = id == IDC_BURST_INTERVAL_PLUS ? 0.01f : -0.01f;
+        float value = config_.burstIntervalSeconds;
+        const std::wstring text = GetWindowString(hwnd, IDC_BURST_INTERVAL);
+        wchar_t* end = nullptr;
+        const float parsed = text.empty() ? 0.0f : wcstof(text.c_str(), &end);
+        while (end && iswspace(*end)) ++end;
+        if (!text.empty() && end && *end == L'\0' && std::isfinite(parsed)) value = parsed;
+        value = std::clamp(value + delta, 0.05f, 0.99f);
+        config_.burstIntervalSeconds = value;
+        wchar_t interval[32]{}; swprintf_s(interval, L"%.2f", value);
+        SetWindowString(hwnd, IDC_BURST_INTERVAL, interval);
+      }
+      InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    }
+    if (id == IDC_RESET_SETTINGS) {
+      config_ = AppConfig{};
+      PopulateSettings(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
     }
     if (id == IDC_SAVE_SETTINGS) {
       if (ReadSettings(hwnd)) { SaveConfig(); RegisterConfiguredHotkeys(); UpdateAutoStart(); DestroyWindow(hwnd); }
@@ -925,17 +999,17 @@ bool Application::ReadSettings(HWND hwnd) {
   const std::wstring secondaryText = trim(GetWindowString(hwnd, IDC_HOTKEY_SECONDARY));
   HotkeySetting primary{}, secondary{};
   if (!ParseHotkeyText(primaryText, primary)) {
-    MessageBoxW(hwnd, L"请设置有效的主快捷键（例如 Ctrl+\\）。", L"RC-ScreenShot", MB_ICONWARNING);
+    MessageBoxW(hwnd, L"请设置有效的截图快捷键（例如 Ctrl+\\）。", L"RC-ScreenShot", MB_ICONWARNING);
     SetFocus(GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY)); return false;
   }
   std::vector<HotkeySetting> hotkeys{primary};
   if (!secondaryText.empty()) {
     if (!ParseHotkeyText(secondaryText, secondary)) {
-      MessageBoxW(hwnd, L"副快捷键格式无效。", L"RC-ScreenShot", MB_ICONWARNING);
+      MessageBoxW(hwnd, L"连拍快捷键格式无效。", L"RC-ScreenShot", MB_ICONWARNING);
       SetFocus(GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY)); return false;
     }
     if (secondary.modifiers == primary.modifiers && secondary.virtualKey == primary.virtualKey) {
-      MessageBoxW(hwnd, L"主快捷键与副快捷键不能重复。", L"RC-ScreenShot", MB_ICONWARNING); return false;
+      MessageBoxW(hwnd, L"截图快捷键与连拍快捷键不能重复。", L"RC-ScreenShot", MB_ICONWARNING); return false;
     }
     hotkeys.push_back(secondary);
   }
