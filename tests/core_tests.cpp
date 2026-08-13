@@ -16,6 +16,29 @@ int failures = 0;
   std::cerr << __FILE__ << ':' << __LINE__ << " CHECK failed: " #condition "\n"; ++failures; \
 } } while (false)
 
+bool LoadBgra(const std::filesystem::path& path, std::vector<uint8_t>& pixels,
+              int& width, int& height) {
+  rc::ComPtr<IWICImagingFactory> factory;
+  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory)))) return false;
+  rc::ComPtr<IWICBitmapDecoder> decoder;
+  if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnLoad, &decoder))) return false;
+  rc::ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(decoder->GetFrame(0, &frame))) return false;
+  rc::ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateFormatConverter(&converter)) ||
+      FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0,
+                                   WICBitmapPaletteTypeCustom))) return false;
+  UINT imageWidth = 0, imageHeight = 0;
+  if (FAILED(converter->GetSize(&imageWidth, &imageHeight))) return false;
+  width = static_cast<int>(imageWidth); height = static_cast<int>(imageHeight);
+  pixels.resize(static_cast<size_t>(width * height * 4));
+  return SUCCEEDED(converter->CopyPixels(nullptr, static_cast<UINT>(width * 4),
+                                         static_cast<UINT>(pixels.size()), pixels.data()));
+}
+
 void TestHotkeys() {
   const rc::AppConfig defaults;
   CHECK(defaults.hotkeys.size() == 2);
@@ -319,6 +342,181 @@ void TestUnitDetection() {
   CHECK(containsPanel);
 }
 
+void TestUnitDetectionRejectsFalseGrid() {
+  constexpr int width = 480, height = 320, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height), 245);
+  const auto drawRect = [&](int left, int top, int right, int bottom) {
+    for (int y = top; y <= bottom; ++y) for (int x = left; x <= right; ++x) {
+      if (x != left && x != right && y != top && y != bottom) continue;
+      uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
+      pixel[0] = pixel[1] = pixel[2] = 10; pixel[3] = 255;
+    }
+  };
+  drawRect(40, 40, 220, 180);
+  drawRect(250, 30, 300, 80);
+  // A short separator/text-like mark must not split the surrounding panel.
+  for (int x = 80; x <= 155; ++x) {
+    uint8_t* pixel = image.data() + static_cast<size_t>(110 * stride + x * 4);
+    pixel[0] = pixel[1] = pixel[2] = 10;
+  }
+
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, stride);
+  const auto chain = detector.CandidatesAt(candidates, {190, 150});
+  CHECK(!chain.empty());
+  const RECT selected = candidates[chain.front()].bounds;
+  CHECK(selected.left <= 45 && selected.top <= 45);
+  CHECK(selected.right >= 215 && selected.bottom >= 175);
+  const auto smallChain = detector.CandidatesAt(candidates, {275, 55});
+  CHECK(!smallChain.empty());
+  const RECT smallSelected = candidates[smallChain.front()].bounds;
+  CHECK(smallSelected.left <= 255 && smallSelected.top <= 35);
+  CHECK(smallSelected.right >= 295 && smallSelected.bottom >= 75);
+}
+
+void TestUnitDetectionAsymmetricGridOuterBounds() {
+  constexpr int width = 520, height = 360, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height), 242);
+  const auto darken = [&](int x, int y) {
+    uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
+    pixel[0] = pixel[1] = pixel[2] = 30; pixel[3] = 255;
+  };
+  for (int x = 40; x <= 460; ++x) {
+    for (int y : {35, 120, 205, 300}) darken(x, y);
+  }
+  for (int y = 35; y <= 300; ++y) {
+    for (int x : {40, 180, 320, 460}) darken(x, y);
+  }
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, stride);
+  const auto chain = detector.CandidatesAt(candidates, {100, 80});
+  CHECK(!chain.empty());
+  CHECK(std::any_of(chain.begin(), chain.end(), [&](size_t index) {
+    const RECT& r = candidates[index].bounds;
+    return r.left <= 45 && r.top <= 40 && r.right >= 455 && r.bottom >= 295;
+  }));
+}
+
+void TestUnitDetectionEllipse() {
+  constexpr int width = 520, height = 360, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height), 245);
+  const auto drawFilledEllipse = [&](int centerX, int centerY, int radiusX, int radiusY) {
+    for (int y = centerY - radiusY; y <= centerY + radiusY; ++y) {
+      for (int x = centerX - radiusX; x <= centerX + radiusX; ++x) {
+        const float dx = static_cast<float>(x - centerX) / radiusX;
+        const float dy = static_cast<float>(y - centerY) / radiusY;
+        if (dx * dx + dy * dy > 1.0f) continue;
+        uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
+        pixel[0] = pixel[1] = pixel[2] = 24; pixel[3] = 255;
+      }
+    }
+  };
+  drawFilledEllipse(130, 110, 54, 54);
+  drawFilledEllipse(350, 210, 62, 88);
+  drawFilledEllipse(475, 55, 12, 12);
+
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, stride);
+  const auto circleChain = detector.CandidatesAt(candidates, {130, 110});
+  const auto ellipseChain = detector.CandidatesAt(candidates, {350, 210});
+  const auto iconChain = detector.CandidatesAt(candidates, {475, 55});
+  CHECK(!circleChain.empty());
+  CHECK(!ellipseChain.empty());
+  CHECK(!iconChain.empty());
+  const RECT circle = candidates[circleChain.front()].bounds;
+  const RECT ellipse = candidates[ellipseChain.front()].bounds;
+  CHECK(circle.left <= 80 && circle.top <= 60 && circle.right >= 180 && circle.bottom >= 160);
+  CHECK(ellipse.left <= 292 && ellipse.top <= 126 && ellipse.right >= 408 && ellipse.bottom >= 294);
+  const RECT icon = candidates[iconChain.front()].bounds;
+  CHECK(icon.left <= 465 && icon.top <= 45 && icon.right >= 485 && icon.bottom >= 65);
+}
+
+void TestUnitDetectionRoundedRectangles() {
+  constexpr int width = 560, height = 340, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height), 112);
+  for (size_t i = 3; i < image.size(); i += 4) image[i] = 255;
+  const auto drawRoundedRect = [&](int left, int top, int right, int bottom, int radius,
+                                   uint8_t luma) {
+    for (int y = top; y <= bottom; ++y) {
+      for (int x = left; x <= right; ++x) {
+        const int nearestX = std::clamp(x, left + radius, right - radius);
+        const int nearestY = std::clamp(y, top + radius, bottom - radius);
+        const int dx = x - nearestX, dy = y - nearestY;
+        if (dx * dx + dy * dy > radius * radius) continue;
+        uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
+        pixel[0] = pixel[1] = pixel[2] = luma;
+      }
+    }
+  };
+  // Ten luma levels model subtle dark-theme cards that the old threshold missed.
+  drawRoundedRect(45, 40, 255, 165, 24, 122);
+  drawRoundedRect(340, 205, 440, 275, 18, 126);
+
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, stride);
+  const auto largeChain = detector.CandidatesAt(candidates, {150, 100});
+  const auto smallChain = detector.CandidatesAt(candidates, {390, 240});
+  CHECK(!largeChain.empty());
+  CHECK(!smallChain.empty());
+  const RECT large = candidates[largeChain.front()].bounds;
+  const RECT smallRect = candidates[smallChain.front()].bounds;
+  CHECK(large.left <= 50 && large.top <= 45 && large.right >= 250 && large.bottom >= 160);
+  CHECK(smallRect.left <= 345 && smallRect.top <= 210 &&
+        smallRect.right >= 435 && smallRect.bottom >= 270);
+}
+
+void TestUnitDetectionColorAndHighResolution() {
+  constexpr int width = 2400, height = 1400, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height));
+  for (size_t i = 0; i < image.size(); i += 4) {
+    image[i] = image[i + 1] = image[i + 2] = 112; image[i + 3] = 255;
+  }
+  const auto drawRoundedColor = [&](int left, int top, int right, int bottom, int radius,
+                                    std::array<uint8_t, 3> bgr) {
+    for (int y = top; y <= bottom; ++y) {
+      for (int x = left; x <= right; ++x) {
+        const int nearestX = std::clamp(x, left + radius, right - radius);
+        const int nearestY = std::clamp(y, top + radius, bottom - radius);
+        const int dx = x - nearestX, dy = y - nearestY;
+        if (dx * dx + dy * dy > radius * radius) continue;
+        uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
+        pixel[0] = bgr[0]; pixel[1] = bgr[1]; pixel[2] = bgr[2];
+      }
+    }
+  };
+  // Nearly identical grayscale luminance but clear RGB separation.
+  drawRoundedColor(1800, 1000, 1860, 1034, 8, {132, 102, 124});
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, stride);
+  const auto chain = detector.CandidatesAt(candidates, {1830, 1017});
+  CHECK(!chain.empty());
+  const RECT selected = candidates[chain.front()].bounds;
+  CHECK(selected.left <= 1805 && selected.top <= 1005);
+  CHECK(selected.right >= 1855 && selected.bottom >= 1029);
+}
+
+void TestUnitDetectionRealSettingsUi() {
+  const auto imagePath = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                         L"assets" / L"feature-settings.png";
+  std::vector<uint8_t> image;
+  int width = 0, height = 0;
+  CHECK(LoadBgra(imagePath, image, width, height));
+  if (image.empty()) return;
+  rc::UnitDetector detector;
+  const auto candidates = detector.Detect(image, width, height, width * 4);
+  const auto hasBounds = [&](int left, int top, int right, int bottom, int tolerance) {
+    return std::any_of(candidates.begin(), candidates.end(), [&](const rc::UnitCandidate& candidate) {
+      const RECT& r = candidate.bounds;
+      return std::abs(r.left - left) <= tolerance && std::abs(r.top - top) <= tolerance &&
+             std::abs(r.right - right) <= tolerance && std::abs(r.bottom - bottom) <= tolerance;
+    });
+  };
+  CHECK(hasBounds(8, 45, 614, 187, 4));
+  CHECK(hasBounds(8, 193, 308, 341, 8));
+  CHECK(hasBounds(312, 193, 614, 341, 4));
+  CHECK(hasBounds(8, 347, 614, 427, 4));
+}
+
 void TestCoordinatesAndHdrIntersection() {
   rc::DesktopSnapshot snapshot;
   snapshot.virtualBounds = {-100, -50, 100, 50};
@@ -417,6 +615,12 @@ int wmain() {
   TestMosaic();
   TestMosaicBlur();
   TestUnitDetection();
+  TestUnitDetectionRejectsFalseGrid();
+  TestUnitDetectionAsymmetricGridOuterBounds();
+  TestUnitDetectionEllipse();
+  TestUnitDetectionRoundedRectangles();
+  TestUnitDetectionColorAndHighResolution();
+  TestUnitDetectionRealSettingsUi();
   TestCoordinatesAndHdrIntersection();
   TestFilenameAndHalfFloat();
   TestJpegColorLayout();
