@@ -17,6 +17,16 @@
 - 设置中心支持快捷键、连拍参数、输出目录、JPEG 质量和启动行为配置。
 - 原生 C++20 实现，无运行时框架依赖，适合直接解压使用。
 
+### 功能界面
+
+设置中心将快捷键、连拍、输出、编辑器和启动行为集中在一个窗口中：
+
+![RC-ScreenShot 设置中心](assets/feature-settings.png)
+
+快捷键和连拍参数可独立配置，连拍张数支持 2-30 帧，间隔支持 0.05-0.99 秒：
+
+![RC-ScreenShot 快捷键与连拍设置](assets/feature-burst-settings.png)
+
 ## 下载
 
 前往 [Latest Release](https://github.com/JDui/RC-ScreenShot/releases/latest) 下载最新版。
