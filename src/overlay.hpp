@@ -39,7 +39,9 @@ class CaptureOverlay {
   // intentionally expose no mutable overlay state and keep hit-testing on the
   // same dynamic icon rect used by production input handling.
   RECT SnapshotIconRectForTest() const { return SnapshotIconRect(); }
+  RECT SnapshotPanelRectForTest() const { return SnapshotPanelRect(); }
   RECT SnapshotThumbnailRectForTest(size_t index) const { return SnapshotThumbnailRect(index); }
+  RECT ToolbarRectForTest() const { return ToolbarRect(); }
   bool SnapshotSwitcherExpandedForTest() const {
     return snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.01f;
   }
@@ -99,6 +101,7 @@ class CaptureOverlay {
     int thumbWidth = 1;
     int thumbHeight = 1;
     int gap = 1;
+    bool opensDownward = false;
   };
   SnapshotLayout SnapshotLayoutFor() const;
   const DesktopSnapshot& SnapshotAt(size_t index) const;
@@ -113,7 +116,8 @@ class CaptureOverlay {
   void UpdateTooltip(POINT point);
   void DrawTextCommand(const TextCommand& command);
   void DrawText(std::wstring_view text, const D2D1_RECT_F& rect, float size,
-                D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_CENTER);
+                D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
   std::optional<Tool> HitTestTool(POINT point) const;
   enum class PropertyAction {
     SizeDown, SizeUp, Color, Opacity, FillColor, FillOpacity, FillToggle,
@@ -195,6 +199,7 @@ class CaptureOverlay {
   size_t activeSnapshot_ = 0;
   std::optional<size_t> hoverSnapshot_;
   std::optional<size_t> hoverSnapshotPrevious_;
+  bool snapshotRestorePending_ = false;
   bool snapshotsExpanded_ = false;
   bool snapshotsAnimating_ = false;
   float snapshotsAnimationProgress_ = 0.0f;

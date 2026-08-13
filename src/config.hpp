@@ -45,10 +45,13 @@ enum class MosaicStyle { Pixel, Blur };
 
 struct AppConfig {
   int schemaVersion = 4;
-  std::vector<HotkeySetting> hotkeys{{}};
+  std::vector<HotkeySetting> hotkeys{
+      {},
+      {MOD_ALT | MOD_NOREPEAT, VK_OEM_5, true},
+  };
   // The first configured hotkey is the regular one-shot capture. The optional
   // second hotkey starts a burst using these values.
-  int burstCount = 5;
+  int burstCount = 6;
   float burstIntervalSeconds = 0.08f;
   bool launchAtLogin = false;
   bool silentAtLogin = true;

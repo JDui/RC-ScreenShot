@@ -106,7 +106,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
   }
   if (!previewResponsive) return 7;
+  const RECT originalToolbar = overlay.ToolbarRectForTest();
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(dockPoint.x, dockPoint.y));
+  const POINT toolbarDragPoint{(originalToolbar.left + originalToolbar.right) / 2,
+                               originalToolbar.bottom - 2};
+  const POINT toolbarTopPoint{toolbarDragPoint.x,
+                              40 + (originalToolbar.bottom - originalToolbar.top) - 2};
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON,
+               MAKELPARAM(toolbarDragPoint.x, toolbarDragPoint.y));
+  SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON,
+               MAKELPARAM(toolbarTopPoint.x, toolbarTopPoint.y));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0,
+               MAKELPARAM(toolbarTopPoint.x, toolbarTopPoint.y));
+  const RECT topIcon = overlay.SnapshotIconRectForTest();
+  const POINT topIconPoint{(topIcon.left + topIcon.right) / 2,
+                           (topIcon.top + topIcon.bottom) / 2};
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON,
+               MAKELPARAM(topIconPoint.x, topIconPoint.y));
+  Sleep(340);
+  while (PeekMessageW(&previewMessage, nullptr, 0, 0, PM_REMOVE)) {
+    TranslateMessage(&previewMessage); DispatchMessageW(&previewMessage);
+  }
+  const RECT topPanel = overlay.SnapshotPanelRectForTest();
+  const RECT topThumb = overlay.SnapshotThumbnailRectForTest(0);
+  if (topPanel.top < topIcon.bottom + 7 || topPanel.bottom > 320) return 8;
+  if (topThumb.right - topThumb.left < 24 || topThumb.bottom - topThumb.top < 18) return 9;
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON,
+               MAKELPARAM(topIconPoint.x, topIconPoint.y));
+  const RECT topToolbar = overlay.ToolbarRectForTest();
+  const POINT restoreDragPoint{(topToolbar.left + topToolbar.right) / 2,
+                               topToolbar.bottom - 2};
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON,
+               MAKELPARAM(restoreDragPoint.x, restoreDragPoint.y));
+  SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON,
+               MAKELPARAM(toolbarDragPoint.x, toolbarDragPoint.y));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0,
+               MAKELPARAM(toolbarDragPoint.x, toolbarDragPoint.y));
   SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'M', 0);
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(180, 140));
   SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(260, 170));

@@ -17,6 +17,10 @@ int failures = 0;
 } } while (false)
 
 void TestHotkeys() {
+  const rc::AppConfig defaults;
+  CHECK(defaults.hotkeys.size() == 2);
+  CHECK(rc::FormatHotkey(defaults.hotkeys[0]) == L"Ctrl+\\");
+  CHECK(rc::FormatHotkey(defaults.hotkeys[1]) == L"Alt+\\");
   rc::HotkeySetting key;
   CHECK(rc::ParseHotkeyText(L"Ctrl+\\", key));
   CHECK((key.modifiers & MOD_CONTROL) != 0);
@@ -83,8 +87,8 @@ void TestConfigDamagedFieldRecovery() {
   CHECK(loaded.launchAtLogin);
   CHECK(loaded.autoSaveOnCopy);
   CHECK(loaded.jpegQuality == 80);
-  CHECK(loaded.hotkeys.size() == 1);
-  CHECK(loaded.burstCount == 5);
+  CHECK(loaded.hotkeys.size() == 2);
+  CHECK(loaded.burstCount == 6);
   CHECK(std::abs(loaded.burstIntervalSeconds - 0.08f) < 0.001f);
 
   output.open(store.path(), std::ios::binary | std::ios::trunc);

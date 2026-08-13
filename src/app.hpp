@@ -72,6 +72,7 @@ class Application {
   HFONT settingsTitleFont_ = nullptr;
   HFONT settingsSectionFont_ = nullptr;
   HFONT settingsSmallFont_ = nullptr;
+  HFONT settingsHintFont_ = nullptr;
   bool settingsSliderDragging_ = false;
   HotkeyCaptureState hotkeyPrimaryState_{};
   HotkeyCaptureState hotkeySecondaryState_{};

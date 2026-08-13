@@ -18,6 +18,11 @@ constexpr UINT_PTR kUnitTimer = 1;
 constexpr UINT_PTR kSettingPreviewTimer = 2;
 constexpr UINT_PTR kSnapshotAnimationTimer = 3;
 constexpr UINT_PTR kSnapshotDockTimer = 4;
+constexpr UINT_PTR kSnapshotRestoreTimer = 5;
+// Debounce for restoring the committed frame after hovering a thumbnail.
+// A quick pass across the gaps between thumbnails stays on the previewed
+// frame; only a genuine pause (or leaving the panel) snaps back.
+constexpr UINT kSnapshotRestoreDelayMs = 180;
 constexpr UINT kUnitDetectionFinishedMessage = WM_APP + 0x431;
 constexpr int kSnapshotIconSize = 44;
 constexpr int kSnapshotThumbWidth = 92;
@@ -69,23 +74,26 @@ float SnapshotRevealProgress(float progress) {
   return std::clamp(progress, 0.0f, 1.0f);
 }
 
-float SnapshotItemProgress(size_t index, size_t count, float revealProgress) {
+float SnapshotItemProgress(size_t index, size_t count, float revealProgress,
+                           bool opensDownward = false) {
   if (count <= 1) return 1.0f;
-  // The panel uncovers the bottom row first, so stagger in that same order.
-  const size_t reverseIndex = count - 1 - std::min(index, count - 1);
-  const float delay = std::min(0.35f, static_cast<float>(reverseIndex) * kSnapshotStaggerProgress);
+  // Stagger from the edge attached to the icon so items follow the reveal.
+  const size_t revealIndex = opensDownward ? std::min(index, count - 1)
+                                           : count - 1 - std::min(index, count - 1);
+  const float delay = std::min(0.35f, static_cast<float>(revealIndex) * kSnapshotStaggerProgress);
   const float span = std::max(0.01f, 1.0f - delay);
   return std::clamp((revealProgress - delay) / span, 0.0f, 1.0f);
 }
 
-RECT AnimatedSnapshotPanelRect(const RECT& panel, float revealProgress) {
+RECT AnimatedSnapshotPanelRect(const RECT& panel, float revealProgress, bool opensDownward) {
   const float reveal = SnapshotRevealProgress(revealProgress);
   const float panelScale = 0.985f + 0.015f * reveal;
   const int panelHeight = std::max(0, static_cast<int>(panel.bottom - panel.top));
   const int scaledHeight = std::clamp(static_cast<int>(std::lround(
       panelHeight * panelScale * reveal)), 0, panelHeight);
   RECT animated = panel;
-  animated.top = animated.bottom - scaledHeight;
+  if (opensDownward) animated.bottom = animated.top + scaledHeight;
+  else animated.top = animated.bottom - scaledHeight;
   return animated;
 }
 
@@ -432,6 +440,7 @@ DesktopSnapshot& CaptureOverlay::SnapshotAt(size_t index) {
 CaptureOverlay::~CaptureOverlay() {
   KillTimer(hwnd_, kSnapshotAnimationTimer);
   KillTimer(hwnd_, kSnapshotDockTimer);
+  KillTimer(hwnd_, kSnapshotRestoreTimer);
   KillTimer(hwnd_, kUnitTimer);
   KillTimer(hwnd_, kSettingPreviewTimer);
   if (unitThread_.joinable()) unitThread_.request_stop();
@@ -506,6 +515,11 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_TIMER:
       if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
+      else if (wParam == kSnapshotRestoreTimer) {
+        KillTimer(hwnd_, kSnapshotRestoreTimer);
+        snapshotRestorePending_ = false;
+        RestoreHoverSnapshot(false);
+      }
       else if (wParam == kSnapshotAnimationTimer && snapshotsAnimating_) {
         const float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - snapshotsAnimationStart_).count();
         const float duration = snapshotsExpanded_ ? 0.28f : 0.19f;
@@ -548,11 +562,21 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         TrackMouseEvent(&track);
         if (HitSnapshotIcon(point) || HitSnapshotPanel(point)) {
           if (const auto thumb = HitSnapshotThumbnail(point)) {
+            if (snapshotRestorePending_) {
+              KillTimer(hwnd_, kSnapshotRestoreTimer);
+              snapshotRestorePending_ = false;
+            }
             if (!hoverSnapshot_) hoverSnapshotPrevious_ = activeSnapshot_;
             hoverSnapshot_ = *thumb;
             SetActiveSnapshot(*thumb, false, false);
-          } else {
-            RestoreHoverSnapshot(false);
+          } else if (hoverSnapshot_) {
+            // In a gap between thumbnails: keep deferring the restore while
+            // the pointer is still in motion so neither a quick slide nor a
+            // slow sweep across the strip flashes back to the committed frame.
+            // Only a stationary pause (or leaving the panel) snaps back, and
+            // reaching another thumbnail cancels the pending restore entirely.
+            snapshotRestorePending_ = true;
+            SetTimer(hwnd_, kSnapshotRestoreTimer, kSnapshotRestoreDelayMs, nullptr);
           }
           InvalidateRect(hwnd_, nullptr, FALSE);
           return 0;
@@ -591,6 +615,10 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       if (snapshots_.size() > 1) {
         if (HitSnapshotIcon(point)) {
+          if (snapshotRestorePending_) {
+            KillTimer(hwnd_, kSnapshotRestoreTimer);
+            snapshotRestorePending_ = false;
+          }
           snapshotsAnimationFromProgress_ = std::clamp(snapshotsAnimationProgress_, 0.0f, 1.0f);
           snapshotsExpanded_ = !snapshotsExpanded_;
           snapshotsAnimating_ = true;
@@ -599,6 +627,10 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
           return 0;
         }
         if (const auto thumb = HitSnapshotThumbnail(point)) {
+          if (snapshotRestorePending_) {
+            KillTimer(hwnd_, kSnapshotRestoreTimer);
+            snapshotRestorePending_ = false;
+          }
           hoverSnapshot_.reset();
           hoverSnapshotPrevious_.reset();
           SetActiveSnapshot(*thumb, true, false);
@@ -1016,8 +1048,23 @@ void CaptureOverlay::Paint() {
   DrawSnapshotSwitcher();
   const wchar_t* modeName = mode_ == SelectionMode::Normal ? L"普通模式" : mode_ == SelectionMode::Window ? L"窗口模式" : L"单元模式";
   std::wstring status = std::wstring(L"空格切换  ·  ") + modeName;
-  if (mode_ == SelectionMode::Unit && !unitReady_) status += L"（正在分析区域…）";
-  DrawText(status, D2D1::RectF(16, 14, 330, 48), 15, D2D1::ColorF(D2D1::ColorF::White), DWRITE_TEXT_ALIGNMENT_LEADING);
+  const bool waitingForUnits = mode_ == SelectionMode::Unit && !unitReady_;
+  if (waitingForUnits) status += L"（正在分析区域…）";
+  const RECT statusRect{12, 10, waitingForUnits ? 394L : 270L, 50};
+  ComPtr<ID2D1SolidColorBrush> statusShadow, statusBackground, statusBorder;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.5f), &statusShadow);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.025f, 0.055f, 0.09f, 0.92f), &statusBackground);
+  renderTarget_->CreateSolidColorBrush(waitingForUnits
+      ? D2D1::ColorF(1.0f, 0.67f, 0.16f, 1.0f)
+      : D2D1::ColorF(0.25f, 0.7f, 1.0f, 0.98f), &statusBorder);
+  RECT shadowRect = statusRect;
+  OffsetRect(&shadowRect, 0, 2);
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(shadowRect), 8, 8), statusShadow.Get());
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(statusRect), 8, 8), statusBackground.Get());
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(statusRect), 8, 8), statusBorder.Get(), 1.5f);
+  DrawText(status, D2D1::RectF(24, 10, static_cast<float>(statusRect.right - 10), 50), 16,
+           D2D1::ColorF(D2D1::ColorF::White), DWRITE_TEXT_ALIGNMENT_LEADING,
+           DWRITE_FONT_WEIGHT_SEMI_BOLD);
   HRESULT hr = renderTarget_->EndDraw();
   if (hr == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
 }
@@ -1108,73 +1155,117 @@ CaptureOverlay::SnapshotLayout CaptureOverlay::SnapshotLayoutFor() const {
   const int targetTop = static_cast<int>(target.top);
   const int targetRight = static_cast<int>(target.right);
   const int targetBottom = static_cast<int>(target.bottom);
-  const int width = std::max(1, targetRight - targetLeft);
-  const int height = std::max(1, targetBottom - targetTop);
   const RECT icon = SnapshotIconRect();
   constexpr int padding = 9;
   constexpr int minThumbWidth = 24;
   constexpr int minThumbHeight = 18;
-  const int right = std::clamp(static_cast<int>(icon.right), targetLeft, targetRight);
-  const int bottom = std::clamp(static_cast<int>(icon.top) - 8, targetTop, targetBottom);
-  const int leftMargin = std::min(padding, std::max(0, width / 4));
-  const int topMargin = std::min(padding, std::max(0, height / 4));
-  const int availableWidth = std::max(1, right - (targetLeft + leftMargin));
-  const int availableHeight = std::max(1, bottom - (targetTop + topMargin));
-
-  int bestColumns = 1;
-  int bestRows = static_cast<int>(count);
-  int bestWidth = 1;
-  int bestHeight = 1;
-  int bestArea = -1;
-  int bestDistance = std::numeric_limits<int>::max();
+  constexpr int iconGap = 8;
   const int preferredColumns = std::max(1, static_cast<int>(std::ceil(std::sqrt(
       static_cast<double>(count)))));
-  for (size_t columnsValue = 1; columnsValue <= count; ++columnsValue) {
-    const int columns = static_cast<int>(columnsValue);
-    const int rows = static_cast<int>((count + columnsValue - 1) / columnsValue);
-    const int innerWidth = availableWidth - 2 * padding - (columns - 1) * kSnapshotThumbGap;
-    const int innerHeight = availableHeight - 2 * padding - (rows - 1) * kSnapshotThumbGap;
-    if (innerWidth <= 0 || innerHeight <= 0) continue;
-    const int thumbWidth = std::min(kSnapshotThumbWidth, std::max(1, innerWidth / columns));
-    const int thumbHeight = std::min(kSnapshotThumbHeight, std::max(1, innerHeight / rows));
-    if (thumbWidth < minThumbWidth || thumbHeight < minThumbHeight) continue;
-    const int area = thumbWidth * thumbHeight;
-    const int distance = std::abs(columns - preferredColumns);
-    if (area > bestArea || (area == bestArea && distance < bestDistance)) {
-      bestArea = area;
-      bestDistance = distance;
-      bestColumns = columns;
-      bestRows = rows;
-      bestWidth = thumbWidth;
-      bestHeight = thumbHeight;
-    }
-  }
-  if (bestArea < 0) {
-    bestColumns = std::max(1, std::min(static_cast<int>(count), availableWidth / (minThumbWidth + kSnapshotThumbGap)));
-    bestRows = static_cast<int>((count + static_cast<size_t>(bestColumns) - 1) /
-                                static_cast<size_t>(bestColumns));
-    bestWidth = std::max(1, (availableWidth - 2 * padding -
-                             (bestColumns - 1) * kSnapshotThumbGap) / bestColumns);
-    bestHeight = std::max(1, (availableHeight - 2 * padding -
-                              (bestRows - 1) * kSnapshotThumbGap) / bestRows);
-  }
 
-  const int panelWidth = 2 * padding + bestColumns * bestWidth +
-                         (bestColumns - 1) * kSnapshotThumbGap;
-  const int panelHeight = 2 * padding + bestRows * bestHeight +
-                          (bestRows - 1) * kSnapshotThumbGap;
-  int panelRight = std::clamp(right, targetLeft, targetRight);
-  int panelBottom = std::clamp(bottom, targetTop, targetBottom);
-  int panelLeft = panelRight - panelWidth;
-  int panelTop = panelBottom - panelHeight;
-  if (panelLeft < targetLeft) { panelLeft = targetLeft; panelRight = std::min(targetRight, targetLeft + panelWidth); }
-  if (panelTop < targetTop) { panelTop = targetTop; panelBottom = std::min(targetBottom, targetTop + panelHeight); }
+  struct LayoutCandidate {
+    int columns = 1;
+    int rows = 1;
+    int thumbWidth = 1;
+    int thumbHeight = 1;
+    int area = 1;
+    int columnDistance = std::numeric_limits<int>::max();
+    int availableWidth = 1;
+    int availableHeight = 1;
+    bool preservesMinimum = false;
+    bool opensRight = false;
+    bool opensDownward = false;
+  };
+
+  const auto makeCandidate = [&](int availableWidth, int availableHeight,
+                                 bool opensRight, bool opensDownward) {
+    LayoutCandidate candidate{};
+    candidate.availableWidth = std::max(1, availableWidth);
+    candidate.availableHeight = std::max(1, availableHeight);
+    candidate.opensRight = opensRight;
+    candidate.opensDownward = opensDownward;
+    for (size_t columnsValue = 1; columnsValue <= count; ++columnsValue) {
+      const int columns = static_cast<int>(columnsValue);
+      const int rows = static_cast<int>((count + columnsValue - 1) / columnsValue);
+      const int innerWidth = candidate.availableWidth - 2 * padding -
+                             (columns - 1) * kSnapshotThumbGap;
+      const int innerHeight = candidate.availableHeight - 2 * padding -
+                              (rows - 1) * kSnapshotThumbGap;
+      if (innerWidth <= 0 || innerHeight <= 0) continue;
+      const int thumbWidth = std::min(kSnapshotThumbWidth, std::max(1, innerWidth / columns));
+      const int thumbHeight = std::min(kSnapshotThumbHeight, std::max(1, innerHeight / rows));
+      if (thumbWidth < minThumbWidth || thumbHeight < minThumbHeight) continue;
+      const int area = thumbWidth * thumbHeight;
+      const int distance = std::abs(columns - preferredColumns);
+      if (!candidate.preservesMinimum || area > candidate.area ||
+          (area == candidate.area && distance < candidate.columnDistance)) {
+        candidate.preservesMinimum = true;
+        candidate.columns = columns;
+        candidate.rows = rows;
+        candidate.thumbWidth = thumbWidth;
+        candidate.thumbHeight = thumbHeight;
+        candidate.area = area;
+        candidate.columnDistance = distance;
+      }
+    }
+    if (!candidate.preservesMinimum) {
+      candidate.columns = std::max(1, std::min(static_cast<int>(count),
+          candidate.availableWidth / (minThumbWidth + kSnapshotThumbGap)));
+      candidate.rows = static_cast<int>((count + static_cast<size_t>(candidate.columns) - 1) /
+                                        static_cast<size_t>(candidate.columns));
+      candidate.thumbWidth = std::max(1, (candidate.availableWidth - 2 * padding -
+          (candidate.columns - 1) * kSnapshotThumbGap) / candidate.columns);
+      candidate.thumbHeight = std::max(1, (candidate.availableHeight - 2 * padding -
+          (candidate.rows - 1) * kSnapshotThumbGap) / candidate.rows);
+      candidate.area = candidate.thumbWidth * candidate.thumbHeight;
+      candidate.columnDistance = std::abs(candidate.columns - preferredColumns);
+    }
+    return candidate;
+  };
+
+  const int iconLeft = std::clamp(static_cast<int>(icon.left), targetLeft, targetRight);
+  const int iconRight = std::clamp(static_cast<int>(icon.right), targetLeft, targetRight);
+  const int iconTop = std::clamp(static_cast<int>(icon.top), targetTop, targetBottom);
+  const int iconBottom = std::clamp(static_cast<int>(icon.bottom), targetTop, targetBottom);
+  const int leftWidth = std::max(1, iconRight - targetLeft);
+  const int rightWidth = std::max(1, targetRight - iconLeft);
+  const int aboveHeight = std::max(1, iconTop - iconGap - targetTop);
+  const int belowHeight = std::max(1, targetBottom - (iconBottom + iconGap));
+  std::array<LayoutCandidate, 4> candidates{{
+      makeCandidate(leftWidth, aboveHeight, false, false),
+      makeCandidate(rightWidth, aboveHeight, true, false),
+      makeCandidate(leftWidth, belowHeight, false, true),
+      makeCandidate(rightWidth, belowHeight, true, true),
+  }};
+  const auto better = [](const LayoutCandidate& value, const LayoutCandidate& current) {
+    if (value.preservesMinimum != current.preservesMinimum) return value.preservesMinimum;
+    if (value.area != current.area) return value.area > current.area;
+    if (value.columnDistance != current.columnDistance)
+      return value.columnDistance < current.columnDistance;
+    // Preserve the familiar up-and-left expansion whenever geometry is tied.
+    if (value.opensDownward != current.opensDownward) return !value.opensDownward;
+    if (value.opensRight != current.opensRight) return !value.opensRight;
+    return false;
+  };
+  LayoutCandidate best = candidates.front();
+  for (size_t index = 1; index < candidates.size(); ++index)
+    if (better(candidates[index], best)) best = candidates[index];
+
+  const int panelWidth = std::min(best.availableWidth, 2 * padding + best.columns * best.thumbWidth +
+                                  (best.columns - 1) * kSnapshotThumbGap);
+  const int panelHeight = std::min(best.availableHeight, 2 * padding + best.rows * best.thumbHeight +
+                                   (best.rows - 1) * kSnapshotThumbGap);
+  const int panelLeft = best.opensRight ? iconLeft : iconRight - panelWidth;
+  const int panelRight = panelLeft + panelWidth;
+  const int panelTop = best.opensDownward ? iconBottom + iconGap : iconTop - iconGap - panelHeight;
+  const int panelBottom = panelTop + panelHeight;
   result.panel = {panelLeft, panelTop, panelRight, panelBottom};
-  result.columns = bestColumns;
-  result.rows = bestRows;
-  result.thumbWidth = bestWidth;
-  result.thumbHeight = bestHeight;
+  result.columns = best.columns;
+  result.rows = best.rows;
+  result.thumbWidth = best.thumbWidth;
+  result.thumbHeight = best.thumbHeight;
   result.gap = kSnapshotThumbGap;
+  result.opensDownward = best.opensDownward;
   return result;
 }
 
@@ -1190,23 +1281,26 @@ bool CaptureOverlay::HitSnapshotIcon(POINT point) const {
 
 bool CaptureOverlay::HitSnapshotPanel(POINT point) const {
   if (snapshots_.size() <= 1 || snapshotsAnimationProgress_ <= 0.01f) return false;
-  RECT panel = SnapshotLayoutFor().panel;
+  const SnapshotLayout layout = SnapshotLayoutFor();
+  RECT panel = layout.panel;
   if (panel.right <= panel.left || panel.bottom <= panel.top) return false;
   const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
-  panel = AnimatedSnapshotPanelRect(panel, reveal);
+  panel = AnimatedSnapshotPanelRect(panel, reveal, layout.opensDownward);
   return Contains(panel, point);
 }
 
 std::optional<size_t> CaptureOverlay::HitSnapshotThumbnail(POINT point) const {
   if (!HitSnapshotPanel(point)) return std::nullopt;
-  const RECT panel = SnapshotLayoutFor().panel;
+  const SnapshotLayout layout = SnapshotLayoutFor();
+  const RECT panel = layout.panel;
   const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
-  const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal);
+  const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal, layout.opensDownward);
   const int animatedTop = animatedPanel.top;
   const int animatedBottom = animatedPanel.bottom;
   for (size_t index = 0; index < snapshots_.size(); ++index) {
     const RECT thumb = SnapshotThumbnailRect(index);
-    const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal);
+    const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal,
+                                                    layout.opensDownward);
     if (thumb.top < animatedTop || thumb.bottom > animatedBottom || itemProgress < 0.55f) continue;
     const float itemScale = 0.96f + 0.04f * itemProgress;
     const int centerX = (thumb.left + thumb.right) / 2;
@@ -1347,6 +1441,10 @@ void CaptureOverlay::SetActiveSnapshot(size_t index, bool collapse, bool refresh
 
 void CaptureOverlay::RestoreHoverSnapshot(bool refreshDetection) {
   if (!hoverSnapshot_) return;
+  if (snapshotRestorePending_) {
+    snapshotRestorePending_ = false;
+    if (hwnd_) KillTimer(hwnd_, kSnapshotRestoreTimer);
+  }
   const std::optional<size_t> previous = hoverSnapshotPrevious_;
   hoverSnapshot_.reset();
   hoverSnapshotPrevious_.reset();
@@ -1370,18 +1468,17 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
     const RECT panel = layout.panel;
     const int panelLeft = static_cast<int>(panel.left);
     const int panelRight = static_cast<int>(panel.right);
-    const int panelBottom = static_cast<int>(panel.bottom);
     const float reveal = SnapshotRevealProgress(snapshotsAnimationProgress_);
-    const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal);
+    const RECT animatedPanel = AnimatedSnapshotPanelRect(panel, reveal, layout.opensDownward);
     const int animatedTop = animatedPanel.top;
     const auto panelBrush = brush(D2D1::ColorF(0.035f, 0.07f, 0.12f, 0.94f));
     const auto panelBorder = brush(D2D1::ColorF(0.35f, 0.55f, 0.84f, 0.9f));
     renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
         D2D1::RectF(static_cast<float>(panelLeft), static_cast<float>(animatedTop),
-                    static_cast<float>(panelRight), static_cast<float>(panelBottom)), 10, 10), panelBrush.Get());
+                    static_cast<float>(panelRight), static_cast<float>(animatedPanel.bottom)), 10, 10), panelBrush.Get());
     renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
         D2D1::RectF(static_cast<float>(panelLeft), static_cast<float>(animatedTop),
-                    static_cast<float>(panelRight), static_cast<float>(panelBottom)), 10, 10), panelBorder.Get(), 1.0f);
+                    static_cast<float>(panelRight), static_cast<float>(animatedPanel.bottom)), 10, 10), panelBorder.Get(), 1.0f);
     renderTarget_->PushAxisAlignedClip(
         D2D1::RectF(static_cast<float>(animatedPanel.left), static_cast<float>(animatedPanel.top),
                     static_cast<float>(animatedPanel.right), static_cast<float>(animatedPanel.bottom)),
@@ -1401,7 +1498,8 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
     }
     for (size_t index = 0; index < snapshots_.size(); ++index) {
       const RECT rect = SnapshotThumbnailRect(index);
-      const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal);
+      const float itemProgress = SnapshotItemProgress(index, snapshots_.size(), reveal,
+                                                      layout.opensDownward);
       if (rect.top < animatedTop || rect.bottom > animatedPanel.bottom || itemProgress <= 0.01f) continue;
       const float itemOpacity = 0.48f + 0.52f * itemProgress;
       const float itemScale = 0.96f + 0.04f * itemProgress;
@@ -2843,9 +2941,10 @@ void CaptureOverlay::DrawTooltip() {
 }
 
 void CaptureOverlay::DrawText(std::wstring_view text, const D2D1_RECT_F& rect, float size,
-                              D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT alignment) {
+                              D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT alignment,
+                              DWRITE_FONT_WEIGHT weight) {
   ComPtr<IDWriteTextFormat> format;
-  if (FAILED(dwriteFactory_->CreateTextFormat(L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+  if (FAILED(dwriteFactory_->CreateTextFormat(L"Microsoft YaHei UI", nullptr, weight,
       DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"zh-CN", &format))) return;
   format->SetTextAlignment(alignment); format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
   ComPtr<ID2D1SolidColorBrush> brush; renderTarget_->CreateSolidColorBrush(color, &brush);
