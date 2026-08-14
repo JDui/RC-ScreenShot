@@ -2,6 +2,7 @@
 
 #include "capture.hpp"
 #include "editor.hpp"
+#include "uia_detector.hpp"
 #include "unit_detector.hpp"
 
 #include <d2d1.h>
@@ -45,6 +46,7 @@ class CaptureOverlay {
   bool SnapshotSwitcherExpandedForTest() const {
     return snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.01f;
   }
+  bool EditingForTest() const { return editing_; }
 
  private:
   static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -56,9 +58,19 @@ class CaptureOverlay {
   void BeginSettingPreview(POINT point, bool timed = false);
   void EndSettingPreview();
   void DrawSettingPreview();
+  void BeginWindowEnumeration();
+  void FinishWindowEnumerationMessage();
   void BeginUnitDetection();
+  void ScheduleUiaQuery(POINT point);
+  void BeginUiaQuery();
+  void FinishUiaQueryMessage();
+  void StopUiaQuery();
+  void SetHoverTarget(RECT target, bool immediate = false);
+  void AdvanceHoverAnimation();
   void UpdateHover(POINT point);
   void CycleMode();
+  void HandleEscape();
+  void ReturnToSelection();
   void BeginSelection(POINT point);
   void ContinueSelection(POINT point);
   void EndSelection(POINT point);
@@ -256,6 +268,10 @@ class CaptureOverlay {
   float penWidthScale_ = 1.0f;
   RECT selection_{};  // overlay-local coordinates
   RECT hoverRect_{};
+  RECT hoverTargetRect_{};
+  RECT hoverAnimationFromRect_{};
+  std::chrono::steady_clock::time_point hoverAnimationStart_{};
+  bool hoverAnimating_ = false;
   EditorDocument document_;
   std::optional<EditCommand> previewCommand_;
   HWND textEdit_ = nullptr;
@@ -264,11 +280,27 @@ class CaptureOverlay {
   std::mutex unitMutex_;
   std::vector<WindowCandidate> windowCandidates_;
   std::vector<UnitCandidate> unitCandidates_;
+  std::vector<UnitCandidate> uiaCandidates_;
+  std::vector<UnitCandidate> pendingUiaCandidates_;
   std::atomic<bool> unitReady_{false};
   std::atomic<bool> unitDetectionRunning_{false};
   std::atomic<bool> unitDetectionFinished_{false};
+  std::atomic<bool> windowReady_{false};
+  std::atomic<bool> windowEnumerationFinished_{false};
+  std::atomic<bool> uiaQueryRunning_{false};
+  std::atomic<bool> uiaQueryFinished_{false};
   bool unitDetectionSuppressed_ = false;
+  bool restartUnitDetectionPending_ = false;
   std::jthread unitThread_;
+  std::jthread windowThread_;
+  std::jthread uiaThread_;
+  std::optional<POINT> requestedUiaPoint_;
+  POINT uiaResultPoint_{};
+  POINT pendingUiaPoint_{};
+  uint64_t uiaRequestGeneration_ = 0;
+  uint64_t pendingUiaGeneration_ = 0;
+  bool uiaReady_ = false;
+  bool uiaRestartPending_ = false;
   struct PendingSnapshotSwitch {
     size_t index = 0;
     bool collapse = false;
@@ -276,7 +308,7 @@ class CaptureOverlay {
   };
   std::optional<PendingSnapshotSwitch> pendingSnapshotSwitch_;
   std::optional<CaptureCompletion> pendingCompletion_;
-  std::vector<size_t> hoverUnitChain_;
+  std::vector<RECT> hoverUnitRects_;
   size_t hoverUnitIndex_ = 0;
 
   struct ToolButton { Tool tool; };

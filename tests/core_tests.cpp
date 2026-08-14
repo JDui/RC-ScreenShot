@@ -3,6 +3,7 @@
 #include "editor.hpp"
 #include "exporter.hpp"
 #include "unit_detector.hpp"
+#include "uia_detector.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -517,6 +518,28 @@ void TestUnitDetectionRealSettingsUi() {
   CHECK(hasBounds(8, 347, 614, 427, 4));
 }
 
+void TestUiaCandidateNormalization() {
+  const RECT virtualBounds{-100, -50, 900, 650};
+  const POINT point{50, 50};
+  const std::array<RECT, 5> bounds{{
+      {-50, -20, 500, 400},
+      {20, 30, 120, 90},
+      {20, 30, 120, 90},
+      {400, 400, 500, 500},
+      {48, 48, 52, 52},
+  }};
+  const auto candidates = rc::UiaDetector::NormalizeCandidates(bounds, point, virtualBounds);
+  CHECK(candidates.size() == 2);
+  if (candidates.size() != 2) return;
+  CHECK(candidates[0].bounds.left == 120);
+  CHECK(candidates[0].bounds.top == 80);
+  CHECK(candidates[0].bounds.right == 220);
+  CHECK(candidates[0].bounds.bottom == 140);
+  CHECK(candidates[0].parent == 1);
+  CHECK(candidates[1].bounds.left == 50);
+  CHECK(candidates[1].bounds.top == 30);
+}
+
 void TestCoordinatesAndHdrIntersection() {
   rc::DesktopSnapshot snapshot;
   snapshot.virtualBounds = {-100, -50, 100, 50};
@@ -621,6 +644,7 @@ int wmain() {
   TestUnitDetectionRoundedRectangles();
   TestUnitDetectionColorAndHighResolution();
   TestUnitDetectionRealSettingsUi();
+  TestUiaCandidateNormalization();
   TestCoordinatesAndHdrIntersection();
   TestFilenameAndHalfFloat();
   TestJpegColorLayout();

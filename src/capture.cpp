@@ -466,9 +466,9 @@ BOOL CALLBACK WindowEnumerator(HWND hwnd, LPARAM parameter) {
     if (!GetWindowRect(hwnd, &bounds)) return TRUE;
   }
   if (bounds.right - bounds.left < 32 || bounds.bottom - bounds.top < 32) return TRUE;
-  wchar_t title[512]{};
-  GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
-  windows->push_back({hwnd, bounds, title});
+  // Titles are not consumed by selection. Avoid a cross-process
+  // GetWindowTextW call, which can stall on an unresponsive application.
+  windows->push_back({hwnd, bounds, {}});
   return TRUE;
 }
 

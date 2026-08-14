@@ -5,8 +5,8 @@
 102 ICON "../assets/rc-screenshot.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,4,3,0
- PRODUCTVERSION 0,4,3,0
+ FILEVERSION 5,0,0,0
+ PRODUCTVERSION 5,0,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -22,11 +22,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "RC-ScreenShot\0"
       VALUE "FileDescription", "RC-ScreenShot\0"
-      VALUE "FileVersion", "0.4.3\0"
+      VALUE "FileVersion", "5.0\0"
       VALUE "InternalName", "RC-ScreenShot\0"
       VALUE "OriginalFilename", "RC-ScreenShot.exe\0"
       VALUE "ProductName", "RC-ScreenShot\0"
-      VALUE "ProductVersion", "0.4.3\0"
+      VALUE "ProductVersion", "5.0\0"
     END
   END
   BLOCK "VarFileInfo"

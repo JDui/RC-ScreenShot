@@ -19,11 +19,19 @@ constexpr UINT_PTR kSettingPreviewTimer = 2;
 constexpr UINT_PTR kSnapshotAnimationTimer = 3;
 constexpr UINT_PTR kSnapshotDockTimer = 4;
 constexpr UINT_PTR kSnapshotRestoreTimer = 5;
+constexpr UINT_PTR kUiaDebounceTimer = 6;
+constexpr UINT_PTR kUiaTimeoutTimer = 7;
+constexpr UINT_PTR kHoverAnimationTimer = 8;
 // Debounce for restoring the committed frame after hovering a thumbnail.
 // A quick pass across the gaps between thumbnails stays on the previewed
 // frame; only a genuine pause (or leaving the panel) snaps back.
 constexpr UINT kSnapshotRestoreDelayMs = 180;
+constexpr UINT kUiaDebounceDelayMs = 140;
+constexpr UINT kUiaQueryTimeoutMs = 240;
+constexpr float kHoverAnimationSeconds = 0.14f;
 constexpr UINT kUnitDetectionFinishedMessage = WM_APP + 0x431;
+constexpr UINT kWindowEnumerationFinishedMessage = WM_APP + 0x432;
+constexpr UINT kUiaQueryFinishedMessage = WM_APP + 0x433;
 constexpr int kSnapshotIconSize = 44;
 constexpr int kSnapshotThumbWidth = 92;
 constexpr int kSnapshotThumbHeight = 58;
@@ -442,8 +450,13 @@ CaptureOverlay::~CaptureOverlay() {
   KillTimer(hwnd_, kSnapshotDockTimer);
   KillTimer(hwnd_, kSnapshotRestoreTimer);
   KillTimer(hwnd_, kUnitTimer);
+  KillTimer(hwnd_, kUiaDebounceTimer);
+  KillTimer(hwnd_, kUiaTimeoutTimer);
+  KillTimer(hwnd_, kHoverAnimationTimer);
   KillTimer(hwnd_, kSettingPreviewTimer);
   if (unitThread_.joinable()) unitThread_.request_stop();
+  if (windowThread_.joinable()) windowThread_.request_stop();
+  StopUiaQuery();
   CancelTextInput();
   if (hwnd_) DestroyWindow(hwnd_);
   if (textEditBrush_) { DeleteObject(textEditBrush_); textEditBrush_ = nullptr; }
@@ -471,6 +484,7 @@ bool CaptureOverlay::Show(std::wstring& error) {
   ShowWindow(hwnd_, SW_SHOW);
   SetForegroundWindow(hwnd_);
   SetFocus(hwnd_);
+  BeginWindowEnumeration();
   BeginUnitDetection();
   return true;
 }
@@ -513,7 +527,17 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       return 0;
     case WM_DISPLAYCHANGE: Cancel(); return 0;
     case WM_TIMER:
-      if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
+      if (wParam == kUiaDebounceTimer) BeginUiaQuery();
+      else if (wParam == kUiaTimeoutTimer) {
+        KillTimer(hwnd_, kUiaTimeoutTimer);
+        if (uiaQueryRunning_.load(std::memory_order_acquire) && uiaThread_.joinable()) {
+          uiaThread_.request_stop();
+          const DWORD threadId = GetThreadId(uiaThread_.native_handle());
+          if (threadId) CoCancelCall(threadId, 0);
+        }
+      }
+      else if (wParam == kHoverAnimationTimer) AdvanceHoverAnimation();
+      else if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
       else if (wParam == kSnapshotRestoreTimer) {
         KillTimer(hwnd_, kSnapshotRestoreTimer);
@@ -553,6 +577,12 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       return 0;
     case kUnitDetectionFinishedMessage:
       FinishUnitDetectionMessage();
+      return 0;
+    case kWindowEnumerationFinishedMessage:
+      FinishWindowEnumerationMessage();
+      return 0;
+    case kUiaQueryFinishedMessage:
+      FinishUiaQueryMessage();
       return 0;
     case WM_MOUSEMOVE: {
       POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -763,18 +793,17 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       }
       return 0;
     case WM_MOUSEWHEEL:
-      if (!editing_ && mode_ == SelectionMode::Unit && !hoverUnitChain_.empty()) {
-        if (GET_WHEEL_DELTA_WPARAM(wParam) > 0) hoverUnitIndex_ = std::min(hoverUnitIndex_ + 1, hoverUnitChain_.size() - 1);
+      if (!editing_ && mode_ == SelectionMode::Unit && !hoverUnitRects_.empty()) {
+        if (GET_WHEEL_DELTA_WPARAM(wParam) > 0) hoverUnitIndex_ = std::min(hoverUnitIndex_ + 1, hoverUnitRects_.size() - 1);
         else if (hoverUnitIndex_) --hoverUnitIndex_;
-        std::scoped_lock lock(unitMutex_);
-        hoverRect_ = unitCandidates_[hoverUnitChain_[hoverUnitIndex_]].bounds;
+        SetHoverTarget(hoverUnitRects_[hoverUnitIndex_]);
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
       return 0;
     case WM_KEYDOWN: {
       const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-      if (wParam == VK_ESCAPE) { Cancel(); return 0; }
+      if (wParam == VK_ESCAPE) { HandleEscape(); return 0; }
       if (wParam == VK_SPACE && !editing_) { CycleMode(); return 0; }
       if (control && wParam == 'Z') {
         document_.Undo();
@@ -1050,7 +1079,13 @@ void CaptureOverlay::Paint() {
   std::wstring status = std::wstring(L"空格切换  ·  ") + modeName;
   const bool waitingForUnits = mode_ == SelectionMode::Unit && !unitReady_;
   if (waitingForUnits) status += L"（正在分析区域…）";
-  const RECT statusRect{12, 10, waitingForUnits ? 394L : 270L, 50};
+  if (mode_ == SelectionMode::Unit && !editing_ && !hoverUnitRects_.empty())
+    status += L"  \u00b7  \u5c42\u7ea7 " + std::to_wstring(hoverUnitIndex_ + 1) + L"/" +
+              std::to_wstring(hoverUnitRects_.size()) + L"  \u6eda\u8f6e\u8c03\u8282";
+  const RECT statusRect{12, 10,
+                        mode_ == SelectionMode::Unit && !hoverUnitRects_.empty()
+                            ? 470L : waitingForUnits ? 394L : 270L,
+                        50};
   ComPtr<ID2D1SolidColorBrush> statusShadow, statusBackground, statusBorder;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.5f), &statusShadow);
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.025f, 0.055f, 0.09f, 0.92f), &statusBackground);
@@ -1319,11 +1354,11 @@ std::optional<size_t> CaptureOverlay::HitSnapshotThumbnail(POINT point) const {
 
 void CaptureOverlay::StopUnitDetection() {
   KillTimer(hwnd_, kUnitTimer);
+  StopUiaQuery();
   if (unitThread_.joinable()) {
     unitThread_.request_stop();
-    // A detector may currently be inside EnumWindows/GetWindowTextW.  Never
-    // synchronously join that worker from an input message; its completion
-    // message performs the join once the worker has naturally returned.
+    // Detection is cancellable at scan boundaries. Its completion message
+    // performs the join so input messages never wait for a full image pass.
     if (unitDetectionFinished_.load(std::memory_order_acquire)) {
       unitThread_.join();
       unitDetectionRunning_.store(false, std::memory_order_release);
@@ -1334,10 +1369,19 @@ void CaptureOverlay::StopUnitDetection() {
 void CaptureOverlay::ResetUnitDetection() {
   unitReady_ = false;
   std::scoped_lock lock(unitMutex_);
-  windowCandidates_.clear();
   unitCandidates_.clear();
-  hoverUnitChain_.clear();
+  uiaCandidates_.clear();
+  pendingUiaCandidates_.clear();
+  requestedUiaPoint_.reset();
+  ++uiaRequestGeneration_;
+  uiaReady_ = false;
+  uiaRestartPending_ = false;
+  hoverUnitRects_.clear();
   hoverUnitIndex_ = 0;
+  hoverRect_ = {};
+  hoverTargetRect_ = {};
+  hoverAnimating_ = false;
+  KillTimer(hwnd_, kHoverAnimationTimer);
 }
 
 void CaptureOverlay::SuppressUnitDetection() {
@@ -1353,8 +1397,8 @@ void CaptureOverlay::SuppressUnitDetection() {
 }
 
 void CaptureOverlay::FinishUnitDetectionMessage() {
-  // The worker marks itself finished before posting this message.  Joining is
-  // therefore bounded and cannot block on a hung window enumeration.
+  // The worker marks itself finished before posting this message, so joining
+  // here is bounded.
   if (unitThread_.joinable() && unitDetectionFinished_.load(std::memory_order_acquire)) {
     unitThread_.join();
     unitDetectionRunning_.store(false, std::memory_order_release);
@@ -1367,6 +1411,11 @@ void CaptureOverlay::FinishUnitDetectionMessage() {
     const PendingSnapshotSwitch request = *pendingSnapshotSwitch_;
     pendingSnapshotSwitch_.reset();
     SetActiveSnapshot(request.index, request.collapse, request.refreshDetection);
+  }
+  if (restartUnitDetectionPending_ && !pendingCompletion_ && !editing_ &&
+      !unitDetectionSuppressed_) {
+    restartUnitDetectionPending_ = false;
+    BeginUnitDetection();
   }
   if (pendingCompletion_) {
     const CaptureCompletion completion = *pendingCompletion_;
@@ -1694,9 +1743,44 @@ void CaptureOverlay::DrawSettingPreview() {
   }
 }
 
+void CaptureOverlay::BeginWindowEnumeration() {
+  if (!hwnd_ || windowThread_.joinable()) return;
+  windowEnumerationFinished_.store(false, std::memory_order_release);
+  windowReady_.store(false, std::memory_order_release);
+  const HWND detectionWindow = hwnd_;
+  const RECT virtualBounds = snapshot_.virtualBounds;
+  windowThread_ = std::jthread([this, detectionWindow, virtualBounds](std::stop_token token) {
+    DesktopSnapshot windowSnapshot;
+    windowSnapshot.virtualBounds = virtualBounds;
+    if (!token.stop_requested()) EnumerateWindows(windowSnapshot);
+    if (!token.stop_requested()) {
+      std::scoped_lock lock(unitMutex_);
+      windowCandidates_ = std::move(windowSnapshot.windows);
+      windowReady_.store(true, std::memory_order_release);
+    }
+    windowEnumerationFinished_.store(true, std::memory_order_release);
+    if (detectionWindow) PostMessageW(detectionWindow, kWindowEnumerationFinishedMessage, 0, 0);
+  });
+}
+
+void CaptureOverlay::FinishWindowEnumerationMessage() {
+  if (windowThread_.joinable() &&
+      windowEnumerationFinished_.load(std::memory_order_acquire)) windowThread_.join();
+  if (mode_ == SelectionMode::Unit && !editing_) {
+    if (requestedUiaPoint_) BeginUiaQuery();
+    UpdateHover(currentPoint_);
+  }
+  if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void CaptureOverlay::BeginUnitDetection() {
   if (unitDetectionSuppressed_ || editing_ || !hwnd_) return;
-  if (unitDetectionRunning_.load(std::memory_order_acquire)) return;
+  if (unitDetectionRunning_.load(std::memory_order_acquire)) {
+    restartUnitDetectionPending_ = true;
+    if (unitThread_.joinable()) unitThread_.request_stop();
+    return;
+  }
+  restartUnitDetectionPending_ = false;
   StopUnitDetection();
   ResetUnitDetection();
   unitDetectionFinished_.store(false, std::memory_order_release);
@@ -1704,19 +1788,13 @@ void CaptureOverlay::BeginUnitDetection() {
   SetTimer(hwnd_, kUnitTimer, 50, nullptr);
   const HWND detectionWindow = hwnd_;
   unitThread_ = std::jthread([this, detectionWindow](std::stop_token token) {
-    // Window candidates are only consumed in Window mode, so enumerate them off the capture
-    // path. GetWindowTextW crosses process boundaries and can block on hung windows; running
-    // it here keeps the hotkey-to-overlay path free of that variable latency.
-    DesktopSnapshot windowSnapshot;
-    windowSnapshot.virtualBounds = snapshot_.virtualBounds;
-    if (!token.stop_requested()) EnumerateWindows(windowSnapshot);
     UnitDetector detector;
     auto candidates = token.stop_requested()
         ? std::vector<UnitCandidate>{}
-        : detector.Detect(snapshot_.bgra, snapshot_.width, snapshot_.height, snapshot_.bgraStride);
+        : detector.Detect(snapshot_.bgra, snapshot_.width, snapshot_.height,
+                          snapshot_.bgraStride, token);
     if (!token.stop_requested()) {
       std::scoped_lock lock(unitMutex_);
-      windowCandidates_ = std::move(windowSnapshot.windows);
       unitCandidates_ = std::move(candidates);
       unitReady_.store(true, std::memory_order_release);
     }
@@ -1725,35 +1803,245 @@ void CaptureOverlay::BeginUnitDetection() {
   });
 }
 
+void CaptureOverlay::StopUiaQuery() {
+  KillTimer(hwnd_, kUiaDebounceTimer);
+  KillTimer(hwnd_, kUiaTimeoutTimer);
+  ++uiaRequestGeneration_;
+  requestedUiaPoint_.reset();
+  uiaReady_ = false;
+  uiaRestartPending_ = false;
+  if (uiaThread_.joinable()) {
+    uiaThread_.request_stop();
+    if (uiaQueryRunning_.load(std::memory_order_acquire)) {
+      const DWORD threadId = GetThreadId(uiaThread_.native_handle());
+      if (threadId) CoCancelCall(threadId, 0);
+    }
+  }
+}
+
+void CaptureOverlay::ScheduleUiaQuery(POINT point) {
+  if (unitDetectionSuppressed_ || editing_ || selecting_ ||
+      mode_ != SelectionMode::Unit || !hwnd_) return;
+  if (requestedUiaPoint_ && std::abs(requestedUiaPoint_->x - point.x) <= 2 &&
+      std::abs(requestedUiaPoint_->y - point.y) <= 2) return;
+  {
+    // Reuse the completed semantic branch while the pointer remains inside its
+    // deepest element. This prevents visual fallback from replacing UIA on
+    // every tiny mouse movement.
+    std::scoped_lock lock(unitMutex_);
+    if (uiaReady_ && uiaCandidates_.size() > 1 && Contains(uiaCandidates_.front().bounds, point))
+      return;
+  }
+  requestedUiaPoint_ = point;
+  ++uiaRequestGeneration_;
+  SetTimer(hwnd_, kUiaDebounceTimer, kUiaDebounceDelayMs, nullptr);
+}
+
+void CaptureOverlay::BeginUiaQuery() {
+  KillTimer(hwnd_, kUiaDebounceTimer);
+  if (!requestedUiaPoint_ || mode_ != SelectionMode::Unit || editing_ ||
+      unitDetectionSuppressed_) return;
+  if (uiaQueryRunning_.load(std::memory_order_acquire)) {
+    if (uiaThread_.joinable()) uiaThread_.request_stop();
+    uiaRestartPending_ = true;
+    return;
+  }
+  if (!windowReady_.load(std::memory_order_acquire)) return;
+  if (uiaThread_.joinable()) uiaThread_.join();
+
+  const POINT localPoint = *requestedUiaPoint_;
+  const POINT screenPoint{localPoint.x + snapshot_.virtualBounds.left,
+                          localPoint.y + snapshot_.virtualBounds.top};
+  HWND rootWindow = nullptr;
+  {
+    std::scoped_lock lock(unitMutex_);
+    for (const WindowCandidate& window : windowCandidates_) {
+      if (Contains(window.bounds, screenPoint)) {
+        rootWindow = window.hwnd;
+        break;
+      }
+    }
+    if (!rootWindow) {
+      uiaCandidates_.clear();
+      uiaResultPoint_ = localPoint;
+      uiaReady_ = true;
+    }
+  }
+  if (!rootWindow) {
+    UpdateHover(localPoint);
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+
+  const HWND detectionWindow = hwnd_;
+  const RECT virtualBounds = snapshot_.virtualBounds;
+  const uint64_t generation = uiaRequestGeneration_;
+  uiaQueryFinished_.store(false, std::memory_order_release);
+  uiaQueryRunning_.store(true, std::memory_order_release);
+  SetTimer(hwnd_, kUiaTimeoutTimer, kUiaQueryTimeoutMs, nullptr);
+  uiaThread_ = std::jthread(
+      [this, detectionWindow, rootWindow, screenPoint, localPoint, virtualBounds,
+       generation](std::stop_token token) {
+        UiaDetector detector;
+        auto candidates = detector.Detect(rootWindow, screenPoint, virtualBounds, token);
+        if (!token.stop_requested()) {
+          std::scoped_lock lock(unitMutex_);
+          pendingUiaCandidates_ = std::move(candidates);
+          pendingUiaPoint_ = localPoint;
+          pendingUiaGeneration_ = generation;
+        }
+        uiaQueryFinished_.store(true, std::memory_order_release);
+        if (detectionWindow) PostMessageW(detectionWindow, kUiaQueryFinishedMessage, 0, 0);
+      });
+}
+
+void CaptureOverlay::FinishUiaQueryMessage() {
+  KillTimer(hwnd_, kUiaTimeoutTimer);
+  if (uiaThread_.joinable() && uiaQueryFinished_.load(std::memory_order_acquire))
+    uiaThread_.join();
+  uiaQueryRunning_.store(false, std::memory_order_release);
+  {
+    std::scoped_lock lock(unitMutex_);
+    if (pendingUiaGeneration_ == uiaRequestGeneration_ && requestedUiaPoint_ &&
+        pendingUiaPoint_.x == requestedUiaPoint_->x &&
+        pendingUiaPoint_.y == requestedUiaPoint_->y) {
+      uiaCandidates_ = std::move(pendingUiaCandidates_);
+      uiaResultPoint_ = pendingUiaPoint_;
+      uiaReady_ = true;
+    }
+    pendingUiaCandidates_.clear();
+  }
+  const bool restart = std::exchange(uiaRestartPending_, false);
+  if (restart && mode_ == SelectionMode::Unit && !editing_ && !unitDetectionSuppressed_)
+    BeginUiaQuery();
+  UpdateHover(currentPoint_);
+  if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::SetHoverTarget(RECT target, bool immediate) {
+  const auto same = [](const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top &&
+           a.right == b.right && a.bottom == b.bottom;
+  };
+  if (same(target, hoverTargetRect_) && !immediate) return;
+  hoverTargetRect_ = target;
+  if (!HasArea(target)) {
+    hoverRect_ = {};
+    hoverAnimating_ = false;
+    KillTimer(hwnd_, kHoverAnimationTimer);
+    return;
+  }
+  if (immediate || !hwnd_) {
+    hoverRect_ = target;
+    hoverAnimating_ = false;
+    KillTimer(hwnd_, kHoverAnimationTimer);
+    return;
+  }
+  hoverAnimationFromRect_ = hoverRect_;
+  if (!HasArea(hoverAnimationFromRect_)) {
+    hoverAnimationFromRect_ = target;
+    const LONG insetX = std::min(12L, std::max(1L, (target.right - target.left) / 10));
+    const LONG insetY = std::min(12L, std::max(1L, (target.bottom - target.top) / 10));
+    InflateRect(&hoverAnimationFromRect_, -insetX, -insetY);
+    if (!HasArea(hoverAnimationFromRect_)) hoverAnimationFromRect_ = target;
+  }
+  hoverRect_ = hoverAnimationFromRect_;
+  hoverAnimationStart_ = std::chrono::steady_clock::now();
+  hoverAnimating_ = true;
+  SetTimer(hwnd_, kHoverAnimationTimer, 16, nullptr);
+}
+
+void CaptureOverlay::AdvanceHoverAnimation() {
+  if (!hoverAnimating_) {
+    KillTimer(hwnd_, kHoverAnimationTimer);
+    return;
+  }
+  const float elapsed = std::chrono::duration<float>(
+      std::chrono::steady_clock::now() - hoverAnimationStart_).count();
+  const float t = std::clamp(elapsed / kHoverAnimationSeconds, 0.0f, 1.0f);
+  const float eased = 1.0f - std::pow(1.0f - t, 3.0f);
+  const auto interpolate = [&](LONG from, LONG to) {
+    return static_cast<LONG>(std::lround(from + (to - from) * eased));
+  };
+  hoverRect_ = {interpolate(hoverAnimationFromRect_.left, hoverTargetRect_.left),
+                interpolate(hoverAnimationFromRect_.top, hoverTargetRect_.top),
+                interpolate(hoverAnimationFromRect_.right, hoverTargetRect_.right),
+                interpolate(hoverAnimationFromRect_.bottom, hoverTargetRect_.bottom)};
+  if (t >= 1.0f) {
+    hoverRect_ = hoverTargetRect_;
+    hoverAnimating_ = false;
+    KillTimer(hwnd_, kHoverAnimationTimer);
+  }
+  if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void CaptureOverlay::UpdateHover(POINT point) {
   if (editing_ || selecting_) return;
-  hoverRect_ = {};
+  RECT target{};
   if (mode_ == SelectionMode::Window) {
     std::scoped_lock lock(unitMutex_);
     for (const auto& window : windowCandidates_) {
       RECT local = ToLocal(window.bounds, snapshot_.virtualBounds);
-      if (Contains(local, point)) { hoverRect_ = local; break; }
+      if (Contains(local, point)) { target = local; break; }
     }
-  } else if (mode_ == SelectionMode::Unit && unitReady_) {
+  } else if (mode_ == SelectionMode::Unit) {
+    ScheduleUiaQuery(point);
     UnitDetector detector;
-    std::scoped_lock lock(unitMutex_);
-    hoverUnitChain_ = detector.CandidatesAt(unitCandidates_, point);
-    hoverUnitIndex_ = std::min(hoverUnitIndex_, hoverUnitChain_.empty() ? size_t{0} : hoverUnitChain_.size() - 1);
-    if (!hoverUnitChain_.empty()) hoverRect_ = unitCandidates_[hoverUnitChain_[hoverUnitIndex_]].bounds;
+    {
+      std::scoped_lock lock(unitMutex_);
+      hoverUnitRects_.clear();
+      const auto appendAtPoint = [&](const std::vector<UnitCandidate>& source,
+                                     std::span<const size_t> indices) {
+        for (size_t index : indices) {
+          const RECT bounds = source[index].bounds;
+          const bool duplicate = std::any_of(
+              hoverUnitRects_.begin(), hoverUnitRects_.end(), [&](const RECT& existing) {
+                return std::abs(existing.left - bounds.left) <= 3 &&
+                       std::abs(existing.top - bounds.top) <= 3 &&
+                       std::abs(existing.right - bounds.right) <= 3 &&
+                       std::abs(existing.bottom - bounds.bottom) <= 3;
+              });
+          if (!duplicate) hoverUnitRects_.push_back(bounds);
+        }
+      };
+      std::vector<size_t> uiaAtPoint;
+      std::vector<size_t> visualAtPoint;
+      if (uiaReady_) uiaAtPoint = detector.CandidatesAt(uiaCandidates_, point);
+      if (unitReady_.load(std::memory_order_acquire))
+        visualAtPoint = detector.CandidatesAt(unitCandidates_, point);
+      // A lone UIA root is only a window-sized fallback. Prefer the visual unit
+      // in that case; otherwise semantic UIA descendants lead the chain.
+      if (uiaAtPoint.size() > 1) {
+        appendAtPoint(uiaCandidates_, uiaAtPoint);
+        appendAtPoint(unitCandidates_, visualAtPoint);
+      } else {
+        appendAtPoint(unitCandidates_, visualAtPoint);
+        appendAtPoint(uiaCandidates_, uiaAtPoint);
+      }
+      hoverUnitIndex_ = std::min(
+          hoverUnitIndex_, hoverUnitRects_.empty() ? size_t{0} : hoverUnitRects_.size() - 1);
+      if (!hoverUnitRects_.empty()) target = hoverUnitRects_[hoverUnitIndex_];
+    }
   }
+  SetHoverTarget(target);
 }
 
 void CaptureOverlay::CycleMode() {
   mode_ = mode_ == SelectionMode::Normal ? SelectionMode::Window
          : mode_ == SelectionMode::Window ? SelectionMode::Unit : SelectionMode::Normal;
-  hoverRect_ = {}; hoverUnitChain_.clear(); hoverUnitIndex_ = 0;
+  if (mode_ != SelectionMode::Unit) StopUiaQuery();
+  hoverRect_ = {}; hoverTargetRect_ = {}; hoverAnimating_ = false;
+  KillTimer(hwnd_, kHoverAnimationTimer);
+  hoverUnitRects_.clear(); hoverUnitIndex_ = 0;
   UpdateHover(currentPoint_); InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void CaptureOverlay::BeginSelection(POINT point) {
   windowSelection_ = false;
-  if ((mode_ == SelectionMode::Window || mode_ == SelectionMode::Unit) && HasArea(hoverRect_)) {
-    selection_ = hoverRect_;
+  if ((mode_ == SelectionMode::Window || mode_ == SelectionMode::Unit) &&
+      HasArea(hoverTargetRect_)) {
+    selection_ = hoverTargetRect_;
+    SetHoverTarget(hoverTargetRect_, true);
     windowSelection_ = mode_ == SelectionMode::Window;
     editing_ = true;
     SuppressUnitDetection();
@@ -1925,6 +2213,102 @@ void CaptureOverlay::SelectTool(Tool tool) {
   }
   commandAdjustment_ = SelectionAdjustment::None;
   commandBeforeAdjust_.reset();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::HandleEscape() {
+  if (textEdit_) {
+    CancelTextInput();
+    return;
+  }
+  if (toolbarDragging_ || sizeSliderDragging_ || propertySliderDragging_) {
+    if (toolbarDragging_) toolbarPosition_ = toolbarPositionStart_;
+    toolbarDragging_ = false;
+    sizeSliderDragging_ = false;
+    propertySliderDragging_.reset();
+    EndSettingPreview();
+    if (GetCapture() == hwnd_) ReleaseCapture();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (drawing_) {
+    if (commandAdjustment_ != SelectionAdjustment::None && selectedCommand_ &&
+        commandBeforeAdjust_) document_.Replace(*selectedCommand_, *commandBeforeAdjust_);
+    if (selectionAdjustment_ != SelectionAdjustment::None) selection_ = selectionBeforeAdjust_;
+    drawing_ = false;
+    previewCommand_.reset();
+    commandAdjustment_ = SelectionAdjustment::None;
+    commandBeforeAdjust_.reset();
+    selectionAdjustment_ = SelectionAdjustment::None;
+    if (GetCapture() == hwnd_) ReleaseCapture();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (selecting_) {
+    selecting_ = false;
+    selection_ = {};
+    if (GetCapture() == hwnd_) ReleaseCapture();
+    UpdateHover(currentPoint_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (settingPreview_) {
+    EndSettingPreview();
+    return;
+  }
+  if (snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.01f) {
+    RestoreHoverSnapshot(false);
+    snapshotsAnimationFromProgress_ = std::clamp(snapshotsAnimationProgress_, 0.0f, 1.0f);
+    snapshotsExpanded_ = false;
+    snapshotsAnimating_ = true;
+    snapshotsAnimationStart_ = std::chrono::steady_clock::now();
+    SetTimer(hwnd_, kSnapshotAnimationTimer, 16, nullptr);
+    return;
+  }
+  if (selectedCommand_) {
+    selectedCommand_.reset();
+    commandAdjustment_ = SelectionAdjustment::None;
+    commandBeforeAdjust_.reset();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (editing_) {
+    ReturnToSelection();
+    return;
+  }
+  Cancel();
+}
+
+void CaptureOverlay::ReturnToSelection() {
+  EndSettingPreview();
+  CancelTextInput();
+  if (GetCapture() == hwnd_) ReleaseCapture();
+  drawing_ = false;
+  selecting_ = false;
+  toolbarDragging_ = false;
+  sizeSliderDragging_ = false;
+  propertySliderDragging_.reset();
+  previewCommand_.reset();
+  selectedCommand_.reset();
+  textEditingCommand_.reset();
+  commandAdjustment_ = SelectionAdjustment::None;
+  commandBeforeAdjust_.reset();
+  selectionAdjustment_ = SelectionAdjustment::None;
+  document_.Clear();
+  mosaicPreviewBitmap_.Reset();
+  mosaicPreviewSignature_ = 0;
+  editing_ = false;
+  windowSelection_ = false;
+  selection_ = {};
+
+  KillTimer(hwnd_, kSnapshotDockTimer);
+  snapshotDockAnimating_ = false;
+  snapshotDocked_ = false;
+  snapshotDockProgress_ = 0.0f;
+  unitDetectionSuppressed_ = false;
+  SetHoverTarget({}, true);
+  BeginUnitDetection();
+  UpdateHover(currentPoint_);
   InvalidateRect(hwnd_, nullptr, FALSE);
 }
 

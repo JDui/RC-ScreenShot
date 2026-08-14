@@ -65,6 +65,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(40, 40));
   SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(520, 250));
   SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(520, 250));
+  if (!overlay.EditingForTest()) return 10;
+  SendMessageW(overlay.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+  if (overlay.EditingForTest()) return 11;
+  // ESC from edit mode returns to selection instead of closing the overlay.
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(40, 40));
+  SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(520, 250));
+  SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(520, 250));
+  if (!overlay.EditingForTest()) return 12;
   const RECT cornerIcon = overlay.SnapshotIconRectForTest();
   bool dockTimerSettled = false;
   for (int i = 0; i < 80; ++i) {

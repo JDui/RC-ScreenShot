@@ -14,7 +14,7 @@ class UnitDetector {
  public:
   // BGRA8 input. Coordinates in the returned candidates are in source-image pixels.
   std::vector<UnitCandidate> Detect(std::span<const uint8_t> bgra, int width, int height,
-                                    int stride) const;
+                                    int stride, std::stop_token stopToken = {}) const;
   std::vector<size_t> CandidatesAt(std::span<const UnitCandidate> candidates, POINT point) const;
 };
 

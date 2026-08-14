@@ -288,7 +288,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-      std::wstring text = L"RC-ScreenShot 0.4.3\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+      std::wstring text = L"RC-ScreenShot 5.0\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);

@@ -12,7 +12,8 @@ struct Downsampled {
   std::vector<uint8_t> bgr;
 };
 
-Downsampled MakeColor(std::span<const uint8_t> bgra, int width, int height, int stride) {
+Downsampled MakeColor(std::span<const uint8_t> bgra, int width, int height, int stride,
+                      std::stop_token stopToken) {
   Downsampled out;
   // Preserve native pixels on ordinary 4K captures. Sparse point sampling at
   // scale 2-3 used to skip one-pixel borders and entire compact controls.
@@ -21,6 +22,7 @@ Downsampled MakeColor(std::span<const uint8_t> bgra, int width, int height, int 
   out.height = (height + out.scale - 1) / out.scale;
   out.bgr.resize(static_cast<size_t>(out.width * out.height * 3));
   for (int y = 0; y < out.height; ++y) {
+    if (stopToken.stop_requested()) return {};
     for (int x = 0; x < out.width; ++x) {
       std::array<int, 3> sum{};
       int samples = 0;
@@ -153,15 +155,17 @@ BorderScore ScoreEllipse(const std::vector<uint8_t>& edges, int width, int heigh
 }  // namespace
 
 std::vector<UnitCandidate> UnitDetector::Detect(std::span<const uint8_t> bgra, int width, int height,
-                                                int stride) const {
+                                                int stride, std::stop_token stopToken) const {
   if (width < 24 || height < 24 || stride < width * 4 ||
-      bgra.size() < static_cast<size_t>(stride * height)) return {};
-  const Downsampled image = MakeColor(bgra, width, height, stride);
+      bgra.size() < static_cast<size_t>(stride * height) || stopToken.stop_requested()) return {};
+  const Downsampled image = MakeColor(bgra, width, height, stride, stopToken);
+  if (stopToken.stop_requested() || image.width <= 0 || image.height <= 0) return {};
   const int w = image.width, h = image.height;
   std::vector<uint8_t> vertical(static_cast<size_t>(w * h), 0);
   std::vector<uint8_t> horizontal(static_cast<size_t>(w * h), 0);
   std::vector<uint8_t> edges(static_cast<size_t>(w * h), 0);
   for (int y = 1; y < h - 1; ++y) {
+    if (stopToken.stop_requested()) return {};
     for (int x = 1; x < w - 1; ++x) {
       const auto at = [&](int px, int py, int channel) {
         return image.bgr[static_cast<size_t>((py * w + px) * 3 + channel)];
@@ -189,6 +193,7 @@ std::vector<UnitCandidate> UnitDetector::Detect(std::span<const uint8_t> bgra, i
 
   std::vector<int> xEnergy(static_cast<size_t>(w)), yEnergy(static_cast<size_t>(h));
   for (int y = 0; y < h; ++y) {
+    if (stopToken.stop_requested()) return {};
     for (int x = 0; x < w; ++x) {
       xEnergy[static_cast<size_t>(x)] += vertical[static_cast<size_t>(y * w + x)];
       yEnergy[static_cast<size_t>(y)] += horizontal[static_cast<size_t>(y * w + x)];
@@ -241,8 +246,10 @@ std::vector<UnitCandidate> UnitDetector::Detect(std::span<const uint8_t> bgra, i
   // to the same span silently discarded it.
   constexpr size_t maxLineSpan = 6;
   for (size_t spanY = 1; spanY <= maxLineSpan; ++spanY) {
+    if (stopToken.stop_requested()) return {};
     for (size_t spanX = 1; spanX <= maxLineSpan; ++spanX) {
       for (size_t yi = spanY; yi < ys.size(); ++yi) {
+        if (stopToken.stop_requested()) return {};
         for (size_t xi = spanX; xi < xs.size(); ++xi) {
           const int left = xs[xi - spanX], right = xs[xi];
           const int top = ys[yi - spanY], bottom = ys[yi];
@@ -263,6 +270,7 @@ std::vector<UnitCandidate> UnitDetector::Detect(std::span<const uint8_t> bgra, i
   std::vector<uint8_t> visited(edges.size(), 0);
   std::vector<int> queue;
   for (int startY = 1; startY < h - 1; ++startY) {
+    if (stopToken.stop_requested()) return {};
     for (int startX = 1; startX < w - 1; ++startX) {
       const int start = startY * w + startX;
       if (!edges[static_cast<size_t>(start)] || visited[static_cast<size_t>(start)]) continue;
@@ -271,6 +279,7 @@ std::vector<UnitCandidate> UnitDetector::Detect(std::span<const uint8_t> bgra, i
       visited[static_cast<size_t>(start)] = 1;
       int left = startX, right = startX, top = startY, bottom = startY;
       for (size_t head = 0; head < queue.size(); ++head) {
+        if ((head & 1023) == 0 && stopToken.stop_requested()) return {};
         const int current = queue[head];
         const int x = current % w, y = current / w;
         left = std::min(left, x); right = std::max(right, x);
