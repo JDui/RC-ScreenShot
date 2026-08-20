@@ -239,10 +239,11 @@ bool ImageExporter::Render(const DesktopSnapshot& snapshot, const RECT& selectio
   }
   const int sourceWidth = clipped.right - clipped.left;
   const int sourceHeight = clipped.bottom - clipped.top;
-  const int frame = config.frameEnabled ? std::clamp(static_cast<int>(std::lround(config.frame.width)), 1, 128) : 0;
-  const int shadow = addWindowShadow && config.windowShadow ? 18 : 0;
-  const int leftMargin = frame + shadow, topMargin = frame + shadow;
-  const int rightMargin = frame + shadow, bottomMargin = frame + shadow;
+  // “Frame” means the soft drop shadow around the captured content. Never
+  // render its configurable annotation color as a solid border.
+  const int shadow = (config.frameEnabled || (addWindowShadow && config.windowShadow)) ? 18 : 0;
+  const int leftMargin = shadow, topMargin = shadow;
+  const int rightMargin = shadow, bottomMargin = shadow;
   image.width = sourceWidth + leftMargin + rightMargin;
   image.height = sourceHeight + topMargin + bottomMargin;
   image.stride = image.width * 4;
@@ -323,13 +324,6 @@ bool ImageExporter::Render(const DesktopSnapshot& snapshot, const RECT& selectio
                       static_cast<float>(leftMargin + sourceWidth + i),
                       static_cast<float>(topMargin + sourceHeight + i)), 5.0f, 5.0f), brush.Get());
     }
-  }
-  if (frame) {
-    ComPtr<ID2D1SolidColorBrush> brush;
-    target->CreateSolidColorBrush(D2DColor(config.frame.color, config.frame.opacity), &brush);
-    target->FillRectangle(D2D1::RectF(static_cast<float>(shadow), static_cast<float>(shadow),
-                                      static_cast<float>(image.width - shadow),
-                                      static_cast<float>(image.height - shadow)), brush.Get());
   }
   target->DrawBitmap(d2dSource.Get(),
                      D2D1::RectF(static_cast<float>(leftMargin), static_cast<float>(topMargin),

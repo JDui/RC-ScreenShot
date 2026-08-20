@@ -214,6 +214,34 @@ void TestTextRendering() {
   CHECK(penPixels > 30);
 }
 
+void TestExportUsesFrameAsShadow() {
+  rc::DesktopSnapshot snapshot;
+  snapshot.virtualBounds = {0, 0, 32, 20};
+  snapshot.width = 32; snapshot.height = 20; snapshot.bgraStride = 32 * 4;
+  snapshot.bgra.resize(static_cast<size_t>(snapshot.bgraStride * snapshot.height));
+  for (size_t i = 0; i < snapshot.bgra.size(); i += 4) {
+    snapshot.bgra[i] = 12; snapshot.bgra[i + 1] = 34;
+    snapshot.bgra[i + 2] = 56; snapshot.bgra[i + 3] = 255;
+  }
+  rc::AppConfig config;
+  config.frameEnabled = true;
+  config.frame.width = 12.0f;
+  config.frame.color.rgba = 0xFF0000FF;
+  rc::RenderedImage image;
+  std::wstring error;
+  CHECK(rc::ImageExporter{}.Render(snapshot, snapshot.virtualBounds, rc::EditorDocument{},
+                                   config, false, image, error));
+  CHECK(image.width == snapshot.width + 36 && image.height == snapshot.height + 36);
+  const size_t sourceTopLeft = static_cast<size_t>(18 * image.stride + 18 * 4);
+  CHECK(image.bgra[sourceTopLeft] == 12 && image.bgra[sourceTopLeft + 1] == 34 &&
+        image.bgra[sourceTopLeft + 2] == 56);
+  size_t redPixels = 0;
+  for (size_t i = 0; i + 3 < image.bgra.size(); i += 4) {
+    if (image.bgra[i + 2] > 180 && image.bgra[i + 1] < 80 && image.bgra[i] < 80) ++redPixels;
+  }
+  CHECK(redPixels == 0);
+}
+
 void TestMosaic() {
   constexpr int width = 32, height = 32, stride = width * 4;
   std::vector<uint8_t> image(static_cast<size_t>(stride * height));
@@ -635,6 +663,7 @@ int wmain() {
   TestBlankCaptureGuard();
   TestPenPressureCurve();
   TestTextRendering();
+  TestExportUsesFrameAsShadow();
   TestMosaic();
   TestMosaicBlur();
   TestUnitDetection();

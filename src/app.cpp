@@ -288,7 +288,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-      std::wstring text = L"RC-ScreenShot 0.5\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+      std::wstring text = L"RC-ScreenShot 0.5.1\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);
@@ -585,7 +585,7 @@ void Application::ShowSettings() {
   label(L"编辑器", 328, 168, 90, 22, settingsSectionFont_);
   label(L"文字与截图层效果", 328, 192, 150, 14, settingsHintFont_);
   label(L"窗口截图阴影", 328, 239, 120, 14, settingsSmallFont_); toggle(544, 235, IDC_TOGGLE_SHADOW);
-  label(L"截图外框", 328, 280, 120, 14, settingsSmallFont_); toggle(544, 276, IDC_TOGGLE_FRAME);
+  label(L"截图外框阴影", 328, 280, 120, 14, settingsSmallFont_); toggle(544, 276, IDC_TOGGLE_FRAME);
   // Card 4 — 行为.  Three evenly distributed label + toggle groups.
   label(L"行为", 24, 322, 90, 22, settingsSectionFont_);
   label(L"复制后自动保存", 24, 351, 90, 14, settingsSmallFont_); toggle(122, 347, IDC_TOGGLE_AUTOSAVE);

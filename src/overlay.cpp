@@ -3293,7 +3293,7 @@ void CaptureOverlay::UpdateTooltip(POINT point) {
       case PropertyAction::MosaicStrength: tooltipText_ = L"马赛克强度"; break;
       case PropertyAction::TextOrientation: tooltipText_ = L"文字方向"; break;
       case PropertyAction::TextShadow: tooltipText_ = L"文字阴影开关"; break;
-      case PropertyAction::FrameToggle: tooltipText_ = L"截图外框开关"; break;
+      case PropertyAction::FrameToggle: tooltipText_ = L"截图外框阴影开关"; break;
       default: break;
     }
     tooltipVisible_ = !tooltipText_.empty();
