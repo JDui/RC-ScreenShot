@@ -830,6 +830,44 @@ bool DesktopCapture::CaptureGdi(DesktopSnapshot& snapshot, std::wstring& error) 
   return true;
 }
 
+bool CaptureScreenRegion(const RECT& virtualRect, DesktopSnapshot& snapshot, std::wstring& error) {
+  const int width = virtualRect.right - virtualRect.left;
+  const int height = virtualRect.bottom - virtualRect.top;
+  if (width <= 0 || height <= 0) { error = L"长截图区域无效。"; return false; }
+  HDC screen = GetDC(nullptr);
+  if (!screen) { error = L"GetDC 失败。"; return false; }
+  ScopeExit releaseScreen{[&] { ReleaseDC(nullptr, screen); }};
+  HDC memory = CreateCompatibleDC(screen);
+  if (!memory) { error = L"CreateCompatibleDC 失败。"; return false; }
+  ScopeExit deleteMemory{[&] { DeleteDC(memory); }};
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = width;
+  info.bmiHeader.biHeight = -height;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  void* bits = nullptr;
+  HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+  if (!bitmap || !bits) { error = L"CreateDIBSection 失败。"; return false; }
+  ScopeExit deleteBitmap{[&] { DeleteObject(bitmap); }};
+  HGDIOBJ old = SelectObject(memory, bitmap);
+  ScopeExit restore{[&] { SelectObject(memory, old); }};
+  if (!BitBlt(memory, 0, 0, width, height, screen, virtualRect.left, virtualRect.top, SRCCOPY | CAPTUREBLT) &&
+      !BitBlt(memory, 0, 0, width, height, screen, virtualRect.left, virtualRect.top, SRCCOPY)) {
+    error = L"BitBlt 失败：" + HResultMessage(HRESULT_FROM_WIN32(GetLastError())); return false;
+  }
+  snapshot.virtualBounds = virtualRect;
+  snapshot.width = width; snapshot.height = height; snapshot.bgraStride = width * 4;
+  snapshot.bgra.assign(static_cast<uint8_t*>(bits), static_cast<uint8_t*>(bits) +
+                       static_cast<size_t>(snapshot.bgraStride * height));
+  for (int py = 0; py < height; ++py) {
+    uint8_t* row = snapshot.bgra.data() + static_cast<size_t>(py * snapshot.bgraStride);
+    for (int px = 0; px < width; ++px) row[px * 4 + 3] = 255;
+  }
+  return true;
+}
+
 void EnumerateWindows(DesktopSnapshot& snapshot) {
   snapshot.windows.clear();
   EnumWindows(WindowEnumerator, reinterpret_cast<LPARAM>(&snapshot.windows));

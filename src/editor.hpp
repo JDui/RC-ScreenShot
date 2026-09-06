@@ -78,6 +78,10 @@ class EditorDocument {
   std::span<const EditCommand> Commands() const { return {commands_.data(), cursor_}; }
   EditCommand* At(size_t index);
   const EditCommand* At(size_t index) const;
+  // Shifts every visible command by (dx, dy).  Used when a long capture is
+  // cropped: annotations recorded in the old image coordinates must follow
+  // the surviving pixels into the new origin.
+  void Translate(float dx, float dy);
 
  private:
   std::vector<EditCommand> commands_;

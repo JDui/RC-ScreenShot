@@ -76,6 +76,11 @@ struct AppConfig {
   float mosaicBlurRadius = 6.0f;
 
   bool windowShadow = true;
+  // Relative scroll-capture step interval.  1.0 is the historical default;
+  // 0.5 is half as fast (longer wait between capture+stitch steps), which is
+  // the recommended starting point because gentler pacing lines up better
+  // with smooth-scroll animations and avoids "overshoot" on long pages.
+  float scrollSpeed = 0.5f;
   std::wstring language = L"zh-CN";
   std::wstring theme = L"dark";
   std::wstring toolbarPosition = L"auto";

@@ -352,6 +352,9 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
   if (const Json* window = root->Find("windowCapture")) {
     config.windowShadow = ReadBool(window, "shadow", config.windowShadow);
   }
+  if (const Json* scroll = root->Find("scroll")) {
+    config.scrollSpeed = ReadFloat(scroll, "speed", config.scrollSpeed, 0.1f, 4.0f);
+  }
   if (const Json* ui = root->Find("ui")) {
     config.language = ReadWide(ui, "language", config.language);
     config.theme = ReadWide(ui, "theme", config.theme);
@@ -411,6 +414,7 @@ bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
          << ", \"pixelSize\": " << config.mosaicPixelSize
          << ", \"blurRadius\": " << config.mosaicBlurRadius << "}\n  },\n"
          << "  \"windowCapture\": {\"shadow\": " << (config.windowShadow ? "true" : "false") << "},\n"
+         << "  \"scroll\": {\"speed\": " << std::clamp(config.scrollSpeed, 0.1f, 4.0f) << "},\n"
          << "  \"ui\": {\"language\": \"" << Escape(ToUtf8(config.language))
          << "\", \"theme\": \"" << Escape(ToUtf8(config.theme))
          << "\", \"toolbarPosition\": \"" << Escape(ToUtf8(config.toolbarPosition)) << "\"}\n}\n";

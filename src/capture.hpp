@@ -48,6 +48,11 @@ class DesktopCapture {
 // ignored because desktop duplication leaves it undefined on SDR outputs.
 bool SnapshotIsBlank(const DesktopSnapshot& snapshot);
 
+// GDI capture of an arbitrary virtual-desktop rectangle, used by the scrolling
+// long-screenshot engine to grab frames while the overlay is shrunk to its
+// preview strip.  Always produces SDR BGRA pixels.
+bool CaptureScreenRegion(const RECT& virtualRect, DesktopSnapshot& snapshot, std::wstring& error);
+
 // Fills snapshot.windows with candidate windows that overlap the virtual desktop. Only needed
 // for Window mode, so callers run it off the capture path (e.g. the overlay background thread).
 void EnumerateWindows(DesktopSnapshot& snapshot);

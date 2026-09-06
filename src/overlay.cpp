@@ -1,14 +1,18 @@
 #include "overlay.hpp"
 
 #include "arrow.hpp"
+#include "stitch.hpp"
 
 #include <commdlg.h>
 #include <commctrl.h>
 #include <imm.h>
 #include <windowsx.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <limits>
+#include <string_view>
 
 namespace rc {
 namespace {
@@ -22,6 +26,70 @@ constexpr UINT_PTR kSnapshotRestoreTimer = 5;
 constexpr UINT_PTR kUiaDebounceTimer = 6;
 constexpr UINT_PTR kUiaTimeoutTimer = 7;
 constexpr UINT_PTR kHoverAnimationTimer = 8;
+constexpr UINT_PTR kScrollTimer = 9;
+constexpr UINT_PTR kLongPreviewTimer = 10;
+// Long-capture cadence: a 30 ms scheduler tick dispatches a capture+stitch
+// step every kScrollStepMs, then wheels one notch so the page keeps moving.
+constexpr UINT kScrollTickMs = 30;
+constexpr UINT kScrollStepMs = 120;
+constexpr int kScrollMinFrameWidth = 64;
+constexpr int kScrollMinFrameHeight = 120;
+// Settle probe: a frame grabbed while the page is still animating is a blend
+// of two scroll positions and stitches into a ghost, so the region is re-read
+// once after a short pause and the step is skipped while it keeps changing.
+constexpr UINT kScrollSettleDelayMs = 20;
+constexpr int kScrollMaxSettleWaits = 2;
+// The first step after start is always "unaligned" (the page has not moved
+// yet) and smooth-scroll animations take a few hundred ms, so allow several
+// unanswered wheels before declaring the page bottom reached.
+constexpr int kScrollMaxStuckSteps = 6;
+constexpr int kScrollMaxRows = 30000;
+constexpr size_t kScrollMaxBytes = 192ull * 1024 * 1024;
+// Vertical captures keep a rolling 2048-row window in the preview texture
+// (tail for downward, head for upward) so captures may grow past the GPU's
+// maximum bitmap size; rightward captures mirror the whole (capped) width.
+constexpr int kScrollPreviewRows = 2048;
+// Preview float window (post-capture) layout constants.
+constexpr UINT kLongPreviewAnimMs = 260;        // entrance/transition duration
+constexpr UINT kLongPreviewStageMs = 220;       // View/Crop/Annotate switch duration
+constexpr int kLongPreviewToolSize = 36;        // icon-only buttons on the long bar
+constexpr int kLongPreviewToolGap = 5;
+// Backdrop dim behind the review float window.  The top/bottom edge feather
+// fades to exactly this alpha so the image melts into the backdrop instead of
+// ending on a hard border, so the two must stay in lockstep.
+constexpr float kLongPreviewDimAlpha = 0.72f;
+// Share of the screen height (the active monitor, not the image) taken by the
+// feather at its top and bottom edge.
+constexpr float kLongPreviewFeather = 0.01f;
+// Post-capture review shows the stitched image at 100% (1 image pixel = 1 px)
+// with a minimap on the right marking the visible window; drag to navigate.
+constexpr float kLongPreviewWheelStep = 0.16f;  // viewport height scrolled per wheel notch
+constexpr int kLongPreviewThumbMaxWidth = 140;  // minimap width
+constexpr int kLongPreviewThumbMargin = 18;     // gap to the viewport edge
+// Tool grid of the long-review bar: crop first, then the pattern tools of the
+// normal bar (no Select -- annotations are still adjusted by clicking them
+// with the matching tool active).  Shared by drawing, hit-testing and
+// tooltips.  The bar itself is a compact two-row palette (see
+// kLongBarWidth/kLongBarHeight) docked near the right edge of the screen.
+constexpr std::array<Tool, 7> kLongPreviewTools{
+    {Tool::Pen, Tool::Rectangle, Tool::Ellipse, Tool::Line, Tool::Arrow,
+     Tool::MosaicBrush, Tool::MosaicRectangle}};
+// Dedicated top strip shared by every bar (except the capturing bar): the two
+// half-cell utility buttons -- gray back, red close -- live in their own layer
+// above all bar content, so no bar row can ever cover or collide with them.
+constexpr int kBarUtilityStrip = 26;
+constexpr int kUtilityButtonSize = 18;  // half of a 36px tool cell
+constexpr int kUtilityButtonGap = 4;
+constexpr int kUtilityEdge = 8;
+// Long-review bar layout: two rows of five 36px buttons.  The eight tool
+// buttons (crop + 7 tools) fill row 0 and the first three cells of row 1;
+// copy/save (or cancel/apply while a crop is pending) take the last two cells.
+constexpr int kLongBarButtonsPerRow = 5;
+constexpr int kLongBarWidth =
+    12 * 2 + kLongBarButtonsPerRow * kLongPreviewToolSize +
+    (kLongBarButtonsPerRow - 1) * kLongPreviewToolGap;
+constexpr int kLongBarHeight =
+    kBarUtilityStrip + 12 * 2 + 2 * kLongPreviewToolSize + kLongPreviewToolGap;
 // Debounce for restoring the committed frame after hovering a thumbnail.
 // A quick pass across the gaps between thumbnails stays on the previewed
 // frame; only a genuine pause (or leaving the panel) snaps back.
@@ -40,21 +108,27 @@ constexpr int kSnapshotThumbGap = 7;
 // still becomes visible within the single expand transition.
 constexpr float kSnapshotStaggerProgress = 0.055f;
 constexpr int kToolbarMargin = 8;
-constexpr int kToolbarSelectHeight = 54;
-constexpr int kToolbarEditHeight = 138;
+constexpr int kToolbarSelectHeight = kBarUtilityStrip + 54;
+constexpr int kToolbarEditHeight = kBarUtilityStrip + 138;
 constexpr int kToolbarWidth = 620;
+// Compact bar used by the long-capture direction buttons and, while
+// capturing, the finish/cancel pair.
+constexpr int kToolbarLongWidth = 360;
+constexpr int kToolbarLongWide = 54;   // 1.5x the square tool size
+constexpr int kToolbarLongFinish = 72; // 2x the square tool size
 constexpr int kToolbarToolSize = 36;
 constexpr int kToolbarToolGap = 5;
 constexpr int kToolbarActionSize = 40;
-constexpr int kToolbarSecondaryTop = 52;
+constexpr int kToolbarSecondaryTop = kBarUtilityStrip + 52;
 constexpr int kToolbarSecondaryHeight = 36;
-constexpr int kToolbarPropertyTop = 94;
+constexpr int kToolbarPropertyTop = kBarUtilityStrip + 94;
 constexpr int kToolbarPresetStart = 210;
 constexpr int kToolbarPresetStep = 22;
 constexpr int kToolbarPresetSize = 20;
 constexpr int kToolbarPropertyGap = 5;
 constexpr int kToolbarPropertySize = 36;
 constexpr int kToolbarPillWidth = 54;
+constexpr std::wstring_view kTextPlaceholder = L"输入文字";
 
 float SnapshotAnimationEase(float rawProgress, bool expanding) {
   const float raw = std::clamp(rawProgress, 0.0f, 1.0f);
@@ -154,6 +228,25 @@ RECT ToLocal(const RECT& rect, const RECT& virtualBounds) {
 D2D1_RECT_F ToD2D(const RECT& rect) {
   return D2D1::RectF(static_cast<float>(rect.left), static_cast<float>(rect.top),
                      static_cast<float>(rect.right), static_cast<float>(rect.bottom));
+}
+
+// Non-linear easings shared by the preview float window transitions.
+float EaseOutCubic(float t) {
+  t = std::clamp(t, 0.0f, 1.0f);
+  const float p = 1.0f - t;
+  return 1.0f - p * p * p;
+}
+
+float EaseInOutCubic(float t) {
+  t = std::clamp(t, 0.0f, 1.0f);
+  return t < 0.5f ? 4.0f * t * t * t : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+}
+
+float Lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+D2D1_RECT_F LerpRect(const D2D1_RECT_F& from, const D2D1_RECT_F& to, float t) {
+  return D2D1::RectF(Lerp(from.left, to.left, t), Lerp(from.top, to.top, t),
+                     Lerp(from.right, to.right, t), Lerp(from.bottom, to.bottom, t));
 }
 
 bool HasArea(const RECT& rect, int minimum = 4) {
@@ -537,6 +630,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         }
       }
       else if (wParam == kHoverAnimationTimer) AdvanceHoverAnimation();
+      else if (wParam == kScrollTimer) ScrollTick();
       else if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
       else if (wParam == kSnapshotRestoreTimer) {
@@ -560,6 +654,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
+      else if (wParam == kLongPreviewTimer) AdvanceLongPreviewAnimation();
       else if (wParam == kSnapshotDockTimer && snapshotDockAnimating_) {
         const float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - snapshotDockAnimationStart_).count();
         const float t = std::clamp(elapsed / 0.46f, 0.0f, 1.0f);
@@ -587,6 +682,34 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_MOUSEMOVE: {
       POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       currentPoint_ = point;
+      if (scrollCapturing_) {
+        // Live capture: only the capturing bar is interactive; the selection
+        // itself is a hole in the window, so the page underneath receives the
+        // rest of the input directly.
+        if (toolbarDragging_) {
+          toolbarPosition_.x = toolbarPositionStart_.x + point.x - toolbarDragStart_.x;
+          toolbarPosition_.y = toolbarPositionStart_.y + point.y - toolbarDragStart_.y;
+        } else {
+          UpdateTooltip(point);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
+      }
+      if (longPreview_) {
+        // Post-capture review: bar drag, minimap drag and annotation gestures,
+        // plus hover tooltips for the icon-only buttons.
+        if (toolbarDragging_) {
+          toolbarPosition_.x = toolbarPositionStart_.x + point.x - toolbarDragStart_.x;
+          toolbarPosition_.y = toolbarPositionStart_.y + point.y - toolbarDragStart_.y;
+        } else if (longThumbDragging_) {
+          LongThumbDrag(point);
+        } else {
+          LongPreviewGestureMove(point);
+        }
+        UpdateTooltip(point);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
+      }
       if (snapshots_.size() > 1) {
         TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd_, 0};
         TrackMouseEvent(&track);
@@ -637,12 +760,36 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       } else if (selecting_) ContinueSelection(point);
       else if (drawing_) ContinueEditGesture(point);
       else UpdateHover(point);
-      if (editing_) UpdateTooltip(point);
+      if (editing_ && !scrollCapturing_) UpdateTooltip(point);
       InvalidateRect(hwnd_, nullptr, FALSE); return 0;
     }
     case WM_LBUTTONDOWN: {
         SetFocus(hwnd_);
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        // The utility layer (gray back / red close) sits on top of every bar
+        // and wins over any other bar interaction, including bar dragging.
+        if (HitUtilityClose(point)) { Cancel(); return 0; }
+        if (HitUtilityBack(point)) { UtilityBack(); return 0; }
+      if (scrollCapturing_) {
+        // Only the capturing bar (finish/cancel/drag) is interactive; the
+        // selection hole passes clicks straight through to the live page.
+        if (HitLongFinish(point)) { FinishScrollCapture(); return 0; }
+        if (HitLongCancel(point)) { CancelScrollCapture(); return 0; }
+        if (Contains(ToolbarRect(), point)) {
+          const RECT toolbar = ToolbarRect();
+          toolbarDragging_ = true;
+          toolbarPositionSet_ = true;
+          toolbarDragStart_ = point;
+          toolbarPositionStart_ = {toolbar.left, toolbar.top};
+          toolbarPosition_ = toolbarPositionStart_;
+          SetCapture(hwnd_);
+        }
+        return 0;
+      }
+      if (longPreview_) {
+        LongPreviewGestureStart(point);
+        return 0;
+      }
       if (snapshots_.size() > 1) {
         if (HitSnapshotIcon(point)) {
           if (snapshotRestorePending_) {
@@ -669,6 +816,30 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         if (HitSnapshotPanel(point)) return 0;
       }
       if (editing_) {
+        if (longCaptureMode_) {
+          // The bar is flipped to the long-capture mode: only the three
+          // direction buttons and bar dragging stay interactive so hidden
+          // editing buttons can never be triggered by accident.
+          if (HitLongDirection(ScrollDirection::Down, point)) {
+            BeginScrollCapture(ScrollDirection::Down); return 0;
+          }
+          if (HitLongDirection(ScrollDirection::Up, point)) {
+            BeginScrollCapture(ScrollDirection::Up); return 0;
+          }
+          if (HitLongDirection(ScrollDirection::Right, point)) {
+            BeginScrollCapture(ScrollDirection::Right); return 0;
+          }
+          if (Contains(ToolbarRect(), point)) {
+            const RECT toolbar = ToolbarRect();
+            toolbarDragging_ = true;
+            toolbarPositionSet_ = true;
+            toolbarDragStart_ = point;
+            toolbarPositionStart_ = {toolbar.left, toolbar.top};
+            toolbarPosition_ = toolbarPositionStart_;
+            SetCapture(hwnd_);
+          }
+          return 0;
+        }
         if (textEdit_) CommitTextInput();
         if (HasSizeControl() && Contains(SizeSliderRect(), point)) {
           sizeSliderDragging_ = true;
@@ -709,6 +880,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         }
         if (HitCopy(point)) { Complete(CaptureCompletion::Copy); return 0; }
         if (HitSave(point)) { Complete(CaptureCompletion::Save); return 0; }
+        if (HitLongEntry(point)) { EnterLongCaptureMode(); return 0; }
         if (auto hit = HitTestTool(point)) { SelectTool(*hit); return 0; }
         if (auto property = HitTestProperty(point)) {
           ActivateProperty(*property);
@@ -739,6 +911,16 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
       }
+      if (longThumbDragging_) {
+        longThumbDragging_ = false;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
+      }
+      if (longPreview_) {
+        LongPreviewGestureEnd(point);
+        return 0;
+      }
       if (sizeSliderDragging_) {
         SetSizeFromSlider(point);
         sizeSliderDragging_ = false;
@@ -760,6 +942,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     }
     case WM_CAPTURECHANGED:
       if (toolbarDragging_) toolbarDragging_ = false;
+      if (longThumbDragging_) longThumbDragging_ = false;
       if (sizeSliderDragging_) { sizeSliderDragging_ = false; EndSettingPreview(); }
       if (propertySliderDragging_) { propertySliderDragging_.reset(); EndSettingPreview(); }
       InvalidateRect(hwnd_, nullptr, FALSE); return 0;
@@ -768,7 +951,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       InvalidateRect(hwnd_, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK: {
-      if (editing_ && (tool_ == Tool::Select || tool_ == Tool::Text)) {
+      if (editing_ && !longPreview_ && (tool_ == Tool::Select || tool_ == Tool::Text)) {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const auto hit = HitTestCommand(point, tool_ == Tool::Text ? std::optional<Tool>(Tool::Text)
                                                                     : std::nullopt);
@@ -787,12 +970,33 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       return 0;
     }
     case WM_RBUTTONUP:
-      if (editing_) {
+      if (editing_ && !longPreview_) {
         ShowEditorContextMenu({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
         return 0;
       }
       return 0;
     case WM_MOUSEWHEEL:
+      if (longPreview_) {
+        // Wheel scrolls the stitched image at 100% zoom.  Direction follows
+        // the image-viewer convention (wheel down reveals the lower part of
+        // the image) so the long preview feels like a single tall picture
+        // rather than a web page.
+        if (longCaptureResult_) {
+          // Wheel down (negative delta) reveals the lower part of the image,
+          // matching both the web convention and the PageDown/ArrowDown keys
+          // below -- longPreviewScroll_ counts image rows hidden above the
+          // viewport, so a downward wheel has to increase it.
+          const float notches =
+              -static_cast<short>(GET_WHEEL_DELTA_WPARAM(wParam)) / static_cast<float>(WHEEL_DELTA);
+          const D2D1_RECT_F viewport = LongPreviewViewportRect();
+          const float scale = LongPreviewScale();
+          longPreviewScroll_ +=
+              notches * (viewport.bottom - viewport.top) * kLongPreviewWheelStep / scale;
+          ClampLongPreviewScroll();
+          InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return 0;
+      }
       if (!editing_ && mode_ == SelectionMode::Unit && !hoverUnitRects_.empty()) {
         if (GET_WHEEL_DELTA_WPARAM(wParam) > 0) hoverUnitIndex_ = std::min(hoverUnitIndex_ + 1, hoverUnitRects_.size() - 1);
         else if (hoverUnitIndex_) --hoverUnitIndex_;
@@ -804,6 +1008,72 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
       if (wParam == VK_ESCAPE) { HandleEscape(); return 0; }
+      if (scrollCapturing_) {
+        // Enter ends the live preview and completes with the default action.
+        if (wParam == VK_RETURN) FinishScrollCapture();
+        return 0;
+      }
+      if (longPreview_) {
+        // Float preview window: Enter/Esc act on the current stage only.
+        if (wParam == VK_RETURN) {
+          if (longPreviewStage_ == LongPreviewStage::Crop) ApplyLongCrop();
+          else if (longPreviewStage_ == LongPreviewStage::Annotate) {
+            previewCommand_.reset();
+            BeginLongPreviewStage(LongPreviewStage::View);
+          } else {
+            Complete(config_.defaultAction == DefaultAction::Save ? CaptureCompletion::Save
+                                                                  : CaptureCompletion::Copy);
+          }
+        }
+        // Keyboard navigation: Page Up/Down jumps by a viewport, the arrow
+        // keys step by ~one row, and Home/End snap to the top and bottom of
+        // the stitched image.  Direction matches the wheel: Down/Right
+        // reveals lower rows.
+        if (longCaptureResult_) {
+          const D2D1_RECT_F viewport = LongPreviewViewportRect();
+          const float viewportH = viewport.bottom - viewport.top;
+          const float maxScroll = std::max(0.0f,
+              static_cast<float>(longCaptureResult_->height) - viewportH);
+          float delta = 0.0f;
+          if (wParam == VK_NEXT) delta = viewportH;             // PageDown
+          else if (wParam == VK_PRIOR) delta = -viewportH;      // PageUp
+          else if (wParam == VK_DOWN) delta = viewportH * kLongPreviewWheelStep;
+          else if (wParam == VK_UP) delta = -viewportH * kLongPreviewWheelStep;
+          else if (wParam == VK_HOME) longPreviewScroll_ = 0.0f;
+          else if (wParam == VK_END) longPreviewScroll_ = maxScroll;
+          if (delta != 0.0f) {
+            longPreviewScroll_ = std::clamp(longPreviewScroll_ + delta, 0.0f, maxScroll);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+          }
+          if (wParam == VK_HOME || wParam == VK_END) {
+            ClampLongPreviewScroll();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+          }
+        }
+        if (control && wParam == 'Z') {
+          document_.Undo();
+          if (selectedCommand_ && !document_.At(*selectedCommand_)) selectedCommand_.reset();
+          RebuildLongMosaicPixels();
+          InvalidateRect(hwnd_, nullptr, FALSE); return 0;
+        }
+        if (control && wParam == 'Y') {
+          document_.Redo();
+          if (selectedCommand_ && !document_.At(*selectedCommand_)) selectedCommand_.reset();
+          RebuildLongMosaicPixels();
+          InvalidateRect(hwnd_, nullptr, FALSE); return 0;
+        }
+        if ((wParam == VK_DELETE || wParam == VK_BACK) && selectedCommand_) {
+          if (document_.Remove(*selectedCommand_)) {
+            selectedCommand_.reset();
+            RebuildLongMosaicPixels();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+          }
+          return 0;
+        }
+        return 0;
+      }
       if (wParam == VK_SPACE && !editing_) { CycleMode(); return 0; }
       if (control && wParam == 'Z') {
         document_.Undo();
@@ -815,7 +1085,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         if (selectedCommand_ && !document_.At(*selectedCommand_)) selectedCommand_.reset();
         InvalidateRect(hwnd_, nullptr, FALSE); return 0;
       }
-      if (editing_ && (wParam == VK_DELETE || wParam == VK_BACK) && selectedCommand_) {
+      if (editing_ && !longCaptureMode_ && (wParam == VK_DELETE || wParam == VK_BACK) && selectedCommand_) {
         if (document_.Remove(*selectedCommand_)) {
           selectedCommand_.reset();
           InvalidateRect(hwnd_, nullptr, FALSE);
@@ -827,7 +1097,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       if (editing_ && wParam == VK_RETURN) {
         Complete(config_.defaultAction == DefaultAction::Save ? CaptureCompletion::Save : CaptureCompletion::Copy); return 0;
       }
-      if (editing_) {
+      if (editing_ && !longCaptureMode_) {
         switch (wParam) {
           case 'P': SelectTool(Tool::Pen); break;
           case 'R': SelectTool(Tool::Rectangle); break;
@@ -857,7 +1127,13 @@ bool CaptureOverlay::CreateDeviceResources() {
   if (!dwriteFactory_ && FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                                     reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf())))) return false;
   if (!renderTarget_) {
-    const auto properties = D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(snapshot_.width, snapshot_.height),
+    // Use the current client size: after a device loss during scroll capture
+    // the overlay window is the shrunken preview strip, not the desktop.
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const UINT targetWidth = std::max<UINT>(1, static_cast<UINT>(client.right - client.left));
+    const UINT targetHeight = std::max<UINT>(1, static_cast<UINT>(client.bottom - client.top));
+    const auto properties = D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(targetWidth, targetHeight),
                                                              D2D1_PRESENT_OPTIONS_IMMEDIATELY);
     if (FAILED(d2dFactory_->CreateHwndRenderTarget(
         D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -881,6 +1157,10 @@ bool CaptureOverlay::CreateDeviceResources() {
 void CaptureOverlay::DiscardDeviceResources() {
   mosaicPreviewBitmap_.Reset();
   mosaicPreviewSignature_ = 0;
+  scrollPreviewBitmap_.Reset();
+  scrollPreviewWidth_ = 0;
+  scrollPreviewHeight_ = 0;
+  scrollPreviewOffset_ = 0;
   toolbarBackdropBitmap_.Reset();
   toolbarBackdropPixels_.clear();
   toolbarBackdropValid_ = false;
@@ -1049,6 +1329,74 @@ void CaptureOverlay::EnsureToolbarBackdrop() {
   toolbarBackdropValid_ = true;
 }
 
+// Temporary frame diagnostics: append one line to %TEMP%\rc-overlay-debug.log
+// so a missed toolbar can be attributed to a failed EndDraw (with the D2D tag
+// of the offending primitive) or to a geometry/state problem.
+void CaptureOverlay::LogFrameState(const char* event) const {
+  wchar_t path[MAX_PATH]{};
+  if (!GetTempPathW(MAX_PATH, path)) return;
+  const std::wstring file = std::wstring(path) + L"rc-overlay-debug.log";
+  HANDLE handle = CreateFileW(file.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return;
+  char line[320];
+  const RECT toolbar = ToolbarRect();
+  const int length = std::snprintf(
+      line, sizeof(line),
+      "%s editing=%d selecting=%d longPreview=%d longCapture=%d toolbar=(%ld,%ld)-(%ld,%ld)\r\n",
+      event, editing_ ? 1 : 0, selecting_ ? 1 : 0, longPreview_ ? 1 : 0,
+      longCaptureMode_ ? 1 : 0, static_cast<long>(toolbar.left), static_cast<long>(toolbar.top),
+      static_cast<long>(toolbar.right), static_cast<long>(toolbar.bottom));
+  DWORD written = 0;
+  if (length > 0) WriteFile(handle, line, static_cast<DWORD>(length), &written, nullptr);
+  CloseHandle(handle);
+}
+
+void CaptureOverlay::LogFrameErrorAt(HRESULT hr, UINT64 stage, UINT64 tag1, UINT64 tag2) const {
+  // Sticky D2D error state makes every later Flush report the same failure;
+  // remember seen (hr,stage) pairs so the log keeps only first occurrences and
+  // the earliest stage line identifies the offending sub-stage.
+  static std::array<HRESULT, 64> seenHr{};
+  static std::array<UINT64, 64> seenStage{};
+  static size_t seenCount = 0;
+  for (size_t index = 0; index < seenCount; ++index) {
+    if (seenHr[index] == hr && seenStage[index] == stage) return;
+  }
+  if (seenCount < seenHr.size()) {
+    seenHr[seenCount] = hr; seenStage[seenCount] = stage; ++seenCount;
+  }
+  wchar_t path[MAX_PATH]{};
+  if (!GetTempPathW(MAX_PATH, path)) return;
+  const std::wstring file = std::wstring(path) + L"rc-overlay-debug.log";
+  HANDLE handle = CreateFileW(file.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return;
+  char line[256];
+  const int length = std::snprintf(
+      line, sizeof(line), "frame error hr=0x%08lX stage=0x%llX tags=0x%llX/0x%llX\r\n",
+      static_cast<unsigned long>(hr), static_cast<unsigned long long>(stage),
+      static_cast<unsigned long long>(tag1), static_cast<unsigned long long>(tag2));
+  DWORD written = 0;
+  if (length > 0) WriteFile(handle, line, static_cast<DWORD>(length), &written, nullptr);
+  CloseHandle(handle);
+}
+
+void CaptureOverlay::LogFrameError(HRESULT hr) const {
+  UINT64 tag1 = 0, tag2 = 0;
+  if (renderTarget_) renderTarget_->GetTags(&tag1, &tag2);
+  LogFrameErrorAt(hr, 0, tag1, tag2);
+}
+
+void CaptureOverlay::FlushCheck(UINT64 stage) {
+  if (!renderTarget_) return;
+  const HRESULT flushed = renderTarget_->Flush();
+  if (FAILED(flushed)) {
+    UINT64 tag1 = 0, tag2 = 0;
+    renderTarget_->GetTags(&tag1, &tag2);
+    LogFrameErrorAt(flushed, stage, tag1, tag2);
+  }
+}
+
 void CaptureOverlay::Paint() {
   PAINTSTRUCT paint{};
   BeginPaint(hwnd_, &paint);
@@ -1070,9 +1418,35 @@ void CaptureOverlay::Paint() {
     ComPtr<ID2D1SolidColorBrush> border;
     renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.65f, 1.0f, 1.0f), &border);
     renderTarget_->DrawRectangle(ToD2D(active), border.Get(), 2.0f);
+    DrawUnitLevelBoxes();
+  }
+  if (scrollCapturing_) {
+    // Live scroll capture: the selection is a hole in the overlay window, so
+    // the real page shows through and scrolls; only the capturing bar, the
+    // thumbnail preview beside the selection and tooltips are drawn on top.
+    DrawToolbar();
+    DrawScrollPreviewPanel();
+    DrawTooltip();
+    HRESULT early = renderTarget_->EndDraw();
+    if (early == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+    else if (FAILED(early)) LogFrameError(early);
+    return;
+  }
+  if (longPreview_) {
+    // Post-capture float window owns the whole frame while it is open; the
+    // tooltip rides on top like it does on the normal editing bar.
+    DrawLongPreview();
+    DrawTooltip();
+    HRESULT early = renderTarget_->EndDraw();
+    if (early == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+    else if (FAILED(early)) LogFrameError(early);
+    return;
   }
   if (editing_) {
-    DrawDocument(); DrawSettingPreview(); DrawToolbar(); DrawTooltip();
+    DrawDocument();
+    DrawSettingPreview();
+    DrawToolbar();
+    DrawTooltip();
   }
   DrawSnapshotSwitcher();
   const wchar_t* modeName = mode_ == SelectionMode::Normal ? L"普通模式" : mode_ == SelectionMode::Window ? L"窗口模式" : L"单元模式";
@@ -1080,12 +1454,16 @@ void CaptureOverlay::Paint() {
   const bool waitingForUnits = mode_ == SelectionMode::Unit && !unitReady_;
   if (waitingForUnits) status += L"（正在分析区域…）";
   if (mode_ == SelectionMode::Unit && !editing_ && !hoverUnitRects_.empty())
-    status += L"  \u00b7  \u5c42\u7ea7 " + std::to_wstring(hoverUnitIndex_ + 1) + L"/" +
-              std::to_wstring(hoverUnitRects_.size()) + L"  \u6eda\u8f6e\u8c03\u8282";
-  const RECT statusRect{12, 10,
-                        mode_ == SelectionMode::Unit && !hoverUnitRects_.empty()
-                            ? 470L : waitingForUnits ? 394L : 270L,
-                        50};
+    status += L"  ·  层级 " + std::to_wstring(hoverUnitIndex_ + 1) + L"/" +
+              std::to_wstring(hoverUnitRects_.size()) + L"  滚轮切换 · 点边框选层";
+  // The mode-switch hint belongs to the screen the user is looking at: anchor
+  // it to the top-left of the ACTIVE monitor, not to a fixed virtual-desktop
+  // offset (which is the wrong display on multi-monitor setups).
+  const RECT activeMonitor = ActiveMonitorLocalRect();
+  const RECT statusRect{activeMonitor.left + 12, activeMonitor.top + 10,
+                        activeMonitor.left + (mode_ == SelectionMode::Unit && !hoverUnitRects_.empty()
+                            ? 640L : waitingForUnits ? 394L : 270L),
+                        activeMonitor.top + 50};
   ComPtr<ID2D1SolidColorBrush> statusShadow, statusBackground, statusBorder;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.5f), &statusShadow);
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.025f, 0.055f, 0.09f, 0.92f), &statusBackground);
@@ -1097,11 +1475,16 @@ void CaptureOverlay::Paint() {
   renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(shadowRect), 8, 8), statusShadow.Get());
   renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(statusRect), 8, 8), statusBackground.Get());
   renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(statusRect), 8, 8), statusBorder.Get(), 1.5f);
-  DrawText(status, D2D1::RectF(24, 10, static_cast<float>(statusRect.right - 10), 50), 16,
-           D2D1::ColorF(D2D1::ColorF::White), DWRITE_TEXT_ALIGNMENT_LEADING,
+  DrawText(status,
+           D2D1::RectF(static_cast<float>(activeMonitor.left + 24),
+                       static_cast<float>(activeMonitor.top + 10),
+                       static_cast<float>(statusRect.right - 10),
+                       static_cast<float>(activeMonitor.top + 50)),
+           16, D2D1::ColorF(D2D1::ColorF::White), DWRITE_TEXT_ALIGNMENT_LEADING,
            DWRITE_FONT_WEIGHT_SEMI_BOLD);
   HRESULT hr = renderTarget_->EndDraw();
   if (hr == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+  else if (FAILED(hr)) LogFrameError(hr);
 }
 
 RECT CaptureOverlay::SnapshotIconRect() const {
@@ -1504,6 +1887,66 @@ void CaptureOverlay::RestoreHoverSnapshot(bool refreshDetection) {
     SetActiveSnapshot(*previous, false, refreshDetection);
 }
 
+// Rounded-cap, rounded-join stroke style shared by EVERY icon in the app
+// (toolbar tools, actions, properties, snapshot chevrons and the long-capture
+// glyphs) so the whole icon set speaks one stroke language.
+static ComPtr<ID2D1StrokeStyle> RoundCapStyle(ID2D1Factory* factory) {
+  ComPtr<ID2D1StrokeStyle> style;
+  if (factory) {
+    factory->CreateStrokeStyle(
+        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                    D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.0f,
+                                    D2D1_DASH_STYLE_SOLID, 0.0f),
+        nullptr, 0, &style);
+  }
+  return style;
+}
+
+// Unified icon canvas: every bar glyph is authored on a 24x24 design grid and
+// centered in its target rect.  One grid plus one round-cap stroke (see
+// GlyphPen) keeps the whole icon family -- tools, actions, properties, the
+// long-capture glyphs and the utility buttons -- at a single optical weight.
+struct IconGrid {
+  float unit = 0;
+  float ox = 0;
+  float oy = 0;
+  static IconGrid For(const D2D1_RECT_F& rect) {
+    const float width = rect.right - rect.left;
+    const float height = rect.bottom - rect.top;
+    const float unit = std::min(width, height) / 24.0f;
+    return {unit, rect.left + (width - 24.0f * unit) * 0.5f,
+            rect.top + (height - 24.0f * unit) * 0.5f};
+  }
+  D2D1_POINT_2F P(float x, float y) const { return {ox + x * unit, oy + y * unit}; }
+};
+
+struct GlyphPen {
+  ID2D1RenderTarget* rt = nullptr;
+  ID2D1SolidColorBrush* brush = nullptr;
+  ID2D1StrokeStyle* style = nullptr;
+  IconGrid grid;
+  float Weight(float units) const { return units * grid.unit; }
+  void Line(float x1, float y1, float x2, float y2, float weight = 1.7f) const {
+    rt->DrawLine(grid.P(x1, y1), grid.P(x2, y2), brush, Weight(weight), style);
+  }
+  void RoundedRect(float left, float top, float right, float bottom, float radius,
+                   float weight = 1.7f) const {
+    rt->DrawRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(grid.ox + left * grid.unit, grid.oy + top * grid.unit,
+                                      grid.ox + right * grid.unit, grid.oy + bottom * grid.unit),
+                          Weight(radius), Weight(radius)),
+        brush, Weight(weight), style);
+  }
+  void Circle(float cx, float cy, float radius, float weight = 1.7f) const {
+    D2D1_ELLIPSE ellipse{grid.P(cx, cy), Weight(radius), Weight(radius)};
+    rt->DrawEllipse(ellipse, brush, Weight(weight), style);
+  }
+  void Dot(float cx, float cy, float radius) const {
+    D2D1_ELLIPSE ellipse{grid.P(cx, cy), Weight(radius), Weight(radius)};
+    rt->FillEllipse(ellipse, brush);
+  }
+};
+
 void CaptureOverlay::DrawSnapshotSwitcher() {
   if (!renderTarget_ || snapshots_.size() <= 1) return;
   const RECT icon = SnapshotIconRect();
@@ -1638,11 +2081,12 @@ void CaptureOverlay::DrawSnapshotSwitcher() {
   const float chevronX = static_cast<float>(iconRight - 14);
   const bool expanded = snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.55f;
   const float chevronDirection = expanded ? -1.0f : 1.0f;
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
   renderTarget_->DrawLine(D2D1::Point2F(chevronX, chevronY),
                           D2D1::Point2F(chevronX + 4.0f, chevronY + chevronDirection * 4.0f),
-                          glyph.Get(), 1.6f);
+                          glyph.Get(), 1.6f, rounded.Get());
   renderTarget_->DrawLine(D2D1::Point2F(chevronX + 4.0f, chevronY + chevronDirection * 4.0f),
-                          D2D1::Point2F(chevronX + 8.0f, chevronY), glyph.Get(), 1.6f);
+                          D2D1::Point2F(chevronX + 8.0f, chevronY), glyph.Get(), 1.6f, rounded.Get());
 }
 
 void CaptureOverlay::BeginSettingPreview(POINT point, bool timed) {
@@ -1975,6 +2419,56 @@ void CaptureOverlay::AdvanceHoverAnimation() {
   if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+// Unit mode reveals every selectable level under the cursor as a translucent
+// box with a small level badge, so the hierarchy can be read at a glance and
+// picked directly by clicking its outline.  The active level keeps the strong
+// dim hole and blue border drawn by Paint().
+void CaptureOverlay::DrawUnitLevelBoxes() {
+  if (mode_ != SelectionMode::Unit || editing_ || selecting_ || hoverUnitRects_.empty()) return;
+  ComPtr<ID2D1SolidColorBrush> fill, stroke, badge;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.25f, .70f, 1.0f, .08f), &fill);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.45f, .82f, 1.0f, .36f), &stroke);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.02f, .06f, .11f, .60f), &badge);
+  if (!fill || !stroke || !badge) return;
+  const auto same = [](const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+  };
+  for (size_t index = 0; index < hoverUnitRects_.size(); ++index) {
+    const RECT& level = hoverUnitRects_[index];
+    if (same(level, hoverTargetRect_)) continue;  // active level keeps the strong outline
+    renderTarget_->FillRectangle(ToD2D(level), fill.Get());
+    renderTarget_->DrawRectangle(ToD2D(level), stroke.Get(), 1.2f);
+    // Level badge: the wheel index, so a level can be chosen deliberately.
+    const LONG width = level.right - level.left;
+    const LONG height = level.bottom - level.top;
+    if (width < 40 || height < 24) continue;
+    const std::wstring label = std::to_wstring(index + 1);
+    const D2D1_RECT_F tag{static_cast<float>(level.left + 4), static_cast<float>(level.top + 4),
+                          static_cast<float>(level.left + 20), static_cast<float>(level.top + 20)};
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(tag, 5, 5), badge.Get());
+    DrawText(label, tag, 10.5f, D2D1::ColorF(1, 1, 1, .85f));
+  }
+}
+
+// Returns the innermost level whose outline passes within the pick band of
+// point, so clicking a visible level box directly selects that level.
+std::optional<size_t> CaptureOverlay::HitUnitLevelBorder(POINT point) const {
+  constexpr int kBand = 4;  // pixels on each side of the outline
+  std::optional<size_t> found;
+  for (size_t index = 0; index < hoverUnitRects_.size(); ++index) {
+    const RECT& level = hoverUnitRects_[index];
+    RECT outer = level, inner = level;
+    InflateRect(&outer, kBand, kBand);
+    InflateRect(&inner, -kBand, -kBand);
+    if (!Contains(outer, point) || Contains(inner, point)) continue;
+    const auto area = [](const RECT& rect) {
+      return static_cast<int64_t>(rect.right - rect.left) * (rect.bottom - rect.top);
+    };
+    if (!found || area(level) < area(hoverUnitRects_[*found])) found = index;
+  }
+  return found;
+}
+
 void CaptureOverlay::UpdateHover(POINT point) {
   if (editing_ || selecting_) return;
   RECT target{};
@@ -1989,37 +2483,53 @@ void CaptureOverlay::UpdateHover(POINT point) {
     UnitDetector detector;
     {
       std::scoped_lock lock(unitMutex_);
-      hoverUnitRects_.clear();
-      const auto appendAtPoint = [&](const std::vector<UnitCandidate>& source,
+      const auto appendAtPoint = [&](std::vector<RECT>& chain,
+                                     const std::vector<UnitCandidate>& source,
                                      std::span<const size_t> indices) {
         for (size_t index : indices) {
           const RECT bounds = source[index].bounds;
           const bool duplicate = std::any_of(
-              hoverUnitRects_.begin(), hoverUnitRects_.end(), [&](const RECT& existing) {
+              chain.begin(), chain.end(), [&](const RECT& existing) {
                 return std::abs(existing.left - bounds.left) <= 3 &&
                        std::abs(existing.top - bounds.top) <= 3 &&
                        std::abs(existing.right - bounds.right) <= 3 &&
                        std::abs(existing.bottom - bounds.bottom) <= 3;
               });
-          if (!duplicate) hoverUnitRects_.push_back(bounds);
+          if (!duplicate) chain.push_back(bounds);
         }
       };
-      std::vector<size_t> uiaAtPoint;
-      std::vector<size_t> visualAtPoint;
-      if (uiaReady_) uiaAtPoint = detector.CandidatesAt(uiaCandidates_, point);
+      // Merge semantic and visual boxes into one chain ordered strictly
+      // inner-to-outer by area.  The level numbering then no longer depends on
+      // which detector answered first, so chains cannot reorder while UIA and
+      // pixel results trickle in at different times.
+      std::vector<RECT> chain;
+      if (uiaReady_)
+        appendAtPoint(chain, uiaCandidates_, detector.CandidatesAt(uiaCandidates_, point));
       if (unitReady_.load(std::memory_order_acquire))
-        visualAtPoint = detector.CandidatesAt(unitCandidates_, point);
-      // A lone UIA root is only a window-sized fallback. Prefer the visual unit
-      // in that case; otherwise semantic UIA descendants lead the chain.
-      if (uiaAtPoint.size() > 1) {
-        appendAtPoint(uiaCandidates_, uiaAtPoint);
-        appendAtPoint(unitCandidates_, visualAtPoint);
+        appendAtPoint(chain, unitCandidates_, detector.CandidatesAt(unitCandidates_, point));
+      const auto area = [](const RECT& rect) {
+        return static_cast<int64_t>(rect.right - rect.left) * (rect.bottom - rect.top);
+      };
+      std::sort(chain.begin(), chain.end(),
+                [&](const RECT& a, const RECT& b) { return area(a) < area(b); });
+      // Anchor the wheel-selected level to the same box: when a small pointer
+      // move grows or shrinks the chain, re-find the previous rect instead of
+      // keeping the previous slot index (which may now be a different level).
+      if (hoverUnitIndex_ < hoverUnitRects_.size()) {
+        const RECT anchor = hoverUnitRects_[hoverUnitIndex_];
+        const auto found = std::find_if(chain.begin(), chain.end(), [&](const RECT& candidate) {
+          return std::abs(candidate.left - anchor.left) <= 3 &&
+                 std::abs(candidate.top - anchor.top) <= 3 &&
+                 std::abs(candidate.right - anchor.right) <= 3 &&
+                 std::abs(candidate.bottom - anchor.bottom) <= 3;
+        });
+        hoverUnitIndex_ = found == chain.end()
+                              ? size_t{0}
+                              : static_cast<size_t>(found - chain.begin());
       } else {
-        appendAtPoint(unitCandidates_, visualAtPoint);
-        appendAtPoint(uiaCandidates_, uiaAtPoint);
+        hoverUnitIndex_ = 0;
       }
-      hoverUnitIndex_ = std::min(
-          hoverUnitIndex_, hoverUnitRects_.empty() ? size_t{0} : hoverUnitRects_.size() - 1);
+      hoverUnitRects_ = std::move(chain);
       if (!hoverUnitRects_.empty()) target = hoverUnitRects_[hoverUnitIndex_];
     }
   }
@@ -2038,6 +2548,14 @@ void CaptureOverlay::CycleMode() {
 
 void CaptureOverlay::BeginSelection(POINT point) {
   windowSelection_ = false;
+  if (mode_ == SelectionMode::Unit && !editing_ && !hoverUnitRects_.empty()) {
+    // Direct level picking: clicking a visible outline commits exactly that
+    // level, without wheeling to it first.
+    if (const std::optional<size_t> border = HitUnitLevelBorder(point)) {
+      hoverUnitIndex_ = *border;
+      SetHoverTarget(hoverUnitRects_[*border], true);
+    }
+  }
   if ((mode_ == SelectionMode::Window || mode_ == SelectionMode::Unit) &&
       HasArea(hoverTargetRect_)) {
     selection_ = hoverTargetRect_;
@@ -2099,6 +2617,18 @@ void CaptureOverlay::BeginEditGesture(POINT point) {
       drawing_ = true; dragStart_ = point; currentPoint_ = point;
       selectionBeforeAdjust_ = selection_; SetCapture(hwnd_);
     }
+    return;
+  }
+  // Any tool can grab the selection border/handles directly so the region can
+  // be adjusted right after the box selection completes.  The Select tool
+  // keeps the wider zones that also allow moving from the interior.
+  const SelectionAdjustment selectionHandle = tool_ == Tool::Select
+      ? SelectionAdjustment::None
+      : HitTestSelectionHandle(point);
+  if (selectionHandle != SelectionAdjustment::None) {
+    selectionAdjustment_ = selectionHandle;
+    drawing_ = true; dragStart_ = point; currentPoint_ = point;
+    selectionBeforeAdjust_ = selection_; SetCapture(hwnd_);
     return;
   }
   if (!Contains(selection_, point) || tool_ == Tool::Frame) return;
@@ -2217,6 +2747,27 @@ void CaptureOverlay::SelectTool(Tool tool) {
 }
 
 void CaptureOverlay::HandleEscape() {
+  if (scrollCapturing_) {
+    CancelScrollCapture();
+    return;
+  }
+  if (longCaptureMode_) {
+    ExitLongCaptureMode();
+    return;
+  }
+  if (longPreview_) {
+    // Preview float window: ESC mirrors the highlighted action of the stage —
+    // Crop/Annotate step back to the view, view exits to the direction bar.
+    if (longPreviewStage_ == LongPreviewStage::Crop ||
+        longPreviewStage_ == LongPreviewStage::Annotate) {
+      previewCommand_.reset();
+      longPreviewDrag_ = LongPreviewDrag::None;
+      BeginLongPreviewStage(LongPreviewStage::View);
+    } else {
+      ExitLongPreviewToBar();
+    }
+    return;
+  }
   if (textEdit_) {
     CancelTextInput();
     return;
@@ -2329,15 +2880,83 @@ void CaptureOverlay::Complete(CaptureCompletion completion) {
   RestoreHoverSnapshot(false);
   if (textEdit_) CommitTextInput();
   OverlayResult result;
-  result.completion = completion; result.selection = selection_;
-  OffsetRect(&result.selection, snapshot_.virtualBounds.left, snapshot_.virtualBounds.top);
-  result.document = std::move(document_); result.windowSelection = windowSelection_;
+  result.completion = completion;
+  if (longCaptureResult_) {
+    // Long screenshot: the selection covers the whole stitched image and the
+    // exporter renders against the stitched buffer instead of the frozen
+    // desktop snapshot.  Mosaics are already baked into those pixels, so only
+    // the vector commands travel with the document.
+    EditorDocument exportDocument;
+    int exportLeft = 0;
+    int exportTop = 0;
+    int exportWidth = longCaptureResult_->width;
+    int exportHeight = longCaptureResult_->height;
+    // Honor the soft crop on the way out: trim the stitched buffer to the
+    // committed rectangle and translate annotations so they land in the
+    // exported image.  A soft crop covering the whole image (the common case
+    // when the user never crops) is a no-op.
+    if (longCropAppliedValid_ && longCropApplied_.right > longCropApplied_.left &&
+        longCropApplied_.bottom > longCropApplied_.top) {
+      const int left = std::clamp(static_cast<int>(std::lround(longCropApplied_.left)),
+                                  0, longCaptureResult_->width - 1);
+      const int top = std::clamp(static_cast<int>(std::lround(longCropApplied_.top)),
+                                 0, longCaptureResult_->height - 1);
+      const int right = std::clamp(static_cast<int>(std::lround(longCropApplied_.right)),
+                                   left + 1, longCaptureResult_->width);
+      const int bottom = std::clamp(static_cast<int>(std::lround(longCropApplied_.bottom)),
+                                    top + 1, longCaptureResult_->height);
+      const bool isIdentity = (left == 0 && top == 0 &&
+                               right == longCaptureResult_->width &&
+                               bottom == longCaptureResult_->height);
+      if (!isIdentity) {
+        CroppedImage cropped = CropStitchedPixels(longCaptureResult_->bgra.data(),
+                                                  longCaptureResult_->width,
+                                                  longCaptureResult_->height,
+                                                  longCaptureResult_->stride,
+                                                  left, top, right, bottom);
+        if (!cropped.bgra.empty()) {
+          longCaptureResult_->width = cropped.width;
+          longCaptureResult_->height = cropped.height;
+          longCaptureResult_->stride = cropped.stride;
+          longCaptureResult_->bgra = std::move(cropped.bgra);
+          exportLeft = left;
+          exportTop = top;
+          exportWidth = longCaptureResult_->width;
+          exportHeight = longCaptureResult_->height;
+        }
+      }
+    }
+    for (size_t index = 0; index < document_.Size(); ++index) {
+      const EditCommand* command = document_.At(index);
+      if (command && !std::holds_alternative<MosaicCommand>(*command)) exportDocument.Add(*command);
+    }
+    // Vector annotations are stored against the pre-crop image; shift them
+    // into the exported buffer's coordinate space so they line up correctly.
+    if (exportLeft != 0 || exportTop != 0) {
+      exportDocument.Translate(-static_cast<float>(exportLeft),
+                               -static_cast<float>(exportTop));
+    }
+    result.document = std::move(exportDocument);
+    result.windowSelection = windowSelection_;
+    result.selection = {0, 0, static_cast<LONG>(exportWidth),
+                        static_cast<LONG>(exportHeight)};
+    result.longImage = std::move(longCaptureResult_);
+  } else {
+    result.document = std::move(document_); result.windowSelection = windowSelection_;
+    result.selection = selection_;
+    OffsetRect(&result.selection, snapshot_.virtualBounds.left, snapshot_.virtualBounds.top);
+  }
   ShowWindow(hwnd_, SW_HIDE);
   SetCursor(LoadCursorW(nullptr, IDC_ARROW));
   if (completion_) completion_(std::move(result));
 }
 
 void CaptureOverlay::Cancel() {
+  if (scrollCapturing_) {
+    KillTimer(hwnd_, kScrollTimer);
+    scrollCapturing_ = false;
+    ResetScrollCaptureRegion();
+  }
   SuppressUnitDetection();
   CancelTextInput();
   OverlayResult result; result.completion = CaptureCompletion::Cancel;
@@ -2370,22 +2989,39 @@ void CaptureOverlay::DrawDocument() {
       }
     }
   }
+  // Faint hint shown at the text origin while the edit box is still empty.
+  const auto placeholderCommand = [&] {
+    TextSetting style = textInputStyle_;
+    style.opacity *= 0.35f;
+    style.shadow = false;
+    return TextCommand{textOrigin_, std::wstring(kTextPlaceholder), style};
+  };
   std::vector<EditCommand> commands;
-  commands.reserve(document_.Size() + (liveText.empty() ? 0u : 1u));
+  commands.reserve(document_.Size() + (textEdit_ ? 1u : 0u));
   for (size_t index = 0; index < document_.Size(); ++index) {
     const EditCommand* command = document_.At(index);
     if (!command) continue;
     if (textEditingCommand_ && *textEditingCommand_ == index) {
       if (!liveText.empty()) commands.emplace_back(TextCommand{textOrigin_, liveText, textInputStyle_});
+      else commands.emplace_back(placeholderCommand());
       continue;
     }
     commands.push_back(*command);
   }
-  if (textEdit_ && !textEditingCommand_ && !liveText.empty())
-    commands.emplace_back(TextCommand{textOrigin_, liveText, textInputStyle_});
+  if (textEdit_ && !textEditingCommand_) {
+    if (!liveText.empty()) commands.emplace_back(TextCommand{textOrigin_, liveText, textInputStyle_});
+    else commands.emplace_back(placeholderCommand());
+  }
   if (previewCommand_) commands.push_back(*previewCommand_);
   renderTarget_->PushAxisAlignedClip(ToD2D(selection_), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-  const bool mosaicLayerDrawn = DrawMosaicLayer(commands);
+  // Committed mosaics only: the in-flight stroke previews as a light overlay
+  // (same as the long-capture bar) and bakes into the layer on release.
+  std::vector<EditCommand> mosaicLayerCommands;
+  mosaicLayerCommands.reserve(document_.Size());
+  for (size_t index = 0; index < document_.Size(); ++index) {
+    if (const EditCommand* command = document_.At(index)) mosaicLayerCommands.push_back(*command);
+  }
+  const bool mosaicLayerDrawn = DrawMosaicLayer(mosaicLayerCommands);
   ComPtr<ID2D1StrokeStyle> roundStroke;
   if (d2dFactory_) {
     d2dFactory_->CreateStrokeStyle(
@@ -2439,7 +3075,9 @@ void CaptureOverlay::DrawDocument() {
       dot(index);
     }
   };
-  for (const auto& command : commands) {
+  const size_t committedCount = commands.size() - (previewCommand_ ? 1u : 0u);
+  for (size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
+    const EditCommand& command = commands[commandIndex];
     if (const auto* pen = std::get_if<PenCommand>(&command)) {
       drawPressurePath(*pen, ColorFromSetting(pen->style.color, pen->style.opacity));
     } else if (const auto* shape = std::get_if<ShapeCommand>(&command)) {
@@ -2471,21 +3109,25 @@ void CaptureOverlay::DrawDocument() {
     } else if (const auto* text = std::get_if<TextCommand>(&command)) {
       DrawTextCommand(*text);
     } else if (const auto* mosaic = std::get_if<MosaicCommand>(&command)) {
-      if (!mosaicLayerDrawn) {
+      // Committed mosaics live in the baked layer; the in-flight stroke (the
+      // trailing preview command) always previews as a light blue trace, same
+      // as the long-capture bar.
+      const bool inFlight = commandIndex >= committedCount;
+      if (inFlight || !mosaicLayerDrawn) {
         if (!mosaic->brush) {
           ComPtr<ID2D1SolidColorBrush> brush;
-          renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.2f, .75f, 1.0f, .22f), &brush);
+          renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.2f, .75f, 1.0f, .30f), &brush);
           renderTarget_->FillRectangle(D2D1::RectF(selection_.left + mosaic->bounds.left, selection_.top + mosaic->bounds.top,
                                                     selection_.left + mosaic->bounds.right, selection_.top + mosaic->bounds.bottom), brush.Get());
         } else {
-          drawRoundPath(mosaic->points, D2D1::ColorF(.2f, .75f, 1.0f, .22f), mosaic->brushSize);
+          drawRoundPath(mosaic->points, D2D1::ColorF(.2f, .75f, 1.0f, .30f), mosaic->brushSize);
         }
       }
     }
   }
   renderTarget_->PopAxisAlignedClip();
   if (selectedCommand_) DrawCommandHandles();
-  else if (tool_ == Tool::Select) DrawSelectionHandles();
+  else DrawSelectionHandles();
 }
 
 bool CaptureOverlay::DrawMosaicLayer(std::span<const EditCommand> commands) {
@@ -2608,6 +3250,30 @@ CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestSelectionAdjustment(P
   return Contains(selection_, point) ? SelectionAdjustment::Move : SelectionAdjustment::None;
 }
 
+CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestSelectionHandle(POINT point) const {
+  // Tighter bands than HitTestSelectionAdjustment: with a drawing tool active
+  // only the border itself and the visible handle squares switch to region
+  // adjustment, so the interior keeps its drawing behaviour.
+  constexpr int cornerRadius = 8;
+  constexpr int edgeRadius = 5;
+  const auto isNear = [&](int x, int y, int radius) {
+    return std::abs(point.x - x) <= radius && std::abs(point.y - y) <= radius;
+  };
+  if (isNear(selection_.left, selection_.top, cornerRadius)) return SelectionAdjustment::TopLeft;
+  if (isNear(selection_.right, selection_.top, cornerRadius)) return SelectionAdjustment::TopRight;
+  if (isNear(selection_.left, selection_.bottom, cornerRadius)) return SelectionAdjustment::BottomLeft;
+  if (isNear(selection_.right, selection_.bottom, cornerRadius)) return SelectionAdjustment::BottomRight;
+  if (std::abs(point.x - selection_.left) <= edgeRadius && point.y >= selection_.top && point.y <= selection_.bottom)
+    return SelectionAdjustment::Left;
+  if (std::abs(point.x - selection_.right) <= edgeRadius && point.y >= selection_.top && point.y <= selection_.bottom)
+    return SelectionAdjustment::Right;
+  if (std::abs(point.y - selection_.top) <= edgeRadius && point.x >= selection_.left && point.x <= selection_.right)
+    return SelectionAdjustment::Top;
+  if (std::abs(point.y - selection_.bottom) <= edgeRadius && point.x >= selection_.left && point.x <= selection_.right)
+    return SelectionAdjustment::Bottom;
+  return SelectionAdjustment::None;
+}
+
 std::optional<size_t> CaptureOverlay::HitTestCommand(POINT point,
                                                      std::optional<Tool> toolFilter) const {
   if (!Contains(selection_, point)) return std::nullopt;
@@ -2633,21 +3299,26 @@ CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestCommandAdjustment(POI
   const RectF bounds = SelectedCommandBounds();
   if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return SelectionAdjustment::None;
   const PointF local = ToSelectionPoint(point);
-  constexpr float radius = 9.0f;
-  const auto isNearCommand = [&](float x, float y) {
+  // Corners keep a generous grab area, but edge bands stay tight (and shrink
+  // with small annotations) so most of the interior still starts a move
+  // instead of an accidental resize.
+  const float minimum = std::min(bounds.right - bounds.left, bounds.bottom - bounds.top);
+  const float cornerRadius = std::clamp(minimum * 0.28f, 2.5f, 9.0f);
+  const float edgeRadius = std::clamp(minimum * 0.16f, 2.0f, 4.0f);
+  const auto isNearCommand = [&](float x, float y, float radius) {
     return std::abs(local.x - x) <= radius && std::abs(local.y - y) <= radius;
   };
-  if (isNearCommand(bounds.left, bounds.top)) return SelectionAdjustment::TopLeft;
-  if (isNearCommand(bounds.right, bounds.top)) return SelectionAdjustment::TopRight;
-  if (isNearCommand(bounds.left, bounds.bottom)) return SelectionAdjustment::BottomLeft;
-  if (isNearCommand(bounds.right, bounds.bottom)) return SelectionAdjustment::BottomRight;
-  if (std::abs(local.x - bounds.left) <= radius && local.y >= bounds.top && local.y <= bounds.bottom)
+  if (isNearCommand(bounds.left, bounds.top, cornerRadius)) return SelectionAdjustment::TopLeft;
+  if (isNearCommand(bounds.right, bounds.top, cornerRadius)) return SelectionAdjustment::TopRight;
+  if (isNearCommand(bounds.left, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomLeft;
+  if (isNearCommand(bounds.right, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomRight;
+  if (std::abs(local.x - bounds.left) <= edgeRadius && local.y >= bounds.top && local.y <= bounds.bottom)
     return SelectionAdjustment::Left;
-  if (std::abs(local.x - bounds.right) <= radius && local.y >= bounds.top && local.y <= bounds.bottom)
+  if (std::abs(local.x - bounds.right) <= edgeRadius && local.y >= bounds.top && local.y <= bounds.bottom)
     return SelectionAdjustment::Right;
-  if (std::abs(local.y - bounds.top) <= radius && local.x >= bounds.left && local.x <= bounds.right)
+  if (std::abs(local.y - bounds.top) <= edgeRadius && local.x >= bounds.left && local.x <= bounds.right)
     return SelectionAdjustment::Top;
-  if (std::abs(local.y - bounds.bottom) <= radius && local.x >= bounds.left && local.x <= bounds.right)
+  if (std::abs(local.y - bounds.bottom) <= edgeRadius && local.x >= bounds.left && local.x <= bounds.right)
     return SelectionAdjustment::Bottom;
   return Contains(bounds, local) ? SelectionAdjustment::Move : SelectionAdjustment::None;
 }
@@ -2783,70 +3454,66 @@ void CaptureOverlay::DrawCommandHandles() {
 }
 
 void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
+  // One color ramp for every bar icon: bright when selected, muted otherwise.
   const D2D1_COLOR_F color = active ? D2D1::ColorF(.98f, .99f, 1.0f, 1.0f)
-                                    : D2D1::ColorF(.72f, .78f, .88f, 1.0f);
+                                    : D2D1::ColorF(.74f, .80f, .90f, 1.0f);
   ComPtr<ID2D1SolidColorBrush> brush;
   renderTarget_->CreateSolidColorBrush(color, &brush);
-  const float cx = (rect.left + rect.right) * 0.5f;
-  const float cy = (rect.top + rect.bottom) * 0.5f;
-  const float left = static_cast<float>(rect.left);
-  const float top = static_cast<float>(rect.top);
-  const float right = static_cast<float>(rect.right);
-  const float bottom = static_cast<float>(rect.bottom);
-  const auto line = [&](D2D1_POINT_2F a, D2D1_POINT_2F b, float width = 2.2f) {
-    renderTarget_->DrawLine(a, b, brush.Get(), width);
-  };
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  // Every tool glyph lives on the shared 24x24 grid so the whole toolbar
+  // reads as one family: identical optical margins, stroke weights and caps.
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   switch (tool) {
     case Tool::Pen:
-      line({left + 9, bottom - 9}, {left + 12, bottom - 17}, 2.0f);
-      line({left + 12, bottom - 17}, {right - 13, top + 9}, 2.0f);
-      line({right - 13, top + 9}, {right - 8, top + 14}, 2.0f);
-      line({right - 8, top + 14}, {left + 17, bottom - 12}, 2.0f);
-      line({left + 17, bottom - 12}, {left + 9, bottom - 9}, 2.0f);
-      line({left + 13, bottom - 16}, {left + 18, bottom - 11}, 1.6f);
+      // Diagonal pencil: closed nib triangle plus a separator across the shaft.
+      pen.Line(5.5f, 18.5f, 16.4f, 4.4f, 1.9f);
+      pen.Line(16.4f, 4.4f, 19.6f, 7.6f, 1.9f);
+      pen.Line(19.6f, 7.6f, 5.5f, 18.5f, 1.9f);
+      pen.Line(7.4f, 13.4f, 10.6f, 16.6f, 1.4f);
       break;
     case Tool::Rectangle:
-      renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(left + 9, top + 9, right - 9, bottom - 9), 2, 2), brush.Get(), 2.2f);
+      pen.RoundedRect(5, 5, 19, 19, 2.5f, 1.8f);
       break;
     case Tool::Ellipse:
-      renderTarget_->DrawEllipse({{cx, cy}, 10.0f, 8.0f}, brush.Get(), 2.2f);
+      pen.Circle(12, 12, 7.2f, 1.8f);
       break;
     case Tool::Line:
-      line({left + 9, bottom - 10}, {right - 9, top + 10}, 2.4f);
+      pen.Line(5.2f, 18.8f, 18.8f, 5.2f, 2.0f);
       break;
     case Tool::Arrow:
-      line({left + 8, bottom - 9}, {right - 9, top + 9}, 2.4f);
-      line({right - 9, top + 9}, {right - 19, top + 11}, 2.4f);
-      line({right - 9, top + 9}, {right - 11, top + 19}, 2.4f);
+      // North-east arrow: shaft plus the two axis-aligned head arms.
+      pen.Line(6, 18, 17, 7, 2.0f);
+      pen.Line(9.6f, 7, 17, 7, 1.9f);
+      pen.Line(17, 7, 17, 14.4f, 1.9f);
       break;
     case Tool::Text:
-      DrawText(L"Aa", ToD2D(rect), 14, color);
+      DrawText(L"Aa", ToD2D(rect), 13.5f, color);
       break;
     case Tool::MosaicBrush:
-      renderTarget_->FillRectangle(D2D1::RectF(left + 8, top + 8, left + 13, top + 13), brush.Get());
-      renderTarget_->FillRectangle(D2D1::RectF(left + 14, top + 14, left + 19, top + 19), brush.Get());
-      renderTarget_->FillRectangle(D2D1::RectF(left + 20, top + 8, left + 25, top + 13), brush.Get());
-      line({left + 12, bottom - 9}, {right - 9, top + 15}, 3.5f);
-      renderTarget_->FillEllipse({{left + 11, bottom - 10}, 3.0f, 3.0f}, brush.Get());
+      pen.Dot(5.8f, 5.8f, 1.4f);
+      pen.Dot(10.8f, 5.8f, 1.4f);
+      pen.Dot(5.8f, 10.8f, 1.4f);
+      pen.Line(9.2f, 14.8f, 16.6f, 7.4f, 2.6f);
+      pen.Dot(7.6f, 16.4f, 1.9f);
       break;
     case Tool::MosaicRectangle:
-      renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(left + 7, top + 9, right - 7, bottom - 9), 2, 2), brush.Get(), 1.8f);
-      renderTarget_->FillRectangle(D2D1::RectF(left + 11, top + 13, left + 16, top + 18), brush.Get());
-      renderTarget_->FillRectangle(D2D1::RectF(left + 17, top + 19, left + 22, top + 24), brush.Get());
-      renderTarget_->FillRectangle(D2D1::RectF(left + 23, top + 13, left + 28, top + 18), brush.Get());
+      pen.RoundedRect(4.5f, 6.5f, 19.5f, 17.5f, 2.0f, 1.6f);
+      pen.Dot(9, 10.4f, 1.5f);
+      pen.Dot(14, 10.4f, 1.5f);
+      pen.Dot(9, 14, 1.5f);
+      pen.Dot(14, 14, 1.5f);
       break;
     case Tool::Select:
-      line({left + 10, top + 7}, {left + 17, bottom - 7}, 2.1f);
-      line({left + 10, top + 7}, {right - 8, top + 15}, 2.1f);
-      line({right - 8, top + 15}, {right - 18, top + 18}, 2.1f);
-      line({right - 18, top + 18}, {right - 11, bottom - 9}, 2.1f);
-      line({right - 11, bottom - 9}, {right - 16, bottom - 7}, 2.1f);
-      line({right - 18, top + 18}, {left + 17, bottom - 7}, 2.1f);
+      // Lasso cursor: the angular outline of a selection pointer.
+      pen.Line(6.7f, 4.7f, 11.3f, 19.3f, 1.6f);
+      pen.Line(6.7f, 4.7f, 18.7f, 10, 1.6f);
+      pen.Line(18.7f, 10, 12, 12, 1.6f);
+      pen.Line(12, 12, 16.7f, 18, 1.6f);
+      pen.Line(16.7f, 18, 13.3f, 19.3f, 1.6f);
+      pen.Line(12, 12, 12.7f, 19.3f, 1.6f);
       break;
     case Tool::Frame:
-      renderTarget_->DrawRectangle(D2D1::RectF(left + 8, top + 8, right - 8, bottom - 8), brush.Get(), 2.0f);
+      pen.RoundedRect(4.5f, 6, 19.5f, 18, 2.5f, 1.8f);
       break;
   }
 }
@@ -2854,24 +3521,21 @@ void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
 void CaptureOverlay::DrawActionIcon(bool save, const RECT& rect) {
   ComPtr<ID2D1SolidColorBrush> brush;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.94f, .98f, 1.0f, 1.0f), &brush);
-  const float left = static_cast<float>(rect.left);
-  const float top = static_cast<float>(rect.top);
-  const float right = static_cast<float>(rect.right);
-  const float bottom = static_cast<float>(rect.bottom);
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   if (!save) {
-    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-        D2D1::RectF(left + 15, top + 14, right - 9, bottom - 9), 2, 2), brush.Get(), 2.0f);
-    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-        D2D1::RectF(left + 9, top + 9, right - 15, bottom - 14), 2, 2), brush.Get(), 2.0f);
+    // Copy: two overlapping rounded sheets sharing the grid language.
+    pen.RoundedRect(8.5f, 4.5f, 19.5f, 15.5f, 2.0f, 1.7f);
+    pen.RoundedRect(4.5f, 8.5f, 15.5f, 19.5f, 2.0f, 1.7f);
     return;
   }
-  const float cx = (left + right) * .5f;
-  renderTarget_->DrawLine({cx, top + 8}, {cx, bottom - 14}, brush.Get(), 2.4f);
-  renderTarget_->DrawLine({cx, bottom - 14}, {cx - 6, bottom - 20}, brush.Get(), 2.4f);
-  renderTarget_->DrawLine({cx, bottom - 14}, {cx + 6, bottom - 20}, brush.Get(), 2.4f);
-  renderTarget_->DrawLine({left + 9, bottom - 10}, {left + 9, bottom - 6}, brush.Get(), 2.0f);
-  renderTarget_->DrawLine({left + 9, bottom - 6}, {right - 9, bottom - 6}, brush.Get(), 2.0f);
-  renderTarget_->DrawLine({right - 9, bottom - 6}, {right - 9, bottom - 10}, brush.Get(), 2.0f);
+  // Save: a down arrow dropping into an open tray.
+  pen.Line(12, 4.5f, 12, 13.4f, 1.9f);
+  pen.Line(8.8f, 10.4f, 12, 13.6f, 1.9f);
+  pen.Line(12, 13.6f, 15.2f, 10.4f, 1.9f);
+  pen.Line(4.5f, 14.5f, 4.5f, 18.5f, 1.7f);
+  pen.Line(4.5f, 18.5f, 19.5f, 18.5f, 1.7f);
+  pen.Line(19.5f, 18.5f, 19.5f, 14.5f, 1.7f);
 }
 
 void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
@@ -2879,72 +3543,86 @@ void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
   const D2D1_COLOR_F iconColor =
       action == PropertyAction::TextShadow && ActiveTextStyle()->shadow
           ? D2D1::ColorF(.36f, .67f, 1.0f, 1.0f)
-          : D2D1::ColorF(.76f, .83f, .94f, 1.0f);
+          : D2D1::ColorF(.74f, .80f, .90f, 1.0f);
   renderTarget_->CreateSolidColorBrush(iconColor, &brush);
-  const float left = static_cast<float>(rect.left);
-  const float top = static_cast<float>(rect.top);
-  const float right = static_cast<float>(rect.right);
-  const float bottom = static_cast<float>(rect.bottom);
-  const float cx = (left + right) * .5f;
-  const float cy = (top + bottom) * .5f;
-  const auto line = [&](D2D1_POINT_2F a, D2D1_POINT_2F b, float width = 2.0f) {
-    renderTarget_->DrawLine(a, b, brush.Get(), width);
-  };
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   switch (action) {
     case PropertyAction::SizeDown:
-      line({left + 12, cy}, {right - 12, cy});
+      pen.Line(6.5f, 12, 17.5f, 12);
       break;
     case PropertyAction::SizeUp:
-      line({left + 12, cy}, {right - 12, cy});
-      line({cx, top + 11}, {cx, bottom - 11});
+      pen.Line(6.5f, 12, 17.5f, 12);
+      pen.Line(12, 6.5f, 12, 17.5f);
       break;
     case PropertyAction::Color:
-      renderTarget_->FillEllipse({{cx, cy}, 8, 8}, brush.Get());
-      renderTarget_->DrawEllipse({{cx, cy}, 10, 10}, brush.Get(), 1.5f);
+      pen.Dot(12, 12, 6.2f);
+      pen.Circle(12, 12, 8.4f, 1.4f);
       break;
     case PropertyAction::Opacity:
-      renderTarget_->DrawEllipse({{cx, cy}, 9, 9}, brush.Get(), 2.0f);
-      line({left + 10, bottom - 11}, {right - 10, top + 11}, 2.0f);
+      pen.Circle(12, 12, 7.4f);
+      pen.Line(7, 17, 17, 7, 1.5f);
       break;
     case PropertyAction::FillColor:
-      renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(left + 10, top + 10, right - 10, bottom - 10), 2, 2), brush.Get());
+      renderTarget_->FillRoundedRectangle(
+          D2D1::RoundedRect(D2D1::RectF(pen.grid.ox + 6 * pen.grid.unit,
+                                        pen.grid.oy + 6 * pen.grid.unit,
+                                        pen.grid.ox + 18 * pen.grid.unit,
+                                        pen.grid.oy + 18 * pen.grid.unit),
+                            pen.Weight(2), pen.Weight(2)),
+          brush.Get());
       break;
     case PropertyAction::FillOpacity:
-      renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(left + 10, top + 10, right - 10, bottom - 10), 2, 2), brush.Get(), 2.0f);
-      line({left + 11, bottom - 11}, {right - 11, top + 11}, 1.7f);
+      pen.RoundedRect(6, 6, 18, 18, 2);
+      pen.Line(7.5f, 16.5f, 16.5f, 7.5f, 1.4f);
       break;
     case PropertyAction::FillToggle:
-      renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(
-          D2D1::RectF(left + 8, top + 10, right - 8, bottom - 10), 6, 6), brush.Get(), 1.8f);
+      pen.RoundedRect(5, 8.5f, 19, 15.5f, 3.5f, 1.6f);
       break;
     case PropertyAction::MosaicStyle:
-      for (int i = 0; i < 3; ++i) {
-        line({left + 10.0f + i * 6.0f, top + 10}, {left + 10.0f + i * 6.0f, bottom - 10}, 1.5f);
-        line({left + 10, top + 10.0f + i * 6.0f}, {right - 10, top + 10.0f + i * 6.0f}, 1.5f);
-      }
+      pen.Line(9, 5.5f, 9, 18.5f, 1.4f);
+      pen.Line(15, 5.5f, 15, 18.5f, 1.4f);
+      pen.Line(5.5f, 9, 18.5f, 9, 1.4f);
+      pen.Line(5.5f, 15, 18.5f, 15, 1.4f);
       break;
     case PropertyAction::MosaicStrength:
-      line({left + 11, cy}, {right - 11, cy});
+      pen.Line(6, 12, 18, 12, 1.6f);
+      pen.Dot(12, 12, 2.2f);
       break;
     case PropertyAction::FrameToggle:
-      renderTarget_->DrawRectangle(D2D1::RectF(left + 9, top + 9, right - 9, bottom - 9), brush.Get(), 2.0f);
+      pen.RoundedRect(5.5f, 6.5f, 18.5f, 17.5f, 2.0f, 1.7f);
       break;
     case PropertyAction::TextOrientation:
       DrawText(L"T", ToD2D(rect), 15, iconColor);
       break;
     case PropertyAction::TextShadow:
-      DrawText(L"T", D2D1::RectF(left + 4, top + 4, right + 4, bottom + 4), 13,
-               D2D1::ColorF(.05f, .08f, .12f, .85f));
+      DrawText(L"T",
+               D2D1::RectF(static_cast<float>(rect.left + 4), static_cast<float>(rect.top + 4),
+                           static_cast<float>(rect.right + 4), static_cast<float>(rect.bottom + 4)),
+               13, D2D1::ColorF(.05f, .08f, .12f, .85f));
       DrawText(L"T", ToD2D(rect), 13, iconColor);
       break;
   }
 }
 
+// Burst sessions drop the long-capture entry, so the normal bar shrinks by
+// exactly one tool slot; every consumer derives from this single width.
+int CaptureOverlay::ToolbarNormalWidth() const {
+  return kToolbarWidth - (IsBurstSession() ? kToolbarToolGap + kToolbarToolSize : 0);
+}
+
+// The bar's width in the current mode: the normal editing bar, the compact
+// long-capture bar, or the two-column long-review palette.
+int CaptureOverlay::ToolbarCurrentWidth() const {
+  return longPreview_ ? kLongBarWidth
+                      : longCaptureMode_ ? kToolbarLongWidth : ToolbarNormalWidth();
+}
+
 RECT CaptureOverlay::ToolbarRect() const {
-  const int requestedWidth = kToolbarWidth;
-  const int requestedHeight = tool_ == Tool::Select ? kToolbarSelectHeight : kToolbarEditHeight;
+  const int requestedWidth = ToolbarCurrentWidth();
+  const int requestedHeight = longPreview_ ? kLongBarHeight
+                              : longCaptureMode_ ? kToolbarSelectHeight
+                              : tool_ == Tool::Select ? kToolbarSelectHeight : kToolbarEditHeight;
   RECT work = ToolbarWorkArea();
   const int workWidth = std::max(1, static_cast<int>(work.right - work.left));
   const int workHeight = std::max(1, static_cast<int>(work.bottom - work.top));
@@ -2987,7 +3665,8 @@ RECT CaptureOverlay::ToolbarRect() const {
 RECT CaptureOverlay::ToolbarWorkArea() const {
   POINT anchor{};
   if (toolbarPositionSet_) {
-    anchor = {toolbarPosition_.x + kToolbarWidth / 2, toolbarPosition_.y + kToolbarSelectHeight / 2};
+    anchor = {toolbarPosition_.x + ToolbarCurrentWidth() / 2,
+              toolbarPosition_.y + kToolbarSelectHeight / 2};
   } else if (HasArea(selection_)) {
     anchor = {(selection_.left + selection_.right) / 2, (selection_.top + selection_.bottom) / 2};
   } else {
@@ -3012,21 +3691,136 @@ RECT CaptureOverlay::ToolbarToolRect(size_t index) const {
   const RECT toolbar = ToolbarRect();
   const int x = toolbar.left + kToolbarMargin +
                 static_cast<int>(index) * (kToolbarToolSize + kToolbarToolGap);
-  return {x, toolbar.top + kToolbarMargin, x + kToolbarToolSize,
-          toolbar.top + kToolbarMargin + kToolbarToolSize};
+  return {x, toolbar.top + kBarUtilityStrip + kToolbarMargin, x + kToolbarToolSize,
+          toolbar.top + kBarUtilityStrip + kToolbarMargin + kToolbarToolSize};
 }
 
 RECT CaptureOverlay::ToolbarCopyRect() const {
+  if (longPreview_) return LongBarActionRect(0);
   const RECT toolbar = ToolbarRect();
   const int x = toolbar.right - kToolbarMargin - kToolbarActionSize * 2 - kToolbarToolGap;
-  return {x, toolbar.top + kToolbarMargin, x + kToolbarActionSize,
-          toolbar.top + kToolbarMargin + kToolbarToolSize};
+  return {x, toolbar.top + kBarUtilityStrip + kToolbarMargin, x + kToolbarActionSize,
+          toolbar.top + kBarUtilityStrip + kToolbarMargin + kToolbarToolSize};
 }
 
 RECT CaptureOverlay::ToolbarSaveRect() const {
+  if (longPreview_) return LongBarActionRect(1);
   const RECT copy = ToolbarCopyRect();
   return {copy.right + kToolbarToolGap, copy.top,
           copy.right + kToolbarToolGap + kToolbarActionSize, copy.bottom};
+}
+
+// --- Utility buttons (gray back / red close) --------------------------------
+// Every bar except the capturing bar carries the same half-cell pair in a
+// dedicated strip along its top edge.  They are drawn last and hit-tested
+// first, so they always sit on their own topmost layer of the bar.
+
+RECT CaptureOverlay::UtilityCloseRect() const {
+  const RECT toolbar = ToolbarRect();
+  return {toolbar.right - kUtilityEdge - kUtilityButtonSize, toolbar.top + 4,
+          toolbar.right - kUtilityEdge, toolbar.top + 4 + kUtilityButtonSize};
+}
+
+RECT CaptureOverlay::UtilityBackRect() const {
+  const RECT close = UtilityCloseRect();
+  return {close.left - kUtilityButtonGap - kUtilityButtonSize, close.top,
+          close.left - kUtilityButtonGap, close.top + kUtilityButtonSize};
+}
+
+// The capturing bar keeps its own finish/cancel pair and never shows the
+// generic utility buttons; the pre-selection stage has no bar at all.
+bool CaptureOverlay::UtilityButtonsVisible() const {
+  return !scrollCapturing_ && (editing_ || longPreview_ || longCaptureMode_);
+}
+
+bool CaptureOverlay::HitUtilityBack(POINT point) const {
+  return UtilityButtonsVisible() && Contains(UtilityBackRect(), point);
+}
+
+bool CaptureOverlay::HitUtilityClose(POINT point) const {
+  return UtilityButtonsVisible() && Contains(UtilityCloseRect(), point);
+}
+
+// "Back" mirrors the Escape ladder of the visible bar: the review window
+// steps back to the view / direction bar, the direction bar returns to the
+// editing bar and the editing bar returns to region selection.
+void CaptureOverlay::UtilityBack() {
+  if (longPreview_) {
+    if (longPreviewStage_ == LongPreviewStage::Crop ||
+        longPreviewStage_ == LongPreviewStage::Annotate) {
+      previewCommand_.reset();
+      longPreviewDrag_ = LongPreviewDrag::None;
+      BeginLongPreviewStage(LongPreviewStage::View);
+    } else {
+      ExitLongPreviewToBar();
+    }
+    return;
+  }
+  if (longCaptureMode_) {
+    ExitLongCaptureMode();
+    return;
+  }
+  if (editing_) ReturnToSelection();
+}
+
+void CaptureOverlay::DrawBarUtilityButtons(float alpha) {
+  if (!UtilityButtonsVisible()) return;
+  const RECT back = UtilityBackRect();
+  const RECT close = UtilityCloseRect();
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  ScreenToClient(hwnd_, &cursor);
+  const bool backHover = PtInRect(&back, cursor) != FALSE;
+  const bool closeHover = PtInRect(&close, cursor) != FALSE;
+  ComPtr<ID2D1SolidColorBrush> grayDisc, redDisc, glyph;
+  renderTarget_->CreateSolidColorBrush(
+      D2D1::ColorF(backHover ? .55f : .42f, backHover ? .61f : .48f,
+                   backHover ? .72f : .58f, .96f * alpha),
+      &grayDisc);
+  renderTarget_->CreateSolidColorBrush(
+      D2D1::ColorF(backHover ? .95f : .87f, closeHover ? .38f : .30f,
+                   closeHover ? .40f : .32f, .96f * alpha),
+      &redDisc);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, .96f * alpha), &glyph);
+  if (!grayDisc || !redDisc || !glyph) return;
+  const auto drawDisc = [&](const RECT& rect, ID2D1SolidColorBrush* fill) {
+    const D2D1_POINT_2F center{(rect.left + rect.right) * 0.5f, (rect.top + rect.bottom) * 0.5f};
+    renderTarget_->FillEllipse({center, kUtilityButtonSize * 0.5f, kUtilityButtonSize * 0.5f}, fill);
+  };
+  const auto drawGlyph = [&](const RECT& rect, bool closeIcon) {
+    const IconGrid grid = IconGrid::For(ToD2D(rect));
+    // The stroke style must outlive the deferred DrawLine calls, so it is a
+    // named local here -- a temporary ComPtr would be destroyed right after
+    // the pen is built, leaving a dangling style pointer.
+    const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+    const GlyphPen pen{renderTarget_.Get(), glyph.Get(), rounded.Get(), grid};
+    if (closeIcon) {
+      pen.Line(8, 8, 16, 16, 1.9f);
+      pen.Line(16, 8, 8, 16, 1.9f);
+    } else {
+      pen.Line(16.5f, 12, 7.5f, 12, 1.8f);
+      pen.Line(11.5f, 7, 7.5f, 12, 1.8f);
+      pen.Line(7.5f, 12, 11.5f, 17, 1.8f);
+    }
+  };
+  drawDisc(back, grayDisc.Get());
+  drawGlyph(back, false);
+  drawDisc(close, redDisc.Get());
+  drawGlyph(close, true);
+}
+
+// Bottom-right cells of the two-row long-review palette: copy (cancel while a
+// crop is pending) then save (apply crop) follow the last tool button on the
+// final row.
+RECT CaptureOverlay::LongBarActionRect(int column) const {
+  const RECT toolbar = ToolbarRect();
+  const int toolCount = static_cast<int>(kLongPreviewTools.size()) + 1;  // crop + tools
+  const int lastRow = (toolCount - 1) / kLongBarButtonsPerRow;
+  const int filledOnLastRow = toolCount - lastRow * kLongBarButtonsPerRow;
+  const int left =
+      toolbar.left + 12 + (filledOnLastRow + column) * (kLongPreviewToolSize + kLongPreviewToolGap);
+  const int top = toolbar.top + kBarUtilityStrip + 12 + lastRow * (kLongPreviewToolSize + kLongPreviewToolGap);
+  return {left, top, left + kLongPreviewToolSize, top + kLongPreviewToolSize};
 }
 
 RECT CaptureOverlay::ToolbarMoreColorRect() const {
@@ -3100,6 +3894,14 @@ void CaptureOverlay::DrawToolbar() {
   }
   renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(toolbar), 12, 12), background.Get());
   if (useToolbarMask) renderTarget_->PopLayer();
+  if (longCaptureMode_) {
+    if (scrollCapturing_) DrawCapturingBar(toolbar);
+    else {
+      DrawLongCaptureBar(toolbar);
+      DrawBarUtilityButtons();
+    }
+    return;
+  }
   const auto drawPalette = [&](const RECT& rect) {
     if (!HasArea(rect, 2)) return;
     const std::array<D2D1_COLOR_F, 6> colors{{
@@ -3136,8 +3938,10 @@ void CaptureOverlay::DrawToolbar() {
   const RECT save = ToolbarSaveRect();
   ComPtr<ID2D1SolidColorBrush> separator;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.27f, .34f, .45f, .85f), &separator);
-  renderTarget_->DrawLine({static_cast<float>(copy.left - 10), static_cast<float>(toolbar.top + 10)},
-                          {static_cast<float>(copy.left - 10), static_cast<float>(toolbar.top + 44)},
+  renderTarget_->DrawLine({static_cast<float>(copy.left - 10),
+                           static_cast<float>(toolbar.top + kBarUtilityStrip + 10)},
+                          {static_cast<float>(copy.left - 10),
+                           static_cast<float>(toolbar.top + kBarUtilityStrip + 44)},
                           separator.Get(), 1.0f);
   ComPtr<ID2D1SolidColorBrush> copyBackground, saveBackground;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.10f, .33f, .25f, .98f), &copyBackground);
@@ -3146,6 +3950,12 @@ void CaptureOverlay::DrawToolbar() {
   renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(save), 9, 9), saveBackground.Get());
   DrawActionIcon(false, copy);
   DrawActionIcon(true, save);
+  if (!IsBurstSession()) {
+    // Burst captures never show the long-capture entry (see HitLongEntry).
+    const RECT longEntry = ToolbarLongEntryRect();
+    DrawRainbowPanel(ToD2D(longEntry), 9.0f);
+    DrawLongCaptureGlyph(ToD2D(longEntry));
+  }
 
   if (HasSizeControl()) {
     const RECT slider = SizeSliderRect();
@@ -3176,7 +3986,7 @@ void CaptureOverlay::DrawToolbar() {
                                      (swatch.top + swatch.bottom) / 2.0f}, 8, 8}, colorBrush.Get());
         if ((ActiveColor()->rgba & 0xFFFFFF00u) == (kPresetColors[i] & 0xFFFFFF00u))
           renderTarget_->DrawEllipse({{(swatch.left + swatch.right) / 2.0f,
-                                       (swatch.top + swatch.bottom) / 2.0f}, 9, 9}, outline.Get(), 2);
+                                         (swatch.top + swatch.bottom) / 2.0f}, 9, 9}, outline.Get(), 2);
       }
     }
   }
@@ -3259,12 +4069,2310 @@ void CaptureOverlay::DrawToolbar() {
       DrawPropertyIcon(button.action, button.rect);
     }
   }
+  // Utility layer last: nothing in the bar may cover the back/close pair.
+  DrawBarUtilityButtons();
+}
+
+RECT CaptureOverlay::ToolbarLongEntryRect() const {
+  const RECT copy = ToolbarCopyRect();
+  const int x = copy.left - kToolbarToolGap - kToolbarToolSize;
+  return {x, copy.top, x + kToolbarToolSize, copy.bottom};
+}
+
+RECT CaptureOverlay::ToolbarLongUpRect() const {
+  const RECT toolbar = ToolbarRect();
+  return {toolbar.left + kToolbarMargin, toolbar.top + kBarUtilityStrip + 9,
+          toolbar.left + kToolbarMargin + kToolbarToolSize,
+          toolbar.top + kBarUtilityStrip + 9 + kToolbarToolSize};
+}
+
+RECT CaptureOverlay::ToolbarLongRightRect() const {
+  const RECT up = ToolbarLongUpRect();
+  return {up.right + 10, up.top, up.right + 10 + kToolbarToolSize, up.bottom};
+}
+
+RECT CaptureOverlay::ToolbarLongDownRect() const {
+  const RECT right = ToolbarLongRightRect();
+  return {right.right + 10, right.top, right.right + 10 + kToolbarLongWide, right.bottom};
+}
+
+RECT CaptureOverlay::ToolbarLongFinishRect() const {
+  const RECT toolbar = ToolbarRect();
+  return {toolbar.left + kToolbarMargin, toolbar.top + kBarUtilityStrip + 9,
+          toolbar.left + kToolbarMargin + kToolbarLongFinish,
+          toolbar.top + kBarUtilityStrip + 9 + kToolbarToolSize};
+}
+
+RECT CaptureOverlay::ToolbarLongCancelRect() const {
+  const RECT finish = ToolbarLongFinishRect();
+  return {finish.right + 10, finish.top, finish.right + 10 + kToolbarToolSize, finish.bottom};
+}
+
+bool CaptureOverlay::HitLongEntry(POINT point) const {
+  return !longCaptureMode_ && !IsBurstSession() && Contains(ToolbarLongEntryRect(), point);
+}
+
+// Burst captures hold several frames: stitching the visible frame alone would
+// silently drop the others, so the long-capture entry is removed entirely.
+bool CaptureOverlay::IsBurstSession() const { return snapshots_.size() > 1; }
+
+bool CaptureOverlay::HitLongDirection(ScrollDirection direction, POINT point) const {
+  if (!longCaptureMode_ || scrollCapturing_) return false;
+  switch (direction) {
+    case ScrollDirection::Up: return Contains(ToolbarLongUpRect(), point);
+    case ScrollDirection::Right: return Contains(ToolbarLongRightRect(), point);
+    case ScrollDirection::Down: return Contains(ToolbarLongDownRect(), point);
+  }
+  return false;
+}
+
+bool CaptureOverlay::HitLongFinish(POINT point) const {
+  return longCaptureMode_ && scrollCapturing_ && Contains(ToolbarLongFinishRect(), point);
+}
+
+bool CaptureOverlay::HitLongCancel(POINT point) const {
+  return longCaptureMode_ && scrollCapturing_ && Contains(ToolbarLongCancelRect(), point);
+}
+
+void CaptureOverlay::EnterLongCaptureMode() {
+  if (scrollCapturing_ || IsBurstSession()) return;
+  if (textEdit_) CommitTextInput();
+  longCaptureMode_ = true;
+  selectedCommand_.reset();
+  previewCommand_.reset();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::ExitLongCaptureMode() {
+  if (scrollCapturing_) return;
+  longCaptureMode_ = false;
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// Primary panel for the main-bar long-capture entry.  Flat neutral fill so the
+// entry reads as one family with the other bar buttons: long-capture controls
+// carry no highlight, matching every other icon in the toolbar.
+void CaptureOverlay::DrawRainbowPanel(const D2D1_RECT_F& rect, float radius) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> fill, outline;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.11f, .14f, .19f, .96f), &fill);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.29f, .36f, .46f, .80f), &outline);
+  if (!fill || !outline) return;
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), fill.Get());
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
+}
+
+// Primary-action panel for the long-capture direction/finish buttons: the same
+// flat neutral family as the toolbar entry and the tool buttons, so the whole
+// control set reads consistently with no per-button highlight.
+void CaptureOverlay::DrawAccentPanel(const D2D1_RECT_F& rect, float radius) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> fill, outline;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.11f, .14f, .19f, .96f), &fill);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.29f, .36f, .46f, .80f), &outline);
+  if (!fill || !outline) return;
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), fill.Get());
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
+}
+
+// Neutral dark companion to DrawAccentPanel, for the non-primary buttons of the
+// long-capture bars: the same quiet graphite fill as the tool buttons, flat and
+// gloss-free with a subtle outline.
+void CaptureOverlay::DrawNeutralPanel(const D2D1_RECT_F& rect, float radius) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> fill, outline;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.11f, .14f, .19f, .96f), &fill);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.29f, .36f, .46f, .80f), &outline);
+  if (!fill || !outline) return;
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), fill.Get());
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
+}
+
+// White glyph shared by the rainbow toolbar entry and the primary capture
+// buttons.  The design lives in assets/scroll-capture-icon.svg (24x24 grid)
+// and is scaled proportionally into the target rect: a rounded content page
+// whose text lines taper away, a bold rounded down arrow beside it and an
+// open output tray underneath marking the stitched result.
+void CaptureOverlay::DrawLongCaptureGlyph(const D2D1_RECT_F& rect) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> white;
+  if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
+  // The stroke style must outlive the deferred draw calls below, so it is a
+  // named local: a temporary ComPtr would leave the pen holding a freed style.
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  // Content page with tapering text lines.
+  pen.RoundedRect(5, 3.5f, 15, 16.5f, 2.0f, 1.5f);
+  pen.Line(7, 6.8f, 13, 6.8f, 1.4f);
+  pen.Line(7, 9.6f, 11.2f, 9.6f, 1.4f);
+  pen.Line(7, 12.4f, 9.5f, 12.4f, 1.4f);
+  // Bold rounded chevron beside the page (shaftless, like the bar buttons).
+  pen.Line(14.75f, 8.75f, 18, 12, 1.9f);
+  pen.Line(18, 12, 21.25f, 8.75f, 1.9f);
+  // Output tray: a baseline with raised ends.
+  pen.Line(4.5f, 19.25f, 19.5f, 19.25f, 1.5f);
+  pen.Line(4.5f, 17.75f, 4.5f, 19.25f, 1.5f);
+  pen.Line(19.5f, 17.75f, 19.5f, 19.25f, 1.5f);
+}
+
+// Direction chevrons for the three scroll buttons: a bold open ">"-style
+// wedge without a shaft, centered on the shared 24x24 design grid.
+void CaptureOverlay::DrawScrollDirectionGlyph(ScrollDirection direction, const D2D1_RECT_F& rect) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> white;
+  if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  switch (direction) {
+    case ScrollDirection::Up:
+      pen.Line(6.5f, 14.25f, 12, 8.5f, 2.3f);
+      pen.Line(12, 8.5f, 17.5f, 14.25f, 2.3f);
+      break;
+    case ScrollDirection::Right:
+      pen.Line(9.75f, 6.5f, 15.5f, 12, 2.3f);
+      pen.Line(15.5f, 12, 9.75f, 17.5f, 2.3f);
+      break;
+    case ScrollDirection::Down:
+      pen.Line(6.5f, 9.75f, 12, 15.5f, 2.3f);
+      pen.Line(12, 15.5f, 17.5f, 9.75f, 2.3f);
+      break;
+  }
+}
+
+// Glyphs for the capturing bar: a bold rounded checkmark (finish) and a bold
+// rounded cross (cancel) on the shared grid.
+void CaptureOverlay::DrawLongActionGlyph(bool finish, const D2D1_RECT_F& rect) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> white;
+  if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  if (finish) {
+    pen.Line(6.75f, 12.75f, 10.25f, 16.25f, 2.3f);
+    pen.Line(10.25f, 16.25f, 17.5f, 7.75f, 2.3f);
+  } else {
+    pen.Line(8, 8, 16, 16, 2.3f);
+    pen.Line(16, 8, 8, 16, 2.3f);
+  }
+}
+
+// Small white glyphs for the long-review bar, on the same 24x24 grid and
+// stroke language as the capture bar.  Kind: 0 crop, 1 check, 2 cross.
+void CaptureOverlay::DrawLongPreviewGlyph(int kind, const D2D1_RECT_F& rect) {
+  const float width = rect.right - rect.left;
+  const float height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  ComPtr<ID2D1SolidColorBrush> white;
+  if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
+  const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  switch (kind) {
+    case 0:  // crop: the classic double-elbow mark
+      pen.Line(8.5f, 5.5f, 8.5f, 15.5f, 1.7f);
+      pen.Line(8.5f, 15.5f, 18.5f, 15.5f, 1.7f);
+      pen.Line(5.5f, 8.5f, 15.5f, 8.5f, 1.7f);
+      pen.Line(15.5f, 8.5f, 15.5f, 18.5f, 1.7f);
+      break;
+    case 1:  // check
+      pen.Line(7, 12.5f, 10.5f, 16, 2.1f);
+      pen.Line(10.5f, 16, 17.25f, 7.75f, 2.1f);
+      break;
+    default:  // cross
+      pen.Line(8.25f, 8.25f, 15.75f, 15.75f, 2.1f);
+      pen.Line(15.75f, 8.25f, 8.25f, 15.75f, 2.1f);
+      break;
+  }
+}
+
+void CaptureOverlay::DrawLongCaptureBar(const RECT& toolbar) {
+  // Three direction buttons: two squares and a 1.5x-wide primary (down).
+  // Neutral dark buttons for up/right; the primary takes the blue accent --
+  // the rainbow is reserved for the main-bar long-capture entry alone.
+  const RECT up = ToolbarLongUpRect();
+  const RECT right = ToolbarLongRightRect();
+  const RECT down = ToolbarLongDownRect();
+  DrawNeutralPanel(ToD2D(up), 9.0f);
+  DrawNeutralPanel(ToD2D(right), 9.0f);
+  DrawAccentPanel(ToD2D(down), 9.0f);
+  DrawScrollDirectionGlyph(ScrollDirection::Up, ToD2D(up));
+  DrawScrollDirectionGlyph(ScrollDirection::Right, ToD2D(right));
+  DrawScrollDirectionGlyph(ScrollDirection::Down, ToD2D(down));
+  DrawText(L"选择滚动方向 · Esc 返回",
+           D2D1::RectF(static_cast<float>(down.right + 10), static_cast<float>(toolbar.top),
+                       static_cast<float>(toolbar.right - 10), static_cast<float>(toolbar.bottom)),
+           11.5f, D2D1::ColorF(.62f, .68f, .78f, 1), DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+void CaptureOverlay::DrawCapturingBar(const RECT& toolbar) {
+  // While capturing: a 2x-wide accent finish pill plus a square cancel.
+  const RECT finish = ToolbarLongFinishRect();
+  const RECT cancel = ToolbarLongCancelRect();
+  DrawNeutralPanel(ToD2D(cancel), 9.0f);
+  DrawAccentPanel(ToD2D(finish), 9.0f);
+  DrawLongActionGlyph(true, ToD2D(finish));
+  DrawLongActionGlyph(false, ToD2D(cancel));
+  const wchar_t* hint = scrollEnded_ ? L"已到底部 · Enter 完成 · Esc 取消"
+                                     : L"Enter 完成 · Esc 取消";
+  DrawText(hint,
+           D2D1::RectF(static_cast<float>(cancel.right + 10), static_cast<float>(toolbar.top),
+                       static_cast<float>(toolbar.right - 10), static_cast<float>(toolbar.bottom)),
+           11.5f, D2D1::ColorF(.62f, .68f, .78f, 1), DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+void CaptureOverlay::BeginScrollCapture(ScrollDirection direction) {
+  if (scrollCapturing_ || !HasArea(selection_)) return;
+  const int frameWidth = selection_.right - selection_.left;
+  const int frameHeight = selection_.bottom - selection_.top;
+  if (frameWidth < kScrollMinFrameWidth || frameHeight < kScrollMinFrameHeight) return;
+  if (textEdit_) CommitTextInput();
+  selectedCommand_.reset();
+  previewCommand_.reset();
+
+  scrollDirection_ = direction;
+  // Returning from the preview parks the stitched pixels so "another pass"
+  // appends to the same buffer; a fresh capture or a direction switch (the
+  // parked width would no longer match the frame) starts over.
+  const bool resume = longResumePending_ && !scrollPixels_.empty() &&
+                      scrollWidth_ == frameWidth && scrollStride_ == frameWidth * 4;
+  longResumePending_ = false;
+  if (!resume) {
+    scrollWidth_ = frameWidth;
+    scrollStride_ = frameWidth * 4;
+    scrollHeight_ = 0;
+    scrollPixels_.clear();
+    scrollPreviewBitmap_.Reset();
+    scrollPreviewWidth_ = 0;
+    scrollPreviewHeight_ = 0;
+    scrollPreviewOffset_ = 0;
+  }
+  scrollEnded_ = false;
+  scrollStuckCount_ = 0;
+  scrollLastShift_ = 0;
+  scrollSettleWaits_ = 0;
+  scrollSettleDisabled_ = false;
+  // Growth cap along the stitching axis: rows for vertical captures, columns
+  // for rightward ones, bounded by both a row/column count and a byte budget.
+  const int bytesPerUnit = (direction == ScrollDirection::Right ? frameHeight : frameWidth) * 4;
+  scrollMaxRows_ = static_cast<int>(std::min<long long>(
+      kScrollMaxRows, static_cast<long long>(kScrollMaxBytes / std::max(1, bytesPerUnit))));
+  scrollRegion_ = {selection_.left + snapshot_.virtualBounds.left,
+                   selection_.top + snapshot_.virtualBounds.top,
+                   selection_.right + snapshot_.virtualBounds.left,
+                   selection_.bottom + snapshot_.virtualBounds.top};
+  // Frame zero comes from the frozen snapshot, which matches the screen at
+  // capture time; later frames are grabbed live from the desktop.  A resumed
+  // pass already holds it as the parked head/tail of the stitched buffer.
+  if (!resume) {
+    AppendScrollRows(snapshot_.bgra.data() + static_cast<size_t>(selection_.top) * snapshot_.bgraStride +
+                         static_cast<size_t>(selection_.left) * 4,
+                     frameHeight, snapshot_.bgraStride);
+  }
+
+  // Keep the bar out of the live capture area: everything inside the selection
+  // becomes a hole in the overlay window (see ApplyScrollCaptureRegion), so a
+  // toolbar parked over the selection would vanish and be stitched into the
+  // image.  Reset to automatic placement when it overlaps.
+  RECT overlap{};
+  const RECT toolbarRect = ToolbarRect();
+  if (IntersectRect(&overlap, &toolbarRect, &selection_)) toolbarPositionSet_ = false;
+
+  // The overlay keeps its fullscreen shape and never touches the mouse: the
+  // selection is cut out of the window region so the live page shows through,
+  // stays directly clickable/scrollable by the user, and can be captured via
+  // BitBlt; the bar stays visible and a thumbnail preview grows beside the
+  // selection.
+  scrollCapturing_ = true;
+  ApplyScrollCaptureRegion();
+  SetFocus(hwnd_);
+
+  scrollLastStep_ = std::chrono::steady_clock::now();
+  SetTimer(hwnd_, kScrollTimer, kScrollTickMs, nullptr);
+  // Wheel once immediately: otherwise the very first step captures a page that
+  // has not moved yet and is spent waiting for a scroll that never happened.
+  SendScrollWheel();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// Cut the selection out of the overlay window: the live page beneath shows
+// through the hole, receives real mouse input, and CaptureScreenRegion grabs
+// it instead of the frozen snapshot painted elsewhere.
+void CaptureOverlay::ApplyScrollCaptureRegion() {
+  if (!hwnd_ || !HasArea(selection_)) return;
+  HRGN whole = CreateRectRgn(0, 0, snapshot_.width, snapshot_.height);
+  HRGN hole = CreateRectRgn(selection_.left, selection_.top, selection_.right, selection_.bottom);
+  CombineRgn(whole, whole, hole, RGN_DIFF);
+  DeleteObject(hole);
+  if (!SetWindowRgn(hwnd_, whole, TRUE)) DeleteObject(whole);
+}
+
+void CaptureOverlay::ResetScrollCaptureRegion() {
+  if (hwnd_) SetWindowRgn(hwnd_, nullptr, TRUE);
+}
+
+void CaptureOverlay::ScrollTick() {
+  if (!scrollCapturing_ || scrollEnded_) return;
+  const auto now = std::chrono::steady_clock::now();
+  // scrollSpeed acts as a pacing factor: 1.0 keeps the original cadence,
+  // 0.5 doubles the wait between steps, 2.0 halves it.  The base value is
+  // the historical default (kScrollStepMs) so the user-visible behaviour
+  // degrades gracefully if the config field is missing.
+  const float speed = std::clamp(config_.scrollSpeed, 0.1f, 4.0f);
+  const UINT stepMs = static_cast<UINT>(std::max(15.0f, kScrollStepMs / speed));
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(now - scrollLastStep_).count() <
+      static_cast<long long>(stepMs)) {
+    return;
+  }
+  scrollLastStep_ = now;
+  ScrollCaptureStep();
+}
+
+void CaptureOverlay::ScrollCaptureStep() {
+  DesktopSnapshot frame;
+  std::wstring error;
+  if (!CaptureScreenRegion(scrollRegion_, frame, error)) {
+    // Transient BitBlt hiccups retry on the next tick; a persistent failure
+    // must still terminate through the stuck counter.
+    if (++scrollStuckCount_ >= kScrollMaxStuckSteps) {
+      scrollEnded_ = true;
+      KillTimer(hwnd_, kScrollTimer);
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return;
+  }
+  const int regionWidth = scrollRegion_.right - scrollRegion_.left;
+  const int regionHeight = scrollRegion_.bottom - scrollRegion_.top;
+  if (frame.width != regionWidth || frame.height != regionHeight) return;
+
+  // Settle probe first: aligning a frame that is still animating is how a
+  // stitched page ends up full of ghosts.
+  if (!scrollSettleDisabled_ && ScrollPageStillMoving(frame)) {
+    if (++scrollSettleWaits_ >= kScrollMaxSettleWaits) scrollSettleDisabled_ = true;
+    return;  // no wheel this tick: the next tick re-reads the same region
+  }
+  scrollSettleWaits_ = 0;
+
+  // Content-based alignment: the frame is matched against the stitched buffer
+  // purely by its pixels -- per-line detail signatures screen every candidate
+  // offset, the survivors are scored per segment at full resolution, and the
+  // median across segments is what decides.  No seam blending is involved
+  // anywhere: the boundary is a hard cut at the exact offset the content
+  // reports, which is why there is nothing left to smear into a ghost.
+  ScrollMatch match;
+  if (scrollHeight_ > 0) {
+    ScrollHint hint;
+    hint.priorShift = scrollLastShift_;
+    switch (scrollDirection_) {
+      case ScrollDirection::Down:
+        match = MatchScrollDown(scrollPixels_.data(), scrollHeight_, scrollStride_,
+                                frame.bgra.data(), frame.height, frame.bgraStride,
+                                scrollWidth_, hint);
+        break;
+      case ScrollDirection::Up:
+        match = MatchScrollUp(scrollPixels_.data(), scrollHeight_, scrollStride_,
+                              frame.bgra.data(), frame.height, frame.bgraStride,
+                              scrollWidth_, hint);
+        break;
+      case ScrollDirection::Right:
+        match = MatchScrollRight(scrollPixels_.data(), scrollWidth_, scrollStride_,
+                                 frame.bgra.data(), frame.width, frame.bgraStride,
+                                 frame.height, hint);
+        break;
+    }
+  }
+  if (match.confident) {
+    scrollStuckCount_ = 0;
+    scrollLastShift_ = match.shift;
+    if (scrollDirection_ == ScrollDirection::Down) {
+      const int overlap = frame.height - match.shift;
+      if (scrollHeight_ + match.shift > scrollMaxRows_) scrollEnded_ = true;
+      else AppendScrollRows(frame.bgra.data() + static_cast<size_t>(overlap) * frame.bgraStride,
+                            match.shift, frame.bgraStride);
+    } else if (scrollDirection_ == ScrollDirection::Up) {
+      if (scrollHeight_ + match.shift > scrollMaxRows_) scrollEnded_ = true;
+      else PrependScrollRows(frame.bgra.data(), match.shift, frame.bgraStride);
+    } else {
+      const int overlap = frame.width - match.shift;
+      if (scrollWidth_ + match.shift > scrollMaxRows_) scrollEnded_ = true;
+      else AppendScrollColumns(frame.bgra.data(), frame.bgraStride, overlap, match.shift);
+    }
+  } else {
+    // No trustworthy alignment: the page did not move (bottom reached), a
+    // scroll animation is still running, or the step jumped further than one
+    // viewport.  Keep wheeling -- the stuck counter decides when the page
+    // really refuses to scroll.
+    ++scrollStuckCount_;
+  }
+  if (scrollStuckCount_ >= kScrollMaxStuckSteps) scrollEnded_ = true;
+  if (scrollEnded_) KillTimer(hwnd_, kScrollTimer);
+  else SendScrollWheel();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// True when the captured region is still changing.  The page is re-read after a
+// short pause; while the content keeps moving the frame is a blend of two
+// scroll positions and must not be stitched.  FramesDiffer scores per segment
+// and takes the median, so a single animated element (video, ad, caret) does
+// not hold the capture hostage.
+bool CaptureOverlay::ScrollPageStillMoving(const DesktopSnapshot& frame) {
+  ::Sleep(kScrollSettleDelayMs);
+  DesktopSnapshot probe;
+  std::wstring error;
+  if (!CaptureScreenRegion(scrollRegion_, probe, error)) return false;
+  if (probe.width != frame.width || probe.height != frame.height) return false;
+  return FramesDiffer(frame.bgra.data(), frame.bgraStride, probe.bgra.data(), probe.bgraStride,
+                      frame.width, frame.height);
+}
+
+void CaptureOverlay::AppendScrollRows(const uint8_t* rows, int count, int sourceStride) {
+  if (count <= 0 || !rows || sourceStride < scrollStride_) return;
+  const int oldHeight = scrollHeight_;
+  scrollPixels_.resize(static_cast<size_t>(scrollStride_) * (oldHeight + count));
+  // Row-wise copy: the source stride differs from the stitched stride for
+  // frame zero, which comes from the full-desktop frozen snapshot.
+  uint8_t* destination = scrollPixels_.data() + static_cast<size_t>(scrollStride_) * oldHeight;
+  for (int row = 0; row < count; ++row) {
+    memcpy(destination + static_cast<size_t>(scrollStride_) * row,
+           rows + static_cast<size_t>(sourceStride) * row, static_cast<size_t>(scrollStride_));
+  }
+  // No seam blend: the appended block is new page content that directly
+  // continues the accumulated tail, and the boundary was already pinned to the
+  // exact scroll offset by RefineScrollOverlap.  Blending the accumulated tail
+  // (old capture) against these rows (different page content) is what smeared
+  // the two captures into a ghost; a hard content cut is exact instead.
+  scrollHeight_ += count;
+  UpdateScrollPreviewTail(oldHeight);
+}
+
+void CaptureOverlay::PrependScrollRows(const uint8_t* rows, int count, int sourceStride) {
+  if (count <= 0 || !rows || sourceStride < scrollStride_) return;
+  const int oldHeight = scrollHeight_;
+  scrollPixels_.insert(scrollPixels_.begin(), static_cast<size_t>(scrollStride_) * count, 0);
+  for (int row = 0; row < count; ++row) {
+    memcpy(scrollPixels_.data() + static_cast<size_t>(scrollStride_) * row,
+           rows + static_cast<size_t>(sourceStride) * row, static_cast<size_t>(scrollStride_));
+  }
+  // Hard content cut: the prepended block is new page content and the boundary
+  // is pinned by RefineScrollOverlapReverse; blending it into the old head
+  // would smear two different captures together (ghost), so no blend runs.
+  scrollHeight_ = oldHeight + count;
+  UpdateScrollPreviewHead();
+}
+
+void CaptureOverlay::AppendScrollColumns(const uint8_t* frame, int frameStride, int fromColumn,
+                                          int count) {
+  if (count <= 0 || !frame || fromColumn < 0 || scrollHeight_ <= 0) return;
+  const int oldWidth = scrollWidth_;
+  const int newWidth = oldWidth + count;
+  const int newStride = newWidth * 4;
+  if (newStride < scrollStride_) return;
+  std::vector<uint8_t> stitched(static_cast<size_t>(newStride) * scrollHeight_);
+  for (int row = 0; row < scrollHeight_; ++row) {
+    uint8_t* destination = stitched.data() + static_cast<size_t>(newStride) * row;
+    memcpy(destination, scrollPixels_.data() + static_cast<size_t>(scrollStride_) * row,
+           static_cast<size_t>(oldWidth) * 4);
+    memcpy(destination + static_cast<size_t>(oldWidth) * 4,
+           frame + static_cast<size_t>(frameStride) * row + static_cast<size_t>(fromColumn) * 4,
+           static_cast<size_t>(count) * 4);
+  }
+  // Hard content cut: the appended columns are new page content directly
+  // continuing the trailing columns; the boundary is pinned by
+  // RefineScrollOverlapHorizontal, so no vertical seam blend runs (blending
+  // two different captures here is what caused column ghosting).
+  scrollPixels_.swap(stitched);
+  scrollWidth_ = newWidth;
+  scrollStride_ = newStride;
+  UpdateScrollPreviewFull();
+}
+
+ComPtr<ID2D1Bitmap> CaptureOverlay::EnsureScrollPreviewBitmap(int width, int height) {
+  if (width <= 0 || height <= 0 || !renderTarget_) return nullptr;
+  if (scrollPreviewBitmap_ && scrollPreviewWidth_ == width && scrollPreviewHeight_ == height)
+    return scrollPreviewBitmap_;
+  const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+      D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+  ComPtr<ID2D1Bitmap> bitmap;
+  if (FAILED(renderTarget_->CreateBitmap(D2D1::SizeU(static_cast<UINT>(width),
+                                                     static_cast<UINT>(height)),
+                                         nullptr, 0, properties, &bitmap))) {
+    return nullptr;
+  }
+  scrollPreviewBitmap_ = std::move(bitmap);
+  scrollPreviewWidth_ = width;
+  scrollPreviewHeight_ = height;
+  return scrollPreviewBitmap_;
+}
+
+void CaptureOverlay::UpdateScrollPreviewTail(int appendedFrom) {
+  if (!renderTarget_ || scrollWidth_ <= 0 || scrollHeight_ <= 0) return;
+  // Downward captures: the texture holds a fixed tail window of the stitched
+  // image so the capture can grow past the GPU's maximum bitmap size.
+  const int capacity = std::clamp<int>(static_cast<int>(renderTarget_->GetMaximumBitmapSize()),
+                                       1, kScrollPreviewRows);
+  if (!EnsureScrollPreviewBitmap(scrollWidth_, capacity)) return;
+  const int rows = std::min(scrollHeight_, capacity);
+  const int offset = scrollHeight_ - rows;
+  // When the window slides forward the whole texture is stale, not just the
+  // newly appended rows.
+  const int copyFrom = offset != scrollPreviewOffset_ ? offset
+                                                      : std::max(offset, appendedFrom);
+  scrollPreviewOffset_ = offset;
+  if (copyFrom >= scrollHeight_) return;
+  D2D1_RECT_U destination{0, static_cast<UINT>(copyFrom - offset), static_cast<UINT>(scrollWidth_),
+                          static_cast<UINT>(rows)};
+  scrollPreviewBitmap_->CopyFromMemory(&destination,
+                                       scrollPixels_.data() +
+                                           static_cast<size_t>(scrollStride_) * copyFrom,
+                                       scrollStride_);
+}
+
+void CaptureOverlay::UpdateScrollPreviewHead() {
+  if (!renderTarget_ || scrollWidth_ <= 0 || scrollHeight_ <= 0) return;
+  // Upward captures grow at the head: the texture keeps the leading rows.
+  const int capacity = std::clamp<int>(static_cast<int>(renderTarget_->GetMaximumBitmapSize()),
+                                       1, kScrollPreviewRows);
+  if (!EnsureScrollPreviewBitmap(scrollWidth_, capacity)) return;
+  const int rows = std::min(scrollHeight_, capacity);
+  scrollPreviewOffset_ = 0;
+  D2D1_RECT_U destination{0, 0, static_cast<UINT>(scrollWidth_), static_cast<UINT>(rows)};
+  scrollPreviewBitmap_->CopyFromMemory(&destination, scrollPixels_.data(), scrollStride_);
+}
+
+void CaptureOverlay::UpdateScrollPreviewFull() {
+  if (!renderTarget_ || scrollWidth_ <= 0 || scrollHeight_ <= 0) return;
+  // Rightward captures: the image grows horizontally, so the texture mirrors
+  // the whole stitched area, keeping only the trailing columns when the width
+  // would exceed the GPU's maximum bitmap size.
+  const int maxWidth = static_cast<int>(renderTarget_->GetMaximumBitmapSize());
+  const int width = std::min(scrollWidth_, maxWidth);
+  if (!EnsureScrollPreviewBitmap(width, scrollHeight_)) return;
+  const int columnOffset = scrollWidth_ - width;
+  scrollPreviewOffset_ = columnOffset;
+  D2D1_RECT_U destination{0, 0, static_cast<UINT>(width), static_cast<UINT>(scrollHeight_)};
+  scrollPreviewBitmap_->CopyFromMemory(&destination,
+                                       scrollPixels_.data() +
+                                           static_cast<size_t>(columnOffset) * 4,
+                                       scrollStride_);
+}
+
+// The window below the selection center receives the wheel.  The overlay is a
+// hole there, so WindowFromPoint normally returns the live page directly; the
+// EnumWindows fallback covers windows whose region still covers the anchor
+// (e.g. after the user dragged the bar back over the selection).
+HWND CaptureOverlay::FindScrollTarget(POINT point) const {
+  HWND found = WindowFromPoint(point);
+  if (found && GetAncestor(found, GA_ROOT) != hwnd_) return found;
+  struct Context {
+    POINT point;
+    HWND self;
+    HWND result;
+  } context{point, hwnd_, nullptr};
+  EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
+    auto* context = reinterpret_cast<Context*>(parameter);
+    if (window == context->self || !IsWindowVisible(window)) return TRUE;
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds)) return TRUE;
+    if (!PtInRect(&bounds, context->point)) return TRUE;
+    context->result = window;
+    return FALSE;  // first hit wins: EnumWindows walks top-to-bottom
+  }, reinterpret_cast<LPARAM>(&context));
+  return context.result;
+}
+
+void CaptureOverlay::SendScrollWheel() {
+  // Post the wheel straight to the window under the capture anchor; the
+  // overlay keeps keyboard focus (Enter/Esc), so delivery must not depend on
+  // the OS "scroll inactive windows" setting, which would otherwise route
+  // SendInput wheels to the focused overlay itself.  The mouse is never moved
+  // or captured — the user stays in full control.
+  const POINT anchor{(scrollRegion_.left + scrollRegion_.right) / 2,
+                     (scrollRegion_.top + scrollRegion_.bottom) / 2};
+  UINT message = WM_MOUSEWHEEL;
+  SHORT delta = -WHEEL_DELTA;  // scroll content up => reveal lower content
+  if (scrollDirection_ == ScrollDirection::Up) {
+    delta = WHEEL_DELTA;
+  } else if (scrollDirection_ == ScrollDirection::Right) {
+    message = WM_MOUSEHWHEEL;
+    delta = WHEEL_DELTA;
+  }
+  if (HWND target = FindScrollTarget(anchor)) {
+    PostMessageW(target, message, MAKEWPARAM(0, static_cast<WORD>(delta)),
+                 MAKELPARAM(anchor.x, anchor.y));
+    return;
+  }
+  INPUT input{};
+  input.type = INPUT_MOUSE;
+  input.mi.dwFlags = message == WM_MOUSEHWHEEL ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
+  input.mi.mouseData = static_cast<DWORD>(delta);
+  SendInput(1, &input, sizeof(INPUT));
+}
+
+void CaptureOverlay::FinishScrollCapture() {
+  if (!scrollCapturing_) return;
+  KillTimer(hwnd_, kScrollTimer);
+  if (scrollHeight_ <= 0 || scrollWidth_ <= 0 || scrollPixels_.empty()) {
+    // Nothing stitchable: restore the window and stay on the direction bar.
+    CancelScrollCapture();
+    return;
+  }
+  scrollCapturing_ = false;
+  ResetScrollCaptureRegion();
+  auto image = std::make_shared<LongCaptureImage>();
+  image->width = scrollWidth_;
+  image->height = scrollHeight_;
+  image->stride = scrollStride_;
+  image->bgra = std::move(scrollPixels_);
+  longCaptureResult_ = std::move(image);
+  scrollPreviewBitmap_.Reset();
+  scrollPreviewWidth_ = 0;
+  scrollPreviewHeight_ = 0;
+  scrollPreviewOffset_ = 0;
+  scrollHeight_ = 0;
+  longCaptureMode_ = false;
+  // Ending the capture only closes the stitching session: the result is
+  // presented in a preview float window where it can be cropped, annotated,
+  // decorated and either exported or sent back for another pass.
+  EnterLongPreview();
+}
+
+void CaptureOverlay::CancelScrollCapture() {
+  if (!scrollCapturing_) return;
+  KillTimer(hwnd_, kScrollTimer);
+  scrollCapturing_ = false;
+  scrollEnded_ = false;
+  scrollStuckCount_ = 0;
+  scrollLastShift_ = 0;
+  scrollSettleWaits_ = 0;
+  scrollSettleDisabled_ = false;
+  scrollPixels_.clear();
+  scrollPixels_.shrink_to_fit();
+  scrollHeight_ = 0;
+  scrollPreviewBitmap_.Reset();
+  scrollPreviewWidth_ = 0;
+  scrollPreviewHeight_ = 0;
+  scrollPreviewOffset_ = 0;
+  ResetScrollCaptureRegion();
+  // ESC level one returns to the direction bar.
+  longCaptureMode_ = true;
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------- Post-capture long-screenshot review (bar stays the bar) ----------
+
+void CaptureOverlay::EnterLongPreview() {
+  if (!longCaptureResult_) return;
+  ResetScrollCaptureRegion();
+  // A fresh capture starts from a clean sheet; only a pass resumed after
+  // "back to bar" keeps the annotations recorded against the parked image.
+  if (!longResumePending_) document_.Clear();
+  selectedCommand_.reset();
+  commandAdjustment_ = SelectionAdjustment::None;
+  commandBeforeAdjust_.reset();
+  longMosaicBase_.clear();
+  // Lock the preview viewport to the monitor the user is looking at right now
+  // (the cursor was over the capturing region when finish was hit).  Tracking
+  // it every frame would let a wandering cursor drag the preview off-screen.
+  longPreviewViewport_ = ResolveLongPreviewMonitorRect();
+  longPreview_ = true;
+  longPreviewStage_ = LongPreviewStage::View;
+  longPreviewScroll_ = 0.0f;
+  longThumbDragging_ = false;
+  longThumbGrabOffset_ = 0.0f;
+  longPreviewTool_ = Tool::Pen;
+  longPreviewDrag_ = LongPreviewDrag::None;
+  longCropChanged_ = false;
+  longResumePending_ = false;
+  longCrop_ = {0.0f, 0.0f, static_cast<float>(longCaptureResult_->width),
+               static_cast<float>(longCaptureResult_->height)};
+  // No crop applied yet: every pixel of the stitched image is "active".
+  longCropApplied_ = longCrop_;
+  longCropAppliedValid_ = true;
+  longPreviewTiles_.clear();
+  EnsureLongPreviewTiles();
+  longPreviewProgress_ = 0.0f;
+  longPreviewAnimating_ = true;
+  longPreviewAnimStart_ = std::chrono::steady_clock::now();
+  longPreviewStageProgress_ = 0.0f;
+  longPreviewStageAnimStart_ = longPreviewAnimStart_;
+  // Initial placement: the compact palette docks at the screen's right edge,
+  // vertically centered.  Only when the image is so wide that the bar would
+  // cover it does the bar keep wherever it currently sits.
+  {
+    const D2D1_RECT_F viewport = LongPreviewViewportRect();
+    const float imageRight = LongPreviewImageOrigin().x +
+        static_cast<float>(longCaptureResult_->width) * LongPreviewScale();
+    const int left = static_cast<int>(viewport.right) - 12 - kLongBarWidth;
+    const int minTop = static_cast<int>(viewport.top) + 8;
+    const int maxTop = std::max(minTop, static_cast<int>(viewport.bottom) - kLongBarHeight - 8);
+    const int top = std::clamp(
+        static_cast<int>(std::lround(viewport.top +
+            (viewport.bottom - viewport.top - kLongBarHeight) * 0.5f)),
+        minTop, maxTop);
+    if (left >= static_cast<int>(std::lround(imageRight)) + 12) {
+      toolbarPositionSet_ = true;
+      toolbarPosition_ = {left, top};
+    }
+  }
+  SetTimer(hwnd_, kLongPreviewTimer, 16, nullptr);
+  SetFocus(hwnd_);
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// Single driver for both easings: the window entrance and the active stage
+// transition share one 16 ms timer that stops itself once both complete.
+void CaptureOverlay::AdvanceLongPreviewAnimation() {
+  if (!longPreview_) { KillTimer(hwnd_, kLongPreviewTimer); return; }
+  const auto now = std::chrono::steady_clock::now();
+  const float windowT = std::clamp(
+      std::chrono::duration<float>(now - longPreviewAnimStart_).count() /
+          (kLongPreviewAnimMs / 1000.0f), 0.0f, 1.0f);
+  longPreviewProgress_ = windowT;
+  const float stageT = std::clamp(
+      std::chrono::duration<float>(now - longPreviewStageAnimStart_).count() /
+          (kLongPreviewStageMs / 1000.0f), 0.0f, 1.0f);
+  longPreviewStageProgress_ = stageT;
+  if (windowT >= 1.0f && stageT >= 1.0f) {
+    longPreviewAnimating_ = false;
+    KillTimer(hwnd_, kLongPreviewTimer);
+  }
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// Every stage switch funnels through here so View/Crop/Annotate changes get
+// the same non-linear ease as the window entrance.
+void CaptureOverlay::BeginLongPreviewStage(LongPreviewStage stage) {
+  if (!longPreview_ || longPreviewStage_ == stage) return;
+  longPreviewStage_ = stage;
+  longPreviewDrag_ = LongPreviewDrag::None;
+  longPreviewStageProgress_ = 0.0f;
+  longPreviewStageAnimStart_ = std::chrono::steady_clock::now();
+  SetTimer(hwnd_, kLongPreviewTimer, 16, nullptr);
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// "Back" closes the float window and parks the stitched pixels so the
+// direction bar can start another pass that appends to the same buffer.
+// A committed crop never blocks this: the crop is soft (the pixel buffer
+// keeps the full stitched image), so the parked data still matches the
+// viewport and the resumed pass aligns normally.  The crop itself is dropped
+// -- recapturing from the full image is the expected way to undo it.
+void CaptureOverlay::ExitLongPreviewToBar() {
+  if (!longPreview_) return;
+  // Mosaics are baked into the parked pixels; freeze them so a later resume
+  // never re-applies them (their base cannot survive another stitching pass).
+  if (!longMosaicBase_.empty()) {
+    for (size_t index = document_.Size(); index > 0; --index) {
+      const EditCommand* command = document_.At(index - 1);
+      if (command && std::holds_alternative<MosaicCommand>(*command)) document_.Remove(index - 1);
+    }
+    longMosaicBase_.clear();
+  }
+  auto image = std::move(longCaptureResult_);
+  longPreview_ = false;
+  longPreviewStage_ = LongPreviewStage::View;
+  longPreviewTiles_.clear();
+  longPreviewTileRows_ = 0;
+  longCrop_ = {};
+  longCropApplied_ = {};
+  longCropAppliedValid_ = false;
+  longCropChanged_ = false;
+  if (image) {
+    scrollWidth_ = image->width;
+    scrollStride_ = image->stride;
+    scrollHeight_ = image->height;
+    scrollPixels_ = std::move(image->bgra);
+  }
+  longResumePending_ = true;
+  longCaptureMode_ = true;
+  scrollEnded_ = false;
+  scrollStuckCount_ = 0;
+  scrollLastShift_ = 0;
+  scrollSettleWaits_ = 0;
+  scrollSettleDisabled_ = false;
+  switch (scrollDirection_) {
+    case ScrollDirection::Up: UpdateScrollPreviewHead(); break;
+    case ScrollDirection::Right: UpdateScrollPreviewFull(); break;
+    case ScrollDirection::Down: UpdateScrollPreviewTail(scrollHeight_); break;
+  }
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+D2D1_RECT_F CaptureOverlay::LongPreviewViewportRect() const {
+  // The viewport is locked when the preview opens: the review stays on the
+  // monitor the user was looking at when the capture finished, even if the
+  // cursor later drifts to another display.  Falls back to the full snapshot
+  // bounds when no monitor information is available.
+  RECT work = longPreviewViewport_;
+  if (work.right <= work.left || work.bottom <= work.top) {
+    work = {0, 0, static_cast<LONG>(snapshot_.width), static_cast<LONG>(snapshot_.height)};
+  }
+  return D2D1::RectF(static_cast<float>(work.left), static_cast<float>(work.top),
+                     static_cast<float>(work.right), static_cast<float>(work.bottom));
+}
+
+// Resolves the bounds of the monitor the cursor currently sits on, in
+// snapshot-local coordinates.  The capture overlay's window covers the entire
+// virtual desktop, so the monitor rect from MONITORINFO needs to be shifted
+// into the snapshot's coordinate system before it can be used for layout.
+// The FULL monitor rectangle (rcMonitor) is used -- not the work area -- so
+// the preview centers on the physical middle of the display and the edge
+// feather runs right at the screen's top/bottom borders regardless of taskbar
+// placement.
+RECT CaptureOverlay::ResolveLongPreviewMonitorRect() const {
+  return ActiveMonitorLocalRect();
+}
+
+// Bounds of the monitor under the cursor, in snapshot-local coordinates,
+// clamped to the snapshot.  Shared by anything that must appear on "the
+// screen the user is looking at" rather than at a fixed virtual-desktop
+// offset (which lands on the wrong display on multi-monitor setups).
+RECT CaptureOverlay::ActiveMonitorLocalRect() const {
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+  RECT monitorRect{};
+  if (monitor) {
+    MONITORINFO info{sizeof(info)};
+    if (GetMonitorInfoW(monitor, &info)) monitorRect = info.rcMonitor;
+  }
+  if (monitorRect.right <= monitorRect.left || monitorRect.bottom <= monitorRect.top) {
+    monitorRect = {0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+  }
+  OffsetRect(&monitorRect, -snapshot_.virtualBounds.left, -snapshot_.virtualBounds.top);
+  monitorRect.left = std::clamp(monitorRect.left, 0L, static_cast<LONG>(snapshot_.width));
+  monitorRect.top = std::clamp(monitorRect.top, 0L, static_cast<LONG>(snapshot_.height));
+  monitorRect.right = std::clamp(monitorRect.right, monitorRect.left + 1L,
+                                 static_cast<LONG>(snapshot_.width));
+  monitorRect.bottom = std::clamp(monitorRect.bottom, monitorRect.top + 1L,
+                                  static_cast<LONG>(snapshot_.height));
+  return monitorRect;
+}
+
+// Review always shows the stitched image at 1:1 (100%); the minimap and wheel
+// navigate vertically instead of a zoom slider.
+float CaptureOverlay::LongPreviewScale() const {
+  return 1.0f;
+}
+
+// Screen-space top-left of the image: vertically centered when it fits,
+// otherwise shifted up by the scroll offset under the viewport clip.
+D2D1_POINT_2F CaptureOverlay::LongPreviewImageOrigin() const {
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  if (!longCaptureResult_) return {viewport.left, viewport.top};
+  const float scale = LongPreviewScale();
+  const float imageWidth = longCaptureResult_->width * scale;
+  const float imageHeight = longCaptureResult_->height * scale;
+  const float originX = viewport.left +
+      std::max(0.0f, (viewport.right - viewport.left - imageWidth) / 2.0f);
+  float originY = viewport.top;
+  if (imageHeight <= viewport.bottom - viewport.top) {
+    originY += (viewport.bottom - viewport.top - imageHeight) / 2.0f;
+  } else {
+    originY -= longPreviewScroll_ * scale;
+  }
+  return {originX, originY};
+}
+
+void CaptureOverlay::ClampLongPreviewScroll() {
+  if (!longCaptureResult_) { longPreviewScroll_ = 0.0f; return; }
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  const float scale = LongPreviewScale();
+  const float overflowRows =
+      static_cast<float>(longCaptureResult_->height) - (viewport.bottom - viewport.top) / scale;
+  longPreviewScroll_ = std::clamp(longPreviewScroll_, 0.0f, std::max(0.0f, overflowRows));
+}
+
+void CaptureOverlay::EnsureLongPreviewTiles() {
+  if (!renderTarget_ || !longCaptureResult_ || !longPreviewTiles_.empty()) return;
+  const LongCaptureImage& image = *longCaptureResult_;
+  const int maxRows = std::max(1, static_cast<int>(renderTarget_->GetMaximumBitmapSize()));
+  const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+      D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+  for (int top = 0; top < image.height; top += maxRows) {
+    const int rows = std::min(maxRows, image.height - top);
+    ComPtr<ID2D1Bitmap> tile;
+    if (FAILED(renderTarget_->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT>(image.width), static_cast<UINT>(rows)),
+            nullptr, 0, properties, &tile))) {
+      return;
+    }
+    const D2D1_RECT_U destination{0, 0, static_cast<UINT>(image.width), static_cast<UINT>(rows)};
+    tile->CopyFromMemory(&destination,
+                         image.bgra.data() + static_cast<size_t>(image.stride) * top,
+                         image.stride);
+    longPreviewTiles_.push_back(std::move(tile));
+  }
+  longPreviewTileRows_ = maxRows;
+}
+
+void CaptureOverlay::DrawLongPreview() {
+  const D2D1_RECT_F fullscreen = D2D1::RectF(0.0f, 0.0f,
+                                             static_cast<float>(snapshot_.width),
+                                             static_cast<float>(snapshot_.height));
+  const float progress = EaseOutCubic(longPreviewProgress_);
+  ComPtr<ID2D1SolidColorBrush> dim;
+  renderTarget_->CreateSolidColorBrush(
+      D2D1::ColorF(0.0f, 0.02f, 0.05f, kLongPreviewDimAlpha * progress), &dim);
+  renderTarget_->FillRectangle(fullscreen, dim.Get());
+
+  // The stitched image is drawn at 100%: wheel scrolls, the minimap navigates.
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  renderTarget_->PushAxisAlignedClip(viewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+  if (longCaptureResult_ && !longPreviewTiles_.empty() && longPreviewTileRows_ > 0) {
+    const float scale = LongPreviewScale();
+    const D2D1_POINT_2F origin = LongPreviewImageOrigin();
+    const float imageWidth = longCaptureResult_->width * scale;
+    for (size_t index = 0; index < longPreviewTiles_.size(); ++index) {
+      const int tileTop = static_cast<int>(index) * longPreviewTileRows_;
+      const int tileRows = std::min(longPreviewTileRows_,
+                                    longCaptureResult_->height - tileTop);
+      if (tileRows <= 0) break;
+      const D2D1_RECT_F destination{
+          origin.x, origin.y + tileTop * scale, origin.x + imageWidth,
+          origin.y + (tileTop + tileRows) * scale};
+      if (destination.bottom < viewport.top || destination.top > viewport.bottom) continue;
+      renderTarget_->DrawBitmap(longPreviewTiles_[index].Get(), destination, progress,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
+  }
+  // Grayed-out overlay for the regions the user has cropped away.  Drawn over
+  // the full image (not the active crop) so the cut-off strips are still
+  // visible but visually subdued.  A clipped layer keeps the rectangles
+  // strictly inside the image bounds and lets the dim brush bleed softly into
+  // the active region for a less abrupt edge.
+  if (longCropAppliedValid_ && longCaptureResult_ &&
+      (longCropApplied_.left > 0.5f || longCropApplied_.top > 0.5f ||
+       longCropApplied_.right < longCaptureResult_->width - 0.5f ||
+       longCropApplied_.bottom < longCaptureResult_->height - 0.5f)) {
+    const float scale = LongPreviewScale();
+    const D2D1_POINT_2F origin = LongPreviewImageOrigin();
+    const D2D1_RECT_F activeRect{
+        origin.x + longCropApplied_.left * scale,
+        origin.y + longCropApplied_.top * scale,
+        origin.x + longCropApplied_.right * scale,
+        origin.y + longCropApplied_.bottom * scale};
+    const D2D1_RECT_F imageRect{
+        origin.x, origin.y,
+        origin.x + longCaptureResult_->width * scale,
+        origin.y + longCaptureResult_->height * scale};
+    ComPtr<ID2D1SolidColorBrush> dimOverlay;
+    renderTarget_->CreateSolidColorBrush(
+        D2D1::ColorF(0.0f, 0.02f, 0.05f, 0.55f * progress), &dimOverlay);
+    const std::array<D2D1_RECT_F, 4> strips{{
+        {imageRect.left, imageRect.top, imageRect.right, activeRect.top},
+        {imageRect.left, activeRect.bottom, imageRect.right, imageRect.bottom},
+        {imageRect.left, activeRect.top, activeRect.left, activeRect.bottom},
+        {activeRect.right, activeRect.top, imageRect.right, activeRect.bottom}}};
+    for (const D2D1_RECT_F& strip : strips) {
+      if (strip.right > strip.left && strip.bottom > strip.top)
+        renderTarget_->FillRectangle(strip, dimOverlay.Get());
+    }
+    // Diagonal hatch inside the cut-off strips signals "removed" without
+    // entirely hiding the underlying pixels (the user can still scroll into
+    // the strip to inspect or revert the crop).
+    ComPtr<ID2D1BitmapRenderTarget> hatchTarget;
+    if (SUCCEEDED(renderTarget_->CreateCompatibleRenderTarget(
+            D2D1::SizeF(imageRect.right - imageRect.left,
+                        imageRect.bottom - imageRect.top), &hatchTarget))) {
+      hatchTarget->BeginDraw();
+      hatchTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+      ComPtr<ID2D1SolidColorBrush> hatchBrush;
+      hatchTarget->CreateSolidColorBrush(D2D1::ColorF(0.75f, 0.85f, 1.0f, 0.10f), &hatchBrush);
+      const float w = imageRect.right - imageRect.left;
+      const float h = imageRect.bottom - imageRect.top;
+      const float step = 12.0f;
+      for (float offset = -h; offset < w; offset += step) {
+        hatchTarget->DrawLine({offset, 0}, {offset + h, h}, hatchBrush.Get(), 1.0f);
+      }
+      HRESULT hatchEnd = hatchTarget->EndDraw();
+      if (SUCCEEDED(hatchEnd)) {
+        ComPtr<ID2D1Bitmap> hatchBitmap;
+        if (SUCCEEDED(hatchTarget->GetBitmap(&hatchBitmap))) {
+          for (const D2D1_RECT_F& strip : strips) {
+            if (strip.right <= strip.left || strip.bottom <= strip.top) continue;
+            const D2D1_RECT_F src{
+                std::max(0.0f, strip.left - imageRect.left),
+                std::max(0.0f, strip.top - imageRect.top),
+                std::min(w, strip.right - imageRect.left),
+                std::min(h, strip.bottom - imageRect.top)};
+            if (src.right > src.left && src.bottom > src.top) {
+              renderTarget_->DrawBitmap(hatchBitmap.Get(), strip, progress * 0.6f,
+                                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
+            }
+          }
+        }
+      }
+    }
+  }
+  // Committed annotations always render; the crop overlay fades in over them.
+  DrawLongPreviewCommands();
+  if (selectedCommand_ && longPreviewStage_ == LongPreviewStage::Annotate) {
+    DrawLongCommandHandles();
+  }
+  if (longPreviewStage_ == LongPreviewStage::Crop) {
+    DrawLongCropOverlay(EaseOutCubic(longPreviewStageProgress_));
+  }
+  renderTarget_->PopAxisAlignedClip();
+  // Top and bottom 10% of the SCREEN (the active monitor's bounds, not the
+  // screenshot's edges) get a soft feather so the 1:1 stitched image eases out
+  // toward the display edge instead of meeting a hard black border.  Computed
+  // in screen pixels from the monitor rect, so the cushion tracks the display
+  // size independent of the image and its zoom level.
+  // Top and bottom of the SCREEN (the active monitor's bounds, not the
+  // screenshot's edges) get a soft feather so the 1:1 stitched image eases out
+  // toward the display edge instead of meeting a hard black border.  Computed
+  // in screen pixels from the monitor rect, so the cushion tracks the display
+  // size independent of the image and its zoom level.  The gradient is densest
+  // exactly at the screen edge and clears kLongPreviewFeather of the screen
+  // height inward -- the image fades into the backdrop, it does not sink into
+  // a dark band.
+  const float featherPx = (viewport.bottom - viewport.top) * kLongPreviewFeather * progress;
+  if (featherPx > 1.0f) {
+    const float edgeAlpha = kLongPreviewDimAlpha * progress;
+    ComPtr<ID2D1GradientStopCollection> stops;
+    const D2D1_GRADIENT_STOP gradient[] = {
+        {0.0f, D2D1::ColorF(0.0f, 0.02f, 0.05f, edgeAlpha)},
+        {1.0f, D2D1::ColorF(0.0f, 0.02f, 0.05f, 0.0f)}};
+    if (SUCCEEDED(renderTarget_->CreateGradientStopCollection(
+            gradient, std::size(gradient), D2D1_GAMMA_2_2,
+            D2D1_EXTEND_MODE_CLAMP, &stops))) {
+      // Top: gradient position 0 sits on the screen edge, 1 at 5% inward.
+      ComPtr<ID2D1LinearGradientBrush> topBrush;
+      if (SUCCEEDED(renderTarget_->CreateLinearGradientBrush(
+              D2D1::LinearGradientBrushProperties({viewport.left, viewport.top},
+                                                  {viewport.left, viewport.top + featherPx}),
+              stops.Get(), &topBrush))) {
+        const D2D1_RECT_F topFeather{viewport.left, viewport.top, viewport.right,
+                                     viewport.top + featherPx};
+        renderTarget_->FillRectangle(topFeather, topBrush.Get());
+      }
+      // Bottom: mirrored, gradient position 0 sits on the bottom screen edge.
+      ComPtr<ID2D1LinearGradientBrush> bottomBrush;
+      if (SUCCEEDED(renderTarget_->CreateLinearGradientBrush(
+              D2D1::LinearGradientBrushProperties({viewport.left, viewport.bottom},
+                                                  {viewport.left, viewport.bottom - featherPx}),
+              stops.Get(), &bottomBrush))) {
+        const D2D1_RECT_F bottomFeather{viewport.left, viewport.bottom - featherPx,
+                                        viewport.right, viewport.bottom};
+        renderTarget_->FillRectangle(bottomFeather, bottomBrush.Get());
+      }
+    }
+  }
+  DrawLongToolbar();
+  DrawLongPreviewThumb();
+}
+
+// The long-review bar is a compact two-row palette: icon-only crop and
+// pattern tools fill a five-wide grid, copy/save take the last two cells.
+// While a crop is active the bottom row swaps to cancel/apply.
+void CaptureOverlay::DrawLongToolbar() {
+  const RECT toolbar = ToolbarRect();
+  EnsureToolbarBackdrop();
+  ComPtr<ID2D1SolidColorBrush> shadow, background;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, .28f), &shadow);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.055f, .07f, .10f, .60f), &background);
+  RECT shadowRect = toolbar;
+  OffsetRect(&shadowRect, 0, 4);
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(shadowRect), 12, 12), shadow.Get());
+  ComPtr<ID2D1RoundedRectangleGeometry> toolbarMask;
+  ComPtr<ID2D1Layer> toolbarLayer;
+  const bool useToolbarMask =
+      SUCCEEDED(d2dFactory_->CreateRoundedRectangleGeometry(
+          D2D1::RoundedRect(ToD2D(toolbar), 12, 12), &toolbarMask)) &&
+      SUCCEEDED(renderTarget_->CreateLayer(nullptr, &toolbarLayer));
+  if (useToolbarMask) {
+    renderTarget_->PushLayer(D2D1::LayerParameters(ToD2D(toolbar), toolbarMask.Get()), toolbarLayer.Get());
+  }
+  if (toolbarBackdropBitmap_) {
+    renderTarget_->DrawBitmap(toolbarBackdropBitmap_.Get(), ToD2D(toolbar), 1.0f,
+                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+  }
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(toolbar), 12, 12), background.Get());
+  if (useToolbarMask) renderTarget_->PopLayer();
+
+  const float progress = EaseOutCubic(longPreviewProgress_);
+  // Non-linear stage transition: the bar content rises into place while fading.
+  const float stage = EaseOutCubic(longPreviewStageProgress_);
+  const float rise = (1.0f - stage) * 12.0f;
+  const float alpha = progress * (0.25f + 0.75f * stage);
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  ScreenToClient(hwnd_, &cursor);
+
+  // Tool row: crop first, then the pattern tools of the normal bar.
+  for (int index = 0; index <= static_cast<int>(kLongPreviewTools.size()); ++index) {
+    RECT item = LongToolbarButtonRect(index);
+    OffsetRect(&item, 0, static_cast<LONG>(std::lround(rise)));
+    const D2D1_RECT_F area = ToD2D(item);
+    const bool hover = stage >= 1.0f && PtInRect(&item, cursor) != FALSE;
+    const bool active = index == 0
+        ? longPreviewStage_ == LongPreviewStage::Crop
+        : longPreviewStage_ == LongPreviewStage::Annotate &&
+              kLongPreviewTools[static_cast<size_t>(index) - 1] == longPreviewTool_;
+    ComPtr<ID2D1SolidColorBrush> face;
+    renderTarget_->CreateSolidColorBrush(
+        D2D1::ColorF(active ? .12f : hover ? .17f : .11f,
+                     active ? .55f : hover ? .24f : .14f,
+                     active ? .95f : hover ? .34f : .19f, .95f * alpha), &face);
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(area, 9, 9), face.Get());
+    if (index == 0) {
+      DrawLongPreviewGlyph(0, {area.left + 7.0f, area.top + 7.0f,
+                               area.right - 7.0f, area.bottom - 7.0f});
+    } else {
+      DrawToolIcon(kLongPreviewTools[static_cast<size_t>(index) - 1], item, active);
+    }
+  }
+
+  // Right side: copy/save normally; confirm/cancel while a crop is active.
+  RECT copy = ToolbarCopyRect();
+  RECT save = ToolbarSaveRect();
+  OffsetRect(&copy, 0, static_cast<LONG>(std::lround(rise)));
+  OffsetRect(&save, 0, static_cast<LONG>(std::lround(rise)));
+  const D2D1_RECT_F copyArea = ToD2D(copy);
+  const D2D1_RECT_F saveArea = ToD2D(save);
+  if (longPreviewStage_ == LongPreviewStage::Crop) {
+    ComPtr<ID2D1SolidColorBrush> neutral;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.11f, .14f, .19f, .95f * alpha), &neutral);
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(copyArea, 9, 9), neutral.Get());
+    DrawLongPreviewGlyph(2, {copyArea.left + 8.0f, copyArea.top + 8.0f,
+                             copyArea.right - 8.0f, copyArea.bottom - 8.0f});
+    DrawAccentPanel(saveArea, 9.0f);
+    DrawLongPreviewGlyph(1, {saveArea.left + 8.0f, saveArea.top + 8.0f,
+                             saveArea.right - 8.0f, saveArea.bottom - 8.0f});
+  } else {
+    ComPtr<ID2D1SolidColorBrush> copyBackground, saveBackground;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.10f, .33f, .25f, .98f * alpha), &copyBackground);
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.10f, .28f, .48f, .98f * alpha), &saveBackground);
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(copyArea, 9, 9), copyBackground.Get());
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(saveArea, 9, 9), saveBackground.Get());
+    DrawActionIcon(false, copy);
+    DrawActionIcon(true, save);
+  }
+  // Utility layer last, fading with the rest of the bar content.
+  DrawBarUtilityButtons(alpha);
+}
+
+// Tool buttons of the long-review bar as a two-row grid: index 0 is crop,
+// indices 1..N are the pattern tools, filled left to right, top row first.
+RECT CaptureOverlay::LongToolbarButtonRect(int index) const {
+  const RECT toolbar = ToolbarRect();
+  const int column = index % kLongBarButtonsPerRow;
+  const int row = index / kLongBarButtonsPerRow;
+  const int left = toolbar.left + 12 + column * (kLongPreviewToolSize + kLongPreviewToolGap);
+  const int top = toolbar.top + kBarUtilityStrip + 12 + row * (kLongPreviewToolSize + kLongPreviewToolGap);
+  return {left, top, left + kLongPreviewToolSize, top + kLongPreviewToolSize};
+}
+
+bool CaptureOverlay::HitLongToolbarButton(int index, POINT point) const {
+  const RECT rect = LongToolbarButtonRect(index);
+  return PtInRect(&rect, point) != FALSE;
+}
+
+// Minimap anchored to the long-review palette so it visually groups with the
+// rest of the review controls.  The thumb's height is fixed at 30% of the
+// monitor height (regardless of capture length) so the strip is always a
+// comfortable browsing size; its width follows the image aspect ratio within a
+// capped width.  Preferred slot is directly above the bar, horizontally
+// centered on it; when the bar sits too high for that (the thumb would hit
+// the screen's top edge) it hangs below the bar instead.
+RECT CaptureOverlay::LongPreviewThumbRect() const {
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  const int viewportH = std::max(1, static_cast<int>(viewport.bottom - viewport.top));
+  if (!longCaptureResult_ || longCaptureResult_->width <= 0 ||
+      longCaptureResult_->height <= 0) {
+    return RECT{};
+  }
+  const RECT toolbar = ToolbarRect();
+  // 30% of the monitor's top-to-bottom height is the minimap's height budget,
+  // so the strip scales with the display instead of with the bar.
+  const int maxHeight = std::max(80, static_cast<int>(viewportH * 0.30f));
+  const float imageW = static_cast<float>(longCaptureResult_->width);
+  const float imageH = static_cast<float>(longCaptureResult_->height);
+  const float scale = std::min(static_cast<float>(kLongPreviewThumbMaxWidth) / imageW,
+                               static_cast<float>(maxHeight) / imageH);
+  const int width = std::max(8, static_cast<int>(std::lround(imageW * scale)));
+  const int height = std::min(std::max(8, static_cast<int>(std::lround(imageH * scale))),
+                              viewportH - 16);
+  const int viewportLeft = static_cast<int>(viewport.left);
+  const int viewportRight = static_cast<int>(viewport.right);
+  const int viewportTop = static_cast<int>(viewport.top);
+  const int viewportBottom = static_cast<int>(viewport.bottom);
+  // Horizontally centered on the bar, clamped inside the screen.
+  const int centerX = toolbar.left + (toolbar.right - toolbar.left) / 2;
+  const int left = std::clamp(centerX - width / 2, viewportLeft + 8,
+                              std::max(viewportLeft + 8, viewportRight - width - 8));
+  // Preferred: directly above the bar.  Hits the screen top -> hang below.
+  const int aboveTop = toolbar.top - 14 - height;
+  if (aboveTop >= viewportTop + 8) {
+    return {left, aboveTop, left + width, aboveTop + height};
+  }
+  const int belowTop = std::clamp(static_cast<int>(toolbar.bottom) + 14, viewportTop + 8,
+                                  std::max(viewportTop + 8, viewportBottom - height - 8));
+  return {left, belowTop, left + width, belowTop + height};
+}
+
+float CaptureOverlay::LongThumbScale() const {
+  const RECT thumb = LongPreviewThumbRect();
+  if (thumb.bottom <= thumb.top || !longCaptureResult_ || longCaptureResult_->height <= 0) {
+    return 0.0f;
+  }
+  return static_cast<float>(thumb.bottom - thumb.top) /
+         static_cast<float>(longCaptureResult_->height);
+}
+
+bool CaptureOverlay::HitLongThumb(POINT point) const {
+  if (!longPreview_ || !longCaptureResult_) return false;
+  const RECT thumb = LongPreviewThumbRect();
+  return PtInRect(&thumb, point) != FALSE;
+}
+
+void CaptureOverlay::LongThumbBeginDrag(POINT point) {
+  const RECT thumb = LongPreviewThumbRect();
+  const float scale = LongThumbScale();
+  if (scale <= 0.0f) return;
+  // Click-to-jump: a mouse-down on the minimap centers the visible window on
+  // the click position (unless the click is already inside the visible window,
+  // in which case it is a grab for a subsequent drag).  This lets the user
+  // jump to any vertical slice of the long screenshot with one click instead
+  // of having to wheel-scroll all the way down.
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  const float viewportH = viewport.bottom - viewport.top;
+  const int imageH = longCaptureResult_->height;
+  const float maxScroll = std::max(0.0f, static_cast<float>(imageH) - viewportH);
+  const float row = (static_cast<float>(point.y) - thumb.top) / scale;
+  const float visibleTop = std::clamp(longPreviewScroll_, 0.0f, maxScroll);
+  const float visibleBottom = std::min(static_cast<float>(imageH),
+                                       visibleTop + viewportH);
+  const float rowInThumb = (static_cast<float>(point.y) - thumb.top);
+  const float visibleMarkerTop = thumb.top + visibleTop * scale;
+  const float visibleMarkerBottom = thumb.top + visibleBottom * scale;
+  if (rowInThumb < visibleMarkerTop || rowInThumb > visibleMarkerBottom) {
+    // Outside the visible window: jump so the clicked row sits at the
+    // viewport's center (or as close to it as the scroll range allows).
+    const float target = row - viewportH * 0.5f;
+    longPreviewScroll_ = std::clamp(target, 0.0f, maxScroll);
+  }
+  longThumbGrabOffset_ = longPreviewScroll_ - row;
+  longThumbDragging_ = true;
+  SetCapture(hwnd_);
+}
+
+void CaptureOverlay::LongThumbDrag(POINT point) {
+  if (!longThumbDragging_) return;
+  const RECT thumb = LongPreviewThumbRect();
+  const float scale = LongThumbScale();
+  if (scale <= 0.0f) return;
+  const float row = (static_cast<float>(point.y) - thumb.top) / scale;
+  longPreviewScroll_ = row + longThumbGrabOffset_;
+  ClampLongPreviewScroll();
+}
+
+PointF CaptureOverlay::LongThumbToImage(POINT point) const {
+  // The minimap draws the whole strip with the same scale on both axes.
+  const RECT thumb = LongPreviewThumbRect();
+  const float scale = LongThumbScale();
+  if (scale <= 0.0f) return {};
+  return {(static_cast<float>(point.x) - thumb.left) / scale,
+          (static_cast<float>(point.y) - thumb.top) / scale};
+}
+
+void CaptureOverlay::DrawLongPreviewThumb() {
+  if (!longCaptureResult_ || longPreviewTiles_.empty() || longPreviewTileRows_ <= 0) return;
+  const RECT thumb = LongPreviewThumbRect();
+  const int width = thumb.right - thumb.left;
+  const int height = thumb.bottom - thumb.top;
+  if (width < 8 || height < 8) return;
+  const float left = static_cast<float>(thumb.left);
+  const float top = static_cast<float>(thumb.top);
+  ComPtr<ID2D1SolidColorBrush> background;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.03f, .05f, .08f, .92f), &background);
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(thumb), 8, 8), background.Get());
+
+  const int imageW = longCaptureResult_->width;
+  const int imageH = longCaptureResult_->height;
+  const float scale = LongThumbScale();
+  if (scale <= 0.0f) return;
+
+  renderTarget_->PushAxisAlignedClip(ToD2D(thumb), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+  for (size_t index = 0; index < longPreviewTiles_.size(); ++index) {
+    const int tileTop = static_cast<int>(index) * longPreviewTileRows_;
+    const int tileRows = std::min(longPreviewTileRows_, imageH - tileTop);
+    if (tileRows <= 0) break;
+    const D2D1_RECT_F destination{left, top + tileTop * scale, left + imageW * scale,
+                                  top + (tileTop + tileRows) * scale};
+    renderTarget_->DrawBitmap(longPreviewTiles_[index].Get(), destination, 1.0f,
+                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+  }
+  // Keep the minimap in sync with a committed crop: the cut-away strips are
+  // dimmed here exactly like they are in the main 1:1 view, so the strip
+  // always shows the same active range.
+  if (longCropAppliedValid_ &&
+      (longCropApplied_.left > 0.5f || longCropApplied_.top > 0.5f ||
+       longCropApplied_.right < imageW - 0.5f ||
+       longCropApplied_.bottom < imageH - 0.5f)) {
+    const float cropLeft = left + longCropApplied_.left * scale;
+    const float cropTop = top + longCropApplied_.top * scale;
+    const float cropRight = left + longCropApplied_.right * scale;
+    const float cropBottom = top + longCropApplied_.bottom * scale;
+    const float thumbRight = left + static_cast<float>(width);
+    const float thumbBottom = top + static_cast<float>(height);
+    ComPtr<ID2D1SolidColorBrush> cropDim;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.02f, 0.05f, 0.55f), &cropDim);
+    const D2D1_RECT_F strips[] = {
+        {left, top, thumbRight, cropTop},
+        {left, cropBottom, thumbRight, thumbBottom},
+        {left, cropTop, cropLeft, cropBottom},
+        {cropRight, cropTop, thumbRight, cropBottom}};
+    for (const D2D1_RECT_F& strip : strips) {
+      if (strip.right > strip.left && strip.bottom > strip.top)
+        renderTarget_->FillRectangle(strip, cropDim.Get());
+    }
+  }
+  // Mirror the annotations onto the minimap (scaled into the strip) so edits
+  // made on the 1:1 preview are visible here at a glance, including the
+  // in-flight stroke while it is being drawn.
+  DrawLongCommandsTransformed({left, top}, scale);
+  renderTarget_->PopAxisAlignedClip();
+
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  const float viewportH = viewport.bottom - viewport.top;
+  // The visible window on the minimap is measured in image rows, not in
+  // screen pixels: the marker only makes sense relative to the source image.
+  // When the image fits inside the viewport (imageH <= viewportH) the
+  // surviving scroll is 0 and the marker should cover the full strip, so the
+  // raw height uses the full image height in that case.
+  const bool imageFits = static_cast<float>(imageH) <= viewportH;
+  const float maxScroll = std::max(0.0f, static_cast<float>(imageH) - viewportH);
+  const float visibleTop = std::clamp(longPreviewScroll_, 0.0f, maxScroll);
+  const float visibleBottom = imageFits ? static_cast<float>(imageH)
+                                        : std::min(static_cast<float>(imageH),
+                                                   visibleTop + viewportH);
+  // The marker's height is the size of the visible window in image rows
+  // mapped onto the strip.  No artificial cap when the image fits (so the
+  // marker covers the whole strip), and a small floor only when the actual
+  // visible slice would be sub-pixel — anything bigger and the floor starts
+  // misrepresenting the viewport.
+  const float rawHeight = (visibleBottom - visibleTop) * scale;
+  const float minHeight = std::max(6.0f, static_cast<float>(height) * 0.04f);
+  const float markerHeight = std::max(minHeight, std::min(rawHeight,
+                                                          static_cast<float>(height)));
+  const float centerY = top + ((visibleTop + visibleBottom) * 0.5f) * scale;
+  // Clamp the marker inside the strip so a very large rawHeight (image
+  // shorter than the viewport) cannot poke above or below the minimap.
+  const float markerTop = std::clamp(centerY - markerHeight * 0.5f,
+                                     top, top + height - markerHeight);
+  const D2D1_RECT_F marker{left, markerTop, left + static_cast<float>(width),
+                           markerTop + markerHeight};
+  ComPtr<ID2D1SolidColorBrush> markerFill, markerOutline, border;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.28f, 0.66f, 1.0f, 0.28f), &markerFill);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.55f, 0.82f, 1.0f, 0.95f), &markerOutline);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.38f, .52f, .68f, .95f), &border);
+  renderTarget_->FillRectangle(marker, markerFill.Get());
+  renderTarget_->DrawRectangle(marker, markerOutline.Get(), 1.5f);
+  // Top/bottom grip lines for easier targeting during drag, plus a percentage
+  // caption so the user can read the current window directly off the strip.
+  const float gripWidth = std::min(static_cast<float>(width) * 0.42f, 22.0f);
+  const float gripLeft = left + (static_cast<float>(width) - gripWidth) * 0.5f;
+  ComPtr<ID2D1SolidColorBrush> grip;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.85f, 0.95f, 1.0f, 0.85f), &grip);
+  renderTarget_->FillRectangle(
+      D2D1::RectF(gripLeft, markerTop, gripLeft + gripWidth, markerTop + 1.5f), grip.Get());
+  renderTarget_->FillRectangle(
+      D2D1::RectF(gripLeft, markerTop + markerHeight - 1.5f,
+                  gripLeft + gripWidth, markerTop + markerHeight), grip.Get());
+  // Position label: top edge if the visible window sits in the upper half of
+  // the image, otherwise the bottom edge, to avoid covering the marker.
+  const float scrollPercent = imageH > viewportH
+      ? std::clamp(longPreviewScroll_ / (imageH - viewportH), 0.0f, 1.0f) * 100.0f
+      : 0.0f;
+  const std::wstring label = std::to_wstring(static_cast<int>(scrollPercent + 0.5f)) + L"%";
+  const float labelY = centerY < top + height * 0.5f
+      ? markerTop + markerHeight + 2.0f
+      : markerTop - 12.0f;
+  if (labelY + 11.0f <= top + height && labelY >= top) {
+    DrawText(label,
+             D2D1::RectF(left, labelY, left + static_cast<float>(width), labelY + 12.0f),
+             9.5f, D2D1::ColorF(0.78f, 0.88f, 1.0f, 0.95f));
+  }
+  // While cropping, the crop rect is also shown (and adjusted) on the minimap.
+  if (longPreviewStage_ == LongPreviewStage::Crop && longCrop_.right > longCrop_.left &&
+      longCrop_.bottom > longCrop_.top) {
+    const D2D1_RECT_F cropThumb{left + longCrop_.left * scale, top + longCrop_.top * scale,
+                                left + longCrop_.right * scale, top + longCrop_.bottom * scale};
+    ComPtr<ID2D1SolidColorBrush> cropBrush;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.70f, 1.0f, 0.95f), &cropBrush);
+    renderTarget_->DrawRectangle(cropThumb, cropBrush.Get(), 1.2f);
+  }
+  renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(thumb), 8, 8), border.Get(), 1.0f);
+}
+
+// Shared by the viewport and the minimap: which crop grip (or move) does an
+// image-space point grab?  The tolerance is passed in screen pixels converted
+// to image pixels by the caller's scale.
+CaptureOverlay::LongPreviewDrag CaptureOverlay::HitLongCropAdjustment(
+    PointF image, float tolerance) const {
+  const bool nearLeft = std::abs(image.x - longCrop_.left) < tolerance;
+  const bool nearRight = std::abs(image.x - longCrop_.right) < tolerance;
+  const bool nearTop = std::abs(image.y - longCrop_.top) < tolerance;
+  const bool nearBottom = std::abs(image.y - longCrop_.bottom) < tolerance;
+  const bool inside = image.x > longCrop_.left && image.x < longCrop_.right &&
+                      image.y > longCrop_.top && image.y < longCrop_.bottom;
+  if (nearLeft && nearTop) return LongPreviewDrag::CropTL;
+  if (nearRight && nearTop) return LongPreviewDrag::CropTR;
+  if (nearLeft && nearBottom) return LongPreviewDrag::CropBL;
+  if (nearRight && nearBottom) return LongPreviewDrag::CropBR;
+  if (nearLeft) return LongPreviewDrag::CropL;
+  if (nearRight) return LongPreviewDrag::CropR;
+  if (nearTop) return LongPreviewDrag::CropT;
+  if (nearBottom) return LongPreviewDrag::CropB;
+  if (inside) return LongPreviewDrag::CropMove;
+  return LongPreviewDrag::None;
+}
+
+void CaptureOverlay::DrawLongCropOverlay(float stage) {
+  if (!longCaptureResult_) return;
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  const float scale = LongPreviewScale();
+  const D2D1_POINT_2F origin = LongPreviewImageOrigin();
+  const D2D1_RECT_F crop{origin.x + longCrop_.left * scale, origin.y + longCrop_.top * scale,
+                         origin.x + longCrop_.right * scale, origin.y + longCrop_.bottom * scale};
+  // Dim everything outside the crop rect (four strips), then frame it.
+  ComPtr<ID2D1SolidColorBrush> dim;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.45f * stage), &dim);
+  const D2D1_RECT_F strips[] = {
+      {viewport.left, viewport.top, viewport.right, crop.top},
+      {viewport.left, crop.bottom, viewport.right, viewport.bottom},
+      {viewport.left, crop.top, crop.left, crop.bottom},
+      {crop.right, crop.top, viewport.right, crop.bottom}};
+  for (const D2D1_RECT_F& strip : strips) {
+    if (strip.right > strip.left && strip.bottom > strip.top)
+      renderTarget_->FillRectangle(strip, dim.Get());
+  }
+  ComPtr<ID2D1SolidColorBrush> frame;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.70f, 1.0f, stage), &frame);
+  renderTarget_->DrawRectangle(crop, frame.Get(), 1.8f);
+  // Grid guides.
+  ComPtr<ID2D1SolidColorBrush> guide;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.18f * stage), &guide);
+  for (int i = 1; i <= 2; ++i) {
+    const float fx = Lerp(crop.left, crop.right, i / 3.0f);
+    const float fy = Lerp(crop.top, crop.bottom, i / 3.0f);
+    renderTarget_->DrawLine({fx, crop.top}, {fx, crop.bottom}, guide.Get(), 1.0f);
+    renderTarget_->DrawLine({crop.left, fy}, {crop.right, fy}, guide.Get(), 1.0f);
+  }
+  // Corner handles.
+  const float handle = 7.0f;
+  const D2D1_POINT_2F corners[] = {
+      {crop.left, crop.top}, {crop.right, crop.top},
+      {crop.left, crop.bottom}, {crop.right, crop.bottom}};
+  for (const D2D1_POINT_2F& corner : corners) {
+    const D2D1_ELLIPSE ellipse{corner, handle, handle};
+    renderTarget_->FillEllipse(ellipse, frame.Get());
+    ComPtr<ID2D1SolidColorBrush> ring;
+    renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.9f * stage), &ring);
+    renderTarget_->DrawEllipse(ellipse, ring.Get(), 1.6f);
+  }
+  // Live size caption.
+  const int cropWidth = static_cast<int>(longCrop_.right - longCrop_.left + 0.5f);
+  const int cropHeight = static_cast<int>(longCrop_.bottom - longCrop_.top + 0.5f);
+  const std::wstring caption = std::to_wstring(cropWidth) + L" × " + std::to_wstring(cropHeight);
+  const D2D1_RECT_F captionRect{crop.left, crop.top - 26.0f, crop.left + 120.0f, crop.top - 4.0f};
+  DrawText(caption.c_str(), captionRect, 11.5f, D2D1::ColorF(0.55f, 0.85f, 1.0f, stage),
+           DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+}
+
+void CaptureOverlay::DrawLongPreviewCommands() {
+  if (!longCaptureResult_) return;
+  DrawLongCommandsTransformed(LongPreviewImageOrigin(), LongPreviewScale());
+}
+
+// Renders every committed (non-baked) annotation plus the in-flight preview
+// command in image coordinates, mapped through the given origin/scale.  The
+// main 1:1 view and the minimap share this so edits are visible on both.
+void CaptureOverlay::DrawLongCommandsTransformed(D2D1_POINT_2F origin, float scale) {
+  // Annotate coordinates are image pixels: map them into the target area.
+  // D2D matrices compose left-to-right (p' = p * A * B applies A first), so
+  // the scale must come first: Translation * Scale would drag the origin
+  // through the scale factor, which is only harmless at the 1:1 view scale
+  // and throws every stroke off the minimap.
+  const D2D1_MATRIX_3X2_F transform =
+      D2D1::Matrix3x2F::Scale(D2D1::SizeF(scale, scale), D2D1::Point2F(0, 0)) *
+      D2D1::Matrix3x2F::Translation(origin.x, origin.y);
+  std::vector<EditCommand> commands;
+  commands.reserve(document_.Size() + (previewCommand_ ? 1u : 0u));
+  for (size_t index = 0; index < document_.Size(); ++index) {
+    const EditCommand* command = document_.At(index);
+    if (!command) continue;
+    // Committed mosaics are baked into the stitched pixels themselves.
+    if (std::holds_alternative<MosaicCommand>(*command)) continue;
+    commands.push_back(*command);
+  }
+  if (previewCommand_) commands.push_back(*previewCommand_);
+  ComPtr<ID2D1StrokeStyle> rounded;
+  if (d2dFactory_) {
+    d2dFactory_->CreateStrokeStyle(
+        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                    D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND,
+                                    10.0f, D2D1_DASH_STYLE_SOLID, 0.0f), nullptr, 0, &rounded);
+  }
+  renderTarget_->SetTransform(transform);
+  // On the minimap the image shrinks by an order of magnitude, which would
+  // scale stroke widths down to invisible sub-pixel hairlines (only baked
+  // mosaics stayed visible there).  Clamp every stroke to at least ~1 device
+  // pixel after the transform; at the 1:1 view scale this changes nothing.
+  const auto visibleWidth = [scale](float width) {
+    return scale > 0.0f ? std::max(width, 1.0f / scale) : width;
+  };
+  for (const auto& command : commands) {
+    if (const auto* pen = std::get_if<PenCommand>(&command)) {
+      if (pen->points.empty()) continue;
+      ComPtr<ID2D1SolidColorBrush> brush;
+      renderTarget_->CreateSolidColorBrush(
+          ColorFromSetting(pen->style.color, pen->style.opacity), &brush);
+      if (pen->widthScales.empty()) {
+        // Uniform-width fallback (legacy strokes without velocity samples).
+        const float penWidth = visibleWidth(pen->style.width);
+        if (pen->points.size() == 1) {
+          renderTarget_->FillEllipse(
+              {D2D1::Point2F(pen->points.front().x, pen->points.front().y),
+               penWidth * 0.5f, penWidth * 0.5f}, brush.Get());
+          continue;
+        }
+        ComPtr<ID2D1PathGeometry> geometry;
+        if (!d2dFactory_ || FAILED(d2dFactory_->CreatePathGeometry(&geometry))) continue;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(geometry->Open(&sink))) continue;
+        sink->BeginFigure({pen->points.front().x, pen->points.front().y},
+                          D2D1_FIGURE_BEGIN_HOLLOW);
+        for (size_t i = 1; i < pen->points.size(); ++i) {
+          sink->AddLine({pen->points[i].x, pen->points[i].y});
+        }
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        renderTarget_->DrawGeometry(geometry.Get(), brush.Get(), penWidth, rounded.Get());
+        continue;
+      }
+      // Pressure path: per-point widths, identical to the normal edit bar.
+      const auto center = [&](size_t index) {
+        return D2D1::Point2F(pen->points[index].x, pen->points[index].y);
+      };
+      const auto dot = [&](size_t index) {
+        const float radius = visibleWidth(PenPointWidth(*pen, index)) * 0.5f;
+        renderTarget_->FillEllipse({center(index), radius, radius}, brush.Get());
+      };
+      dot(0);
+      for (size_t index = 1; index < pen->points.size(); ++index) {
+        const float width = visibleWidth(
+            (PenPointWidth(*pen, index - 1) + PenPointWidth(*pen, index)) * 0.5f);
+        renderTarget_->DrawLine(center(index - 1), center(index), brush.Get(), width,
+                                rounded.Get());
+        dot(index);
+      }
+    } else if (const auto* shape = std::get_if<ShapeCommand>(&command)) {
+      const RectF rect = NormalizeRect(shape->start, shape->end);
+      const D2D1_RECT_F bounds = D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom);
+      const float strokeWidth = visibleWidth(shape->style.stroke.width);
+      ComPtr<ID2D1SolidColorBrush> stroke;
+      renderTarget_->CreateSolidColorBrush(
+          ColorFromSetting(shape->style.stroke.color, shape->style.stroke.opacity), &stroke);
+      if (shape->kind == ShapeKind::Rectangle) {
+        renderTarget_->DrawRectangle(bounds, stroke.Get(), strokeWidth);
+      } else if (shape->kind == ShapeKind::Ellipse) {
+        const D2D1_ELLIPSE ellipse{{(bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2},
+                                   (bounds.right - bounds.left) / 2, (bounds.bottom - bounds.top) / 2};
+        renderTarget_->DrawEllipse(ellipse, stroke.Get(), strokeWidth);
+      } else if (shape->kind == ShapeKind::Line) {
+        renderTarget_->DrawLine({shape->start.x, shape->start.y},
+                                {shape->end.x, shape->end.y}, stroke.Get(),
+                                strokeWidth);
+      } else {
+        DrawArrow(renderTarget_.Get(), d2dFactory_.Get(),
+                  {shape->start.x, shape->start.y}, {shape->end.x, shape->end.y},
+                  ColorFromSetting(shape->style.stroke.color, shape->style.stroke.opacity),
+                  strokeWidth);
+      }
+    } else if (const auto* mosaic = std::get_if<MosaicCommand>(&command)) {
+      // In-flight mosaic only: committed mosaics are baked into the pixels.
+      const float mosaicWidth = visibleWidth(mosaic->brushSize);
+      ComPtr<ID2D1SolidColorBrush> brush;
+      renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.2f, .75f, 1.0f, .30f), &brush);
+      if (mosaic->brush) {
+        if (mosaic->points.size() == 1) {
+          renderTarget_->FillEllipse(
+              {{mosaic->points.front().x, mosaic->points.front().y},
+               mosaicWidth * 0.5f, mosaicWidth * 0.5f}, brush.Get());
+        }
+        for (size_t i = 1; i < mosaic->points.size(); ++i) {
+          renderTarget_->DrawLine({mosaic->points[i - 1].x, mosaic->points[i - 1].y},
+                                  {mosaic->points[i].x, mosaic->points[i].y},
+                                  brush.Get(), mosaicWidth, rounded.Get());
+        }
+      } else {
+        const RectF rect = NormalizeRect(PointF{mosaic->bounds.left, mosaic->bounds.top},
+                                         PointF{mosaic->bounds.right, mosaic->bounds.bottom});
+        renderTarget_->FillRectangle(
+            D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom), brush.Get());
+      }
+    }
+  }
+  renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+// Annotation picking in image coordinates, mirroring HitTestCommand.
+std::optional<size_t> CaptureOverlay::HitLongCommand(PointF image, Tool toolFilter) const {
+  for (size_t index = document_.Size(); index > 0; --index) {
+    const EditCommand* command = document_.At(index - 1);
+    if (!command) continue;
+    if (!CommandMatchesTool(*command, toolFilter)) continue;
+    const RectF bounds = CommandBounds(*command);
+    if (NearRect(bounds, image, 8.0f) && HitCommandGeometry(*command, image)) return index - 1;
+  }
+  return std::nullopt;
+}
+
+CaptureOverlay::SelectionAdjustment CaptureOverlay::HitLongCommandAdjustment(PointF image) const {
+  if (!selectedCommand_) return SelectionAdjustment::None;
+  const RectF bounds = SelectedCommandBounds();
+  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return SelectionAdjustment::None;
+  const float minimum = std::min(bounds.right - bounds.left, bounds.bottom - bounds.top);
+  const float cornerRadius = std::clamp(minimum * 0.28f, 2.5f, 9.0f);
+  const float edgeRadius = std::clamp(minimum * 0.16f, 2.0f, 4.0f);
+  const auto isNearCommand = [&](float x, float y, float radius) {
+    return std::abs(image.x - x) <= radius && std::abs(image.y - y) <= radius;
+  };
+  if (isNearCommand(bounds.left, bounds.top, cornerRadius)) return SelectionAdjustment::TopLeft;
+  if (isNearCommand(bounds.right, bounds.top, cornerRadius)) return SelectionAdjustment::TopRight;
+  if (isNearCommand(bounds.left, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomLeft;
+  if (isNearCommand(bounds.right, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomRight;
+  if (std::abs(image.x - bounds.left) <= edgeRadius && image.y >= bounds.top && image.y <= bounds.bottom)
+    return SelectionAdjustment::Left;
+  if (std::abs(image.x - bounds.right) <= edgeRadius && image.y >= bounds.top && image.y <= bounds.bottom)
+    return SelectionAdjustment::Right;
+  if (std::abs(image.y - bounds.top) <= edgeRadius && image.x >= bounds.left && image.x <= bounds.right)
+    return SelectionAdjustment::Top;
+  if (std::abs(image.y - bounds.bottom) <= edgeRadius && image.x >= bounds.left && image.x <= bounds.right)
+    return SelectionAdjustment::Bottom;
+  return Contains(bounds, image) ? SelectionAdjustment::Move : SelectionAdjustment::None;
+}
+
+void CaptureOverlay::ContinueLongCommandAdjustment(POINT point) {
+  if (!selectedCommand_ || !commandBeforeAdjust_ || !longCaptureResult_) return;
+  const PointF image = LongPreviewToImage(point);
+  const float dx = image.x - longPreviewDragStart_.x;
+  const float dy = image.y - longPreviewDragStart_.y;
+  RectF next = selectedCommandBeforeBounds_;
+  const bool left = commandAdjustment_ == SelectionAdjustment::Left ||
+                    commandAdjustment_ == SelectionAdjustment::TopLeft ||
+                    commandAdjustment_ == SelectionAdjustment::BottomLeft;
+  const bool right = commandAdjustment_ == SelectionAdjustment::Right ||
+                     commandAdjustment_ == SelectionAdjustment::TopRight ||
+                     commandAdjustment_ == SelectionAdjustment::BottomRight;
+  const bool top = commandAdjustment_ == SelectionAdjustment::Top ||
+                   commandAdjustment_ == SelectionAdjustment::TopLeft ||
+                   commandAdjustment_ == SelectionAdjustment::TopRight;
+  const bool bottom = commandAdjustment_ == SelectionAdjustment::Bottom ||
+                      commandAdjustment_ == SelectionAdjustment::BottomLeft ||
+                      commandAdjustment_ == SelectionAdjustment::BottomRight;
+  const float imageWidth = static_cast<float>(longCaptureResult_->width);
+  const float imageHeight = static_cast<float>(longCaptureResult_->height);
+  if (commandAdjustment_ == SelectionAdjustment::Move) {
+    const float width = next.right - next.left;
+    const float height = next.bottom - next.top;
+    next.left = std::clamp(selectedCommandBeforeBounds_.left + dx, 0.0f, imageWidth - width);
+    next.top = std::clamp(selectedCommandBeforeBounds_.top + dy, 0.0f, imageHeight - height);
+    next.right = next.left + width;
+    next.bottom = next.top + height;
+  } else {
+    if (left) next.left = std::clamp(selectedCommandBeforeBounds_.left + dx, 0.0f,
+                                     next.right - 4.0f);
+    if (right) next.right = std::clamp(selectedCommandBeforeBounds_.right + dx,
+                                       next.left + 4.0f, imageWidth);
+    if (top) next.top = std::clamp(selectedCommandBeforeBounds_.top + dy, 0.0f,
+                                   next.bottom - 4.0f);
+    if (bottom) next.bottom = std::clamp(selectedCommandBeforeBounds_.bottom + dy,
+                                         next.top + 4.0f, imageHeight);
+  }
+  EditCommand updated = *commandBeforeAdjust_;
+  TransformCommand(updated, selectedCommandBeforeBounds_, next);
+  document_.Replace(*selectedCommand_, std::move(updated));
+}
+
+void CaptureOverlay::DrawLongCommandHandles() {
+  const RectF bounds = SelectedCommandBounds();
+  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+  const float scale = LongPreviewScale();
+  const D2D1_POINT_2F origin = LongPreviewImageOrigin();
+  const D2D1_RECT_F screenBounds{
+      origin.x + bounds.left * scale, origin.y + bounds.top * scale,
+      origin.x + bounds.right * scale, origin.y + bounds.bottom * scale};
+  ComPtr<ID2D1SolidColorBrush> border, fill;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.20f, .75f, 1.0f, .95f), &border);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.95f, .98f, 1.0f, 1.0f), &fill);
+  ComPtr<ID2D1StrokeStyle> dashed;
+  if (d2dFactory_) {
+    d2dFactory_->CreateStrokeStyle(
+        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                                    D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER,
+                                    10.0f, D2D1_DASH_STYLE_DASH, 0.0f), nullptr, 0, &dashed);
+  }
+  renderTarget_->DrawRectangle(screenBounds, border.Get(), 1.5f, dashed.Get());
+  const std::array<D2D1_POINT_2F, 8> points{{
+      {screenBounds.left, screenBounds.top},
+      {(screenBounds.left + screenBounds.right) / 2, screenBounds.top},
+      {screenBounds.right, screenBounds.top},
+      {screenBounds.right, (screenBounds.top + screenBounds.bottom) / 2},
+      {screenBounds.right, screenBounds.bottom},
+      {(screenBounds.left + screenBounds.right) / 2, screenBounds.bottom},
+      {screenBounds.left, screenBounds.bottom},
+      {screenBounds.left, (screenBounds.top + screenBounds.bottom) / 2}}};
+  for (const D2D1_POINT_2F point : points) {
+    const D2D1_RECT_F handle = D2D1::RectF(point.x - 4.0f, point.y - 4.0f,
+                                           point.x + 4.0f, point.y + 4.0f);
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), fill.Get());
+    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), border.Get(), 1.0f);
+  }
+}
+
+void CaptureOverlay::BeginLongCrop() {
+  if (!longCaptureResult_) return;
+  longPreviewStage_ = LongPreviewStage::Crop;
+  // Re-entering crop starts from the currently active region (the committed
+  // crop when one exists, the full stitched image otherwise) so the user
+  // can grow the rectangle to bring grayed-out strips back.
+  longCrop_ = longCropAppliedValid_
+      ? longCropApplied_
+      : RectF{0.0f, 0.0f, static_cast<float>(longCaptureResult_->width),
+              static_cast<float>(longCaptureResult_->height)};
+  longCropBefore_ = longCrop_;
+  longPreviewDrag_ = LongPreviewDrag::None;
+  longCropOnThumb_ = false;
+  longThumbDragging_ = false;
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::ApplyLongCrop() {
+  LongCaptureImage* image = longCaptureResult_.get();
+  if (!image || image->width <= 0 || image->height <= 0) return;
+  const int left = std::clamp(static_cast<int>(std::lround(longCrop_.left)), 0, image->width - 2);
+  const int top = std::clamp(static_cast<int>(std::lround(longCrop_.top)), 0, image->height - 2);
+  const int right = std::clamp(static_cast<int>(std::lround(longCrop_.right)), left + 2, image->width);
+  const int bottom = std::clamp(static_cast<int>(std::lround(longCrop_.bottom)), top + 2, image->height);
+  if (right - left < 2 || bottom - top < 2) {
+    // Degenerate/no-op crop: simply leave the crop mode.
+    BeginLongPreviewStage(LongPreviewStage::View);
+    return;
+  }
+  // Soft crop: the full pixel buffer stays put so the user can re-enter Crop
+  // and grow the rectangle to bring the grayed-out strips back.  The
+  // committed crop is recorded as longCropApplied_ for the renderer; the
+  // pre-crop size remains the source of truth for scroll range, annotation
+  // coordinates and any future stitching pass.
+  const bool wasIdentity = longCropAppliedValid_ &&
+      std::lround(longCropApplied_.left) == 0 && std::lround(longCropApplied_.top) == 0 &&
+      std::lround(longCropApplied_.right) == image->width &&
+      std::lround(longCropApplied_.bottom) == image->height;
+  const bool isIdentity = (left == 0 && top == 0 &&
+                           right == image->width && bottom == image->height);
+  if (wasIdentity && isIdentity) {
+    // No change: just exit crop mode without touching anything.
+    BeginLongPreviewStage(LongPreviewStage::View);
+    return;
+  }
+  longCropApplied_ = {static_cast<float>(left), static_cast<float>(top),
+                      static_cast<float>(right), static_cast<float>(bottom)};
+  longCropAppliedValid_ = true;
+  longCropChanged_ = true;
+  // Reset the live crop rectangle to the new active area so the next
+  // adjustment starts from the committed state, not the previous one.
+  longCrop_ = longCropApplied_;
+  longPreviewScroll_ = 0.0f;
+  longPreviewStage_ = LongPreviewStage::View;
+  // Replay the window transition so the cropped result eases into place.
+  longPreviewProgress_ = 0.0f;
+  longPreviewAnimating_ = true;
+  longPreviewAnimStart_ = std::chrono::steady_clock::now();
+  SetTimer(hwnd_, kLongPreviewTimer, 16, nullptr);
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+PointF CaptureOverlay::LongPreviewToImage(POINT point) const {
+  const D2D1_POINT_2F origin = LongPreviewImageOrigin();
+  const float scale = LongPreviewScale();
+  // origin already encodes the current scroll offset (it shifts the image up
+  // by longPreviewScroll_ * scale when the picture is taller than the
+  // viewport), so the y term does not need to add it again.
+  return {(point.x - origin.x) / scale, (point.y - origin.y) / scale};
+}
+
+// Mosaics are baked into the stitched pixels for display, but their commands
+// stay in the document so they can be selected, moved, resized and undone.
+// longMosaicBase_ holds the pristine pixels from before the first bake; every
+// rebuild resets to that base and re-applies the whole mosaic set.
+void CaptureOverlay::CommitLongMosaic(const MosaicCommand& command) {
+  LongCaptureImage* image = longCaptureResult_.get();
+  if (!image || image->width <= 0 || image->height <= 0 || image->bgra.empty()) return;
+  if (longMosaicBase_.empty()) longMosaicBase_ = image->bgra;
+  const std::array<EditCommand, 1> one{EditCommand{command}};
+  ApplyMosaics(image->bgra, image->width, image->height, image->stride, one);
+  document_.Add(one[0]);
+  longPreviewTiles_.clear();
+  EnsureLongPreviewTiles();
+}
+
+void CaptureOverlay::RebuildLongMosaicPixels() {
+  LongCaptureImage* image = longCaptureResult_.get();
+  if (!image || longMosaicBase_.empty()) return;  // no mosaic has ever been baked
+  std::vector<EditCommand> mosaics;
+  for (size_t index = 0; index < document_.Size(); ++index) {
+    const EditCommand* command = document_.At(index);
+    if (command && std::holds_alternative<MosaicCommand>(*command)) mosaics.push_back(*command);
+  }
+  image->bgra = longMosaicBase_;
+  if (mosaics.empty()) {
+    longMosaicBase_.clear();  // last mosaic gone: drop the pristine copy too
+  } else {
+    ApplyMosaics(image->bgra, image->width, image->height, image->stride, mosaics);
+  }
+  longPreviewTiles_.clear();
+  EnsureLongPreviewTiles();
+}
+
+// The bar stays the bar after a long capture: tool buttons, zoom slider and
+// copy/save first, bar-drag for the rest of the strip, then stage gestures
+// (crop handles / annotation) over the image.
+void CaptureOverlay::LongPreviewGestureStart(POINT point) {
+  if (!longCaptureResult_ || longPreviewAnimating_ ||
+      longPreviewStageProgress_ < 1.0f) return;  // ignore input mid-transition
+  // Utility layer first: back/close stay reachable from every review stage.
+  if (HitUtilityClose(point)) { Cancel(); return; }
+  if (HitUtilityBack(point)) { UtilityBack(); return; }
+  if (longPreviewStage_ == LongPreviewStage::Crop) {
+    // While a crop is pending the right side shows cancel/confirm.
+    if (HitSave(point)) { ApplyLongCrop(); return; }
+    if (HitCopy(point)) { BeginLongPreviewStage(LongPreviewStage::View); return; }
+  } else {
+    if (HitCopy(point)) { Complete(CaptureCompletion::Copy); return; }
+    if (HitSave(point)) { Complete(CaptureCompletion::Save); return; }
+  }
+  for (int index = 0; index <= static_cast<int>(kLongPreviewTools.size()); ++index) {
+    if (!HitLongToolbarButton(index, point)) continue;
+    if (index == 0) {
+      BeginLongCrop();
+    } else {
+      longPreviewTool_ = kLongPreviewTools[static_cast<size_t>(index) - 1];
+      previewCommand_.reset();
+      // Mirror SelectTool: an annotation that no longer matches the active
+      // tool drops its selection (Select keeps everything selected).
+      if (selectedCommand_) {
+        const EditCommand* command = document_.At(*selectedCommand_);
+        if (!command || !CommandMatchesTool(*command, longPreviewTool_)) {
+          selectedCommand_.reset();
+          commandAdjustment_ = SelectionAdjustment::None;
+          commandBeforeAdjust_.reset();
+        }
+      }
+      BeginLongPreviewStage(LongPreviewStage::Annotate);
+    }
+    return;
+  }
+  if (Contains(ToolbarRect(), point)) {
+    const RECT toolbar = ToolbarRect();
+    toolbarDragging_ = true;
+    toolbarPositionSet_ = true;
+    toolbarDragStart_ = point;
+    toolbarPositionStart_ = {toolbar.left, toolbar.top};
+    toolbarPosition_ = toolbarPositionStart_;
+    SetCapture(hwnd_);
+    return;
+  }
+  if (HitLongThumb(point)) {
+    // While cropping, the minimap adjusts the crop rect instead of scrolling.
+    if (longPreviewStage_ == LongPreviewStage::Crop) {
+      const PointF image = LongThumbToImage(point);
+      const LongPreviewDrag drag = HitLongCropAdjustment(
+          image, 12.0f / std::max(0.001f, LongThumbScale()));
+      if (drag != LongPreviewDrag::None) {
+        longCropOnThumb_ = true;
+        longPreviewDrag_ = drag;
+        longPreviewDragStart_ = image;
+        longCropBefore_ = longCrop_;
+        SetCapture(hwnd_);
+      }
+      return;
+    }
+    LongThumbBeginDrag(point);
+    return;
+  }
+
+  const D2D1_RECT_F viewport = LongPreviewViewportRect();
+  if (point.x < viewport.left || point.x > viewport.right ||
+      point.y < viewport.top || point.y > viewport.bottom) {
+    return;
+  }
+  const PointF image = LongPreviewToImage(point);
+  if (longPreviewStage_ == LongPreviewStage::Crop) {
+    const LongPreviewDrag drag = HitLongCropAdjustment(
+        image, 12.0f / std::max(0.01f, LongPreviewScale()));
+    if (drag != LongPreviewDrag::None) {
+      longPreviewDrag_ = drag;
+      longPreviewDragStart_ = image;
+      longCropBefore_ = longCrop_;
+      SetCapture(hwnd_);
+    }
+    return;
+  }
+  if (longPreviewStage_ != LongPreviewStage::Annotate) return;
+
+  // Mirror the normal bar: with Select active, or on an annotation matching
+  // the active tool, the gesture adjusts that annotation instead of drawing.
+  const Tool hitFilter = longPreviewTool_ == Tool::Select ? Tool::Select : longPreviewTool_;
+  std::optional<size_t> hit = HitLongCommand(image, hitFilter);
+  if (!hit && selectedCommand_) {
+    const EditCommand* selected = document_.At(*selectedCommand_);
+    if (selected && CommandMatchesTool(*selected, hitFilter) &&
+        NearRect(CommandBounds(*selected), image, 10.0f)) hit = selectedCommand_;
+  }
+  if (hit) {
+    selectedCommand_ = *hit;
+    commandAdjustment_ = HitLongCommandAdjustment(image);
+    if (commandAdjustment_ == SelectionAdjustment::None)
+      commandAdjustment_ = SelectionAdjustment::Move;
+    if (const EditCommand* command = document_.At(*selectedCommand_)) {
+      commandBeforeAdjust_ = *command;
+      selectedCommandBeforeBounds_ = CommandBounds(*command);
+    }
+    drawing_ = true;
+    longPreviewDrag_ = LongPreviewDrag::CommandAdjust;
+    longPreviewDragStart_ = image;
+    dragStart_ = point;
+    currentPoint_ = point;
+    SetCapture(hwnd_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  selectedCommand_.reset();
+  commandAdjustment_ = SelectionAdjustment::None;
+  commandBeforeAdjust_.reset();
+  if (longPreviewTool_ == Tool::Select) {
+    InvalidateRect(hwnd_, nullptr, FALSE);  // empty space: just deselect
+    return;
+  }
+
+  drawing_ = true;
+  longPreviewDrag_ = LongPreviewDrag::Annotate;
+  dragStart_ = point;
+  longPreviewDragStart_ = image;
+  currentPoint_ = point;
+  SetCapture(hwnd_);
+  const float maxWidth = static_cast<float>(longCaptureResult_->width);
+  const float maxHeight = static_cast<float>(longCaptureResult_->height);
+  const PointF local{std::clamp(image.x, 0.0f, maxWidth), std::clamp(image.y, 0.0f, maxHeight)};
+  if (longPreviewTool_ == Tool::Pen) {
+    penLastSampleTime_ = std::chrono::steady_clock::now();
+    penWidthScale_ = 1.0f;
+    previewCommand_ = PenCommand{{local}, config_.pen, {penWidthScale_}};
+  } else if (longPreviewTool_ == Tool::MosaicBrush) {
+    previewCommand_ = MosaicCommand{true, {local}, {}, config_.mosaicStyle,
+                                    config_.mosaicBrushSize, config_.mosaicPixelSize,
+                                    config_.mosaicBlurRadius};
+  } else if (longPreviewTool_ == Tool::MosaicRectangle) {
+    previewCommand_ = MosaicCommand{false, {}, {local.x, local.y, local.x, local.y},
+                                    config_.mosaicStyle, config_.mosaicBrushSize,
+                                    config_.mosaicPixelSize, config_.mosaicBlurRadius};
+  } else {
+    ShapeKind kind = longPreviewTool_ == Tool::Rectangle ? ShapeKind::Rectangle
+                     : longPreviewTool_ == Tool::Ellipse ? ShapeKind::Ellipse
+                     : longPreviewTool_ == Tool::Line ? ShapeKind::Line : ShapeKind::Arrow;
+    ShapeSetting style = kind == ShapeKind::Rectangle ? config_.rectangle
+                         : kind == ShapeKind::Ellipse ? config_.ellipse
+                         : ShapeSetting{kind == ShapeKind::Line ? config_.line : config_.arrow, {}, 0};
+    previewCommand_ = ShapeCommand{kind, local, local, style};
+  }
+}
+
+void CaptureOverlay::LongPreviewGestureMove(POINT point) {
+  currentPoint_ = point;
+  if (longPreviewDrag_ == LongPreviewDrag::None) return;
+  // Crop gestures started on the minimap stay in minimap coordinates.
+  const PointF image = longCropOnThumb_ ? LongThumbToImage(point)
+                                        : LongPreviewToImage(point);
+  if (longPreviewDrag_ == LongPreviewDrag::CommandAdjust) {
+    ContinueLongCommandAdjustment(point);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (longPreviewDrag_ == LongPreviewDrag::Annotate) {
+    if (!previewCommand_ || !longCaptureResult_) return;
+    const PointF local{std::clamp(image.x, 0.0f, static_cast<float>(longCaptureResult_->width)),
+                       std::clamp(image.y, 0.0f, static_cast<float>(longCaptureResult_->height))};
+    if (auto* pen = std::get_if<PenCommand>(&*previewCommand_)) {
+      const float distance = pen->points.empty()
+                                 ? 0.0f
+                                 : std::hypot(local.x - pen->points.back().x,
+                                              local.y - pen->points.back().y);
+      if (pen->points.empty() || distance >= 1.25f) {
+        const auto now = std::chrono::steady_clock::now();
+        const float elapsed = std::clamp(std::chrono::duration<float>(now - penLastSampleTime_).count(),
+                                         0.004f, 0.12f);
+        const float targetScale = PenWidthScaleForSpeed(distance / elapsed);
+        const float smoothing = std::clamp(elapsed * 18.0f, 0.16f, 0.55f);
+        penWidthScale_ = std::lerp(penWidthScale_, targetScale, smoothing);
+        pen->points.push_back(local);
+        pen->widthScales.push_back(penWidthScale_);
+        penLastSampleTime_ = now;
+      }
+    } else if (auto* shape = std::get_if<ShapeCommand>(&*previewCommand_)) {
+      shape->end = local;
+    } else if (auto* mosaic = std::get_if<MosaicCommand>(&*previewCommand_)) {
+      if (mosaic->brush) mosaic->points.push_back(local);
+      else mosaic->bounds = NormalizeRect(longPreviewDragStart_, local);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return;
+  }
+  if (!longCaptureResult_) return;
+  const float dx = image.x - longPreviewDragStart_.x;
+  const float dy = image.y - longPreviewDragStart_.y;
+  const float imageWidth = static_cast<float>(longCaptureResult_->width);
+  const float imageHeight = static_cast<float>(longCaptureResult_->height);
+  const float minSize = 16.0f;
+  switch (longPreviewDrag_) {
+    case LongPreviewDrag::CropL:
+      longCrop_.left = std::clamp(longCropBefore_.left + dx, 0.0f, longCrop_.right - minSize);
+      break;
+    case LongPreviewDrag::CropR:
+      longCrop_.right = std::clamp(longCropBefore_.right + dx, longCrop_.left + minSize, imageWidth);
+      break;
+    case LongPreviewDrag::CropT:
+      longCrop_.top = std::clamp(longCropBefore_.top + dy, 0.0f, longCrop_.bottom - minSize);
+      break;
+    case LongPreviewDrag::CropB:
+      longCrop_.bottom = std::clamp(longCropBefore_.bottom + dy, longCrop_.top + minSize, imageHeight);
+      break;
+    case LongPreviewDrag::CropTL:
+      longCrop_.left = std::clamp(longCropBefore_.left + dx, 0.0f, longCrop_.right - minSize);
+      longCrop_.top = std::clamp(longCropBefore_.top + dy, 0.0f, longCrop_.bottom - minSize);
+      break;
+    case LongPreviewDrag::CropTR:
+      longCrop_.right = std::clamp(longCropBefore_.right + dx, longCrop_.left + minSize, imageWidth);
+      longCrop_.top = std::clamp(longCropBefore_.top + dy, 0.0f, longCrop_.bottom - minSize);
+      break;
+    case LongPreviewDrag::CropBL:
+      longCrop_.left = std::clamp(longCropBefore_.left + dx, 0.0f, longCrop_.right - minSize);
+      longCrop_.bottom = std::clamp(longCropBefore_.bottom + dy, longCrop_.top + minSize, imageHeight);
+      break;
+    case LongPreviewDrag::CropBR:
+      longCrop_.right = std::clamp(longCropBefore_.right + dx, longCrop_.left + minSize, imageWidth);
+      longCrop_.bottom = std::clamp(longCropBefore_.bottom + dy, longCrop_.top + minSize, imageHeight);
+      break;
+    case LongPreviewDrag::CropMove: {
+      const float width = longCropBefore_.right - longCropBefore_.left;
+      const float height = longCropBefore_.bottom - longCropBefore_.top;
+      longCrop_.left = std::clamp(longCropBefore_.left + dx, 0.0f, imageWidth - width);
+      longCrop_.top = std::clamp(longCropBefore_.top + dy, 0.0f, imageHeight - height);
+      longCrop_.right = longCrop_.left + width;
+      longCrop_.bottom = longCrop_.top + height;
+      break;
+    }
+    default: break;
+  }
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::LongPreviewGestureEnd(POINT point) {
+  if (longPreviewDrag_ == LongPreviewDrag::None) return;
+  if (longPreviewDrag_ == LongPreviewDrag::CommandAdjust) {
+    // Moving/scaling a mosaic must re-bake its pixels from the pristine base.
+    if (selectedCommand_) {
+      const EditCommand* command = document_.At(*selectedCommand_);
+      if (command && std::holds_alternative<MosaicCommand>(*command)) RebuildLongMosaicPixels();
+    }
+    commandAdjustment_ = SelectionAdjustment::None;
+    commandBeforeAdjust_.reset();
+  } else if (longPreviewDrag_ == LongPreviewDrag::Annotate) {
+    LongPreviewGestureMove(point);
+    if (previewCommand_) {
+      if (auto* mosaic = std::get_if<MosaicCommand>(&*previewCommand_)) {
+        CommitLongMosaic(*mosaic);
+      } else {
+        document_.Add(std::move(*previewCommand_));
+      }
+    }
+    previewCommand_.reset();
+  }
+  drawing_ = false;
+  longPreviewDrag_ = LongPreviewDrag::None;
+  longCropOnThumb_ = false;
+  if (GetCapture() == hwnd_) ReleaseCapture();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// The thumbnail panel grows beside the selection: prefer the right side, then
+// the left, then below/above, avoiding the toolbar and staying inside the
+// work area.  It must never cover the selection itself — the panel is overlay
+// content and would be stitched into the live capture.
+RECT CaptureOverlay::ScrollPreviewPanelRect() const {
+  if (!HasArea(selection_)) return RECT{};
+  const RECT work = ToolbarWorkArea();
+  const RECT toolbar = ToolbarRect();
+  const int workHeight = std::max(1, static_cast<int>(work.bottom - work.top));
+  const int selectionWidth = selection_.right - selection_.left;
+  const int selectionHeight = selection_.bottom - selection_.top;
+  const int panelWidth = std::clamp(selectionWidth * 3 / 5, 200, 320);
+  const int panelHeight = std::clamp(selectionHeight, 200, std::max(200, workHeight - 24));
+  const int shortHeight = std::min(panelHeight, 260);
+  std::array<RECT, 6> candidates{{
+      {selection_.right + 14, selection_.top,
+       selection_.right + 14 + panelWidth, selection_.top + panelHeight},
+      {selection_.left - 14 - panelWidth, selection_.top,
+       selection_.left - 14, selection_.top + panelHeight},
+      {selection_.right + 14, selection_.bottom - panelHeight,
+       selection_.right + 14 + panelWidth, selection_.bottom},
+      {selection_.left - 14 - panelWidth, selection_.bottom - panelHeight,
+       selection_.left - 14, selection_.bottom},
+      {selection_.left, selection_.bottom + 14,
+       selection_.left + panelWidth, selection_.bottom + 14 + shortHeight},
+      {selection_.left, selection_.top - 14 - shortHeight,
+       selection_.left + panelWidth, selection_.top - 14},
+  }};
+  RECT overlap{};
+  for (const RECT& candidate : candidates) {
+    if (candidate.left < work.left || candidate.top < work.top ||
+        candidate.right > work.right || candidate.bottom > work.bottom) {
+      continue;
+    }
+    if (IntersectRect(&overlap, &candidate, &toolbar)) continue;
+    return candidate;
+  }
+  // No fully free spot: clamp the beside-selection panel into the work area.
+  RECT fallback = candidates.front();
+  const int width = fallback.right - fallback.left;
+  const int height = fallback.bottom - fallback.top;
+  fallback.left = std::clamp(static_cast<int>(fallback.left), static_cast<int>(work.left),
+                             std::max(static_cast<int>(work.left),
+                                      static_cast<int>(work.right) - width));
+  fallback.top = std::clamp(static_cast<int>(fallback.top), static_cast<int>(work.top),
+                            std::max(static_cast<int>(work.top),
+                                     static_cast<int>(work.bottom) - height));
+  fallback.right = fallback.left + width;
+  fallback.bottom = fallback.top + height;
+  return fallback;
+}
+
+void CaptureOverlay::DrawScrollPreviewPanel() {
+  const RECT rect = ScrollPreviewPanelRect();
+  if (!HasArea(rect)) return;
+  const float left = static_cast<float>(rect.left);
+  const float top = static_cast<float>(rect.top);
+  const float width = static_cast<float>(rect.right - rect.left);
+  const float height = static_cast<float>(rect.bottom - rect.top);
+  if (width < 120 || height < 90) return;
+  ComPtr<ID2D1SolidColorBrush> background, border;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.05f, .07f, .10f, .95f), &background);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.28f, .54f, .82f, .90f), &border);
+  renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(rect), 12, 12), background.Get());
+  renderTarget_->DrawRoundedRectangle(
+      D2D1::RoundedRect(D2D1::RectF(left + 1, top + 1, left + width - 1, top + height - 1), 11, 11),
+      border.Get(), 1.0f);
+  DrawText(L"长截图预览", D2D1::RectF(left + 12, top + 5, left + width * 0.5f, top + 27),
+           13, D2D1::ColorF(.96f, .98f, 1.0f, 1), DWRITE_TEXT_ALIGNMENT_LEADING,
+           DWRITE_FONT_WEIGHT_SEMI_BOLD);
+  const std::wstring dimensions = std::to_wstring(scrollWidth_) + L" × " +
+                                  std::to_wstring(std::max(0, scrollHeight_)) + L" px";
+  DrawText(dimensions, D2D1::RectF(left + width * 0.5f, top + 5, left + width - 12, top + 27),
+           11, D2D1::ColorF(.62f, .72f, .86f, 1), DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+  if (scrollPreviewBitmap_ && scrollPreviewWidth_ > 0 && scrollPreviewHeight_ > 0) {
+    const D2D1_RECT_F body{left + 10, top + 31, left + width - 10, top + height - 28};
+    const float bodyWidth = body.right - body.left;
+    const float bodyHeight = body.bottom - body.top;
+    // Contain-fit the texture window (tail for down, head for up, the whole
+    // image for rightward captures) inside the panel body.
+    const float scale = std::min(bodyWidth / scrollPreviewWidth_,
+                                 bodyHeight / scrollPreviewHeight_);
+    const float drawWidth = scrollPreviewWidth_ * scale;
+    const float drawHeight = scrollPreviewHeight_ * scale;
+    const D2D1_RECT_F destination{body.left + (bodyWidth - drawWidth) * 0.5f,
+                                  body.top + (bodyHeight - drawHeight) * 0.5f,
+                                  body.left + (bodyWidth + drawWidth) * 0.5f,
+                                  body.top + (bodyHeight + drawHeight) * 0.5f};
+    renderTarget_->PushAxisAlignedClip(body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    renderTarget_->DrawBitmap(scrollPreviewBitmap_.Get(), destination, 1.0f,
+                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                              D2D1::RectF(0, 0, static_cast<float>(scrollPreviewWidth_),
+                                          static_cast<float>(scrollPreviewHeight_)));
+    renderTarget_->PopAxisAlignedClip();
+  }
+  const std::wstring status = scrollEnded_
+                                  ? L"已到底部 · Enter 完成 · Esc 取消"
+                                  : L"滚动中 · Enter 完成 · Esc 取消";
+  DrawText(status, D2D1::RectF(left + 10, top + height - 26, left + width - 10,
+                               top + height - 6),
+           11, D2D1::ColorF(.62f, .72f, .86f, 1));
 }
 
 void CaptureOverlay::UpdateTooltip(POINT point) {
   tooltipVisible_ = false;
   tooltipText_.clear();
   if (!editing_) return;
+  if (longPreview_) {
+    // Post-capture review bar: icon-only buttons get hover labels, mirroring
+    // the normal editing bar one cell at a time.
+    static constexpr std::array<const wchar_t*, 8> kLongTips{{
+        L"裁剪", L"画笔", L"矩形", L"椭圆", L"直线", L"箭头", L"马赛克画笔", L"马赛克矩形"}};
+    for (int index = 0; index < static_cast<int>(kLongTips.size()); ++index) {
+      if (HitLongToolbarButton(index, point)) {
+        tooltipText_ = kLongTips[static_cast<size_t>(index)];
+        tooltipVisible_ = true; return;
+      }
+    }
+    if (HitLongThumb(point)) {
+      tooltipText_ = L"拖动定位"; tooltipVisible_ = true; return;
+    }
+    if (HitUtilityBack(point)) { tooltipText_ = L"返回"; tooltipVisible_ = true; return; }
+    if (HitUtilityClose(point)) { tooltipText_ = L"退出截图"; tooltipVisible_ = true; return; }
+    if (longPreviewStage_ == LongPreviewStage::Crop) {
+      if (HitSave(point)) { tooltipText_ = L"应用裁剪（Enter）"; tooltipVisible_ = true; return; }
+      if (HitCopy(point)) { tooltipText_ = L"取消裁剪（Esc）"; tooltipVisible_ = true; return; }
+    } else {
+      if (HitSave(point)) { tooltipText_ = L"保存为图片"; tooltipVisible_ = true; return; }
+      if (HitCopy(point)) { tooltipText_ = L"保存到剪贴板"; tooltipVisible_ = true; return; }
+    }
+    if (Contains(ToolbarRect(), point)) {
+      tooltipText_ = L"拖动工具栏"; tooltipVisible_ = true;
+    }
+    return;
+  }
+  if (longCaptureMode_) {
+    // Long-capture bars: only their own controls have labels; everything else
+    // drags.  While capturing, the selection is a live hole, so hovering the
+    // page below never produces a tooltip.
+    if (HitUtilityBack(point)) { tooltipText_ = L"返回编辑"; tooltipVisible_ = true; return; }
+    if (HitUtilityClose(point)) { tooltipText_ = L"退出截图"; tooltipVisible_ = true; return; }
+    if (scrollCapturing_) {
+      if (HitLongFinish(point)) tooltipText_ = L"结束长截图（Enter）";
+      else if (HitLongCancel(point)) tooltipText_ = L"取消长截图（Esc）";
+      else if (Contains(ToolbarRect(), point)) tooltipText_ = L"拖动工具栏";
+    } else {
+      if (HitLongDirection(ScrollDirection::Down, point)) tooltipText_ = L"向下滚动长截图";
+      else if (HitLongDirection(ScrollDirection::Up, point)) tooltipText_ = L"向上滚动长截图";
+      else if (HitLongDirection(ScrollDirection::Right, point)) tooltipText_ = L"向右滚动长截图";
+      else if (Contains(ToolbarRect(), point)) tooltipText_ = L"拖动工具栏";
+    }
+    tooltipVisible_ = !tooltipText_.empty();
+    return;
+  }
   static constexpr std::array<const wchar_t*, 9> toolTips{{
       L"画笔", L"矩形", L"圆形", L"直线", L"箭头", L"文字", L"马赛克画笔", L"马赛克矩形", L"选择/调整"}};
   for (size_t index = 0; index < toolButtons_.size(); ++index) {
@@ -3274,6 +6382,9 @@ void CaptureOverlay::UpdateTooltip(POINT point) {
   }
   if (HitCopy(point)) { tooltipText_ = L"复制到剪贴板"; tooltipVisible_ = true; return; }
   if (HitSave(point)) { tooltipText_ = L"保存为图片"; tooltipVisible_ = true; return; }
+  if (HitLongEntry(point)) { tooltipText_ = L"长截图"; tooltipVisible_ = true; return; }
+  if (HitUtilityBack(point)) { tooltipText_ = L"返回选区"; tooltipVisible_ = true; return; }
+  if (HitUtilityClose(point)) { tooltipText_ = L"退出截图"; tooltipVisible_ = true; return; }
   if (HasSizeControl() && Contains(SizeSliderRect(), point)) {
     tooltipText_ = tool_ == Tool::MosaicBrush ? L"画笔尺寸" : tool_ == Tool::Text ? L"文字大小" : L"描边尺寸";
     tooltipVisible_ = true; return;
@@ -3670,7 +6781,8 @@ bool CaptureOverlay::HasSizeControl() const {
 
 RECT CaptureOverlay::SizeSliderRect() const {
   const RECT toolbar = ToolbarRect();
-  return {toolbar.left + 44, toolbar.top + 57, toolbar.left + 170, toolbar.top + 79};
+  return {toolbar.left + 44, toolbar.top + kBarUtilityStrip + 57,
+          toolbar.left + 170, toolbar.top + kBarUtilityStrip + 79};
 }
 
 void CaptureOverlay::SetSizeFromSlider(POINT point) {

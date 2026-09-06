@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RC-ScreenShot VERSION 0.5.1 LANGUAGES C CXX)
+project(RC-ScreenShot VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +40,7 @@ set(RC_SOURCES
   src/exporter.cpp
   src/main.cpp
   src/overlay.cpp
+  src/stitch.cpp
   src/unit_detector.cpp
   src/uia_detector.cpp
   src/resources.rc
@@ -74,6 +75,7 @@ if(RC_BUILD_TESTS)
     src/config.cpp
     src/editor.cpp
     src/exporter.cpp
+    src/stitch.cpp
     src/unit_detector.cpp
     src/uia_detector.cpp
   )
@@ -92,12 +94,22 @@ if(RC_BUILD_TESTS)
   target_link_libraries(rc_capture_smoke PRIVATE d3d11 dxgi dwmapi ole32 gdi32 user32 imm32)
 
   add_executable(rc_overlay_smoke WIN32 EXCLUDE_FROM_ALL
-    tests/overlay_smoke.cpp src/capture.cpp src/config.cpp src/editor.cpp src/overlay.cpp src/unit_detector.cpp src/uia_detector.cpp
+    tests/overlay_smoke.cpp src/capture.cpp src/config.cpp src/editor.cpp src/overlay.cpp src/stitch.cpp src/unit_detector.cpp src/uia_detector.cpp
   )
   target_include_directories(rc_overlay_smoke PRIVATE src)
   target_compile_definitions(rc_overlay_smoke PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(rc_overlay_smoke PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
   target_link_libraries(rc_overlay_smoke PRIVATE
+    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi ole32 uuid gdi32 user32 comdlg32 comctl32 imm32 uiautomationcore
+  )
+
+  add_executable(rc_bar_dump EXCLUDE_FROM_ALL
+    tests/bar_dump.cpp src/capture.cpp src/config.cpp src/editor.cpp src/overlay.cpp src/stitch.cpp src/unit_detector.cpp src/uia_detector.cpp
+  )
+  target_include_directories(rc_bar_dump PRIVATE src)
+  target_compile_definitions(rc_bar_dump PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(rc_bar_dump PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
+  target_link_libraries(rc_bar_dump PRIVATE
     d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi ole32 uuid gdi32 user32 comdlg32 comctl32 imm32 uiautomationcore
   )
 endif()

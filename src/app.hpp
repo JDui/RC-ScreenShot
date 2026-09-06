@@ -25,6 +25,8 @@ class Application {
   LRESULT HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK HotkeyCaptureProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                             UINT_PTR subclassId, DWORD_PTR referenceData);
+  static LRESULT CALLBACK ButtonHoverProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR subclassId, DWORD_PTR referenceData);
   struct HotkeyCaptureState {
     std::wstring originalText;
     UINT modifiers = 0;
@@ -74,6 +76,7 @@ class Application {
   HFONT settingsSmallFont_ = nullptr;
   HFONT settingsHintFont_ = nullptr;
   bool settingsSliderDragging_ = false;
+  HWND hoverButton_ = nullptr;
   HotkeyCaptureState hotkeyPrimaryState_{};
   HotkeyCaptureState hotkeySecondaryState_{};
 };

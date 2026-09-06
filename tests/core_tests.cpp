@@ -2,9 +2,12 @@
 #include "config.hpp"
 #include "editor.hpp"
 #include "exporter.hpp"
+#include "stitch.hpp"
 #include "unit_detector.hpp"
 #include "uia_detector.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <wincodec.h>
@@ -651,6 +654,241 @@ void TestFilenameAndHalfFloat() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Content-based scroll stitching.
+// ---------------------------------------------------------------------------
+
+// Deterministic synthetic page: content row `row` has a unique colour, so a
+// shifted frame has exactly one correct alignment.  A non-zero `period` makes
+// the page repeat every `period` rows (a feed, a chat list) so several offsets
+// match equally well.  `panelWidth` paints a fixed right-hand sidebar that is
+// byte-identical in every frame of the capture.
+std::vector<uint8_t> MakeRows(int firstRow, int rowCount, int width, int stride,
+                              int period = 0, int panelWidth = 0) {
+  std::vector<uint8_t> buffer(static_cast<size_t>(stride) * rowCount, 0);
+  for (int y = 0; y < rowCount; ++y) {
+    const int row = firstRow + y;
+    const int key = period > 0 ? row % period : row;
+    for (int x = 0; x < width; ++x) {
+      uint8_t* px = buffer.data() + static_cast<size_t>(y) * stride + x * 4;
+      px[0] = static_cast<uint8_t>((key * 7 + x * 3) % 251);
+      px[1] = static_cast<uint8_t>((key * 13 + x) % 251);
+      px[2] = static_cast<uint8_t>((key * 29 + 2 * x) % 251);
+      px[3] = 255;
+    }
+  }
+  for (int y = 0; y < rowCount; ++y) {
+    for (int x = std::max(0, width - panelWidth); x < width; ++x) {
+      uint8_t* px = buffer.data() + static_cast<size_t>(y) * stride + x * 4;
+      px[0] = 200; px[1] = 90; px[2] = 40; px[3] = 255;
+    }
+  }
+  return buffer;
+}
+
+std::vector<uint8_t> MakeColumns(int firstColumn, int columnCount, int height, int stride) {
+  std::vector<uint8_t> buffer(static_cast<size_t>(stride) * height, 0);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < columnCount; ++x) {
+      uint8_t* px = buffer.data() + static_cast<size_t>(y) * stride + x * 4;
+      const int column = firstColumn + x;
+      px[0] = static_cast<uint8_t>((column * 11) % 251);
+      px[1] = static_cast<uint8_t>((column * 17 + y) % 251);
+      px[2] = static_cast<uint8_t>((column * 23 + 3 * y) % 251);
+      px[3] = 255;
+    }
+  }
+  return buffer;
+}
+
+void TestScrollMatchDown() {
+  constexpr int kWidth = 48;
+  constexpr int kStride = kWidth * 4;
+  constexpr int kAccHeight = 120;
+  constexpr int kFrameHeight = 90;
+  const std::vector<uint8_t> accumulated = MakeRows(0, kAccHeight, kWidth, kStride);
+  // The viewport covered content rows [30, 120); scrolling 40 rows down moves
+  // it to [70, 160), so 40 rows are new and 50 repeat the buffer tail.
+  const std::vector<uint8_t> frame = MakeRows(70, kFrameHeight, kWidth, kStride);
+  rc::ScrollHint hint;
+  const rc::ScrollMatch match = rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride,
+                                                    frame.data(), kFrameHeight, kStride, kWidth,
+                                                    hint);
+  CHECK(match.confident);
+  CHECK(match.shift == 40);
+  CHECK(match.residual <= 2.0);
+  CHECK(match.margin > 0.5);
+  CHECK(!match.identical);
+  // Unchanged viewport: the page did not move, so nothing may be appended --
+  // and in particular no confident match may be reported for a duplicate band.
+  const std::vector<uint8_t> still = MakeRows(30, kFrameHeight, kWidth, kStride);
+  const rc::ScrollMatch idle = rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride,
+                                                   still.data(), kFrameHeight, kStride, kWidth,
+                                                   hint);
+  CHECK(idle.identical);
+  CHECK(!idle.confident);
+  // Scrolling further than one viewport leaves no overlap at all.
+  const std::vector<uint8_t> jumped = MakeRows(200, kFrameHeight, kWidth, kStride);
+  CHECK(!rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride, jumped.data(),
+                             kFrameHeight, kStride, kWidth, hint).confident);
+  // A repaint or a blinking caret must not break the lock.
+  std::vector<uint8_t> noisy = frame;
+  for (size_t index = 0; index < noisy.size(); index += 97)
+    noisy[index] = static_cast<uint8_t>(noisy[index] + 9);
+  const rc::ScrollMatch noisyMatch = rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride,
+                                                         noisy.data(), kFrameHeight, kStride,
+                                                         kWidth, hint);
+  CHECK(noisyMatch.confident);
+  CHECK(noisyMatch.shift == 40);
+  // Invalid inputs stay silent instead of stitching garbage.
+  CHECK(!rc::MatchScrollDown(nullptr, kAccHeight, kStride, frame.data(), kFrameHeight, kStride,
+                             kWidth, hint).confident);
+  CHECK(!rc::MatchScrollDown(accumulated.data(), 0, kStride, frame.data(), kFrameHeight, kStride,
+                             kWidth, hint).confident);
+  CHECK(!rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride, frame.data(), kFrameHeight,
+                             kStride, 0, hint).confident);
+}
+
+void TestScrollMatchUp() {
+  constexpr int kWidth = 48;
+  constexpr int kStride = kWidth * 4;
+  constexpr int kAccHeight = 120;
+  constexpr int kFrameHeight = 90;
+  // The accumulated head starts at content row 40, so the viewport covered
+  // [40, 130).  Scrolling up 30 rows reveals [10, 100): 30 rows are new and
+  // the frame's 60-row tail continues the buffer head.
+  const std::vector<uint8_t> accumulated = MakeRows(40, kAccHeight, kWidth, kStride);
+  const std::vector<uint8_t> frame = MakeRows(10, kFrameHeight, kWidth, kStride);
+  rc::ScrollHint hint;
+  const rc::ScrollMatch match = rc::MatchScrollUp(accumulated.data(), kAccHeight, kStride,
+                                                  frame.data(), kFrameHeight, kStride, kWidth,
+                                                  hint);
+  CHECK(match.confident);
+  CHECK(match.shift == 30);
+  CHECK(match.residual <= 2.0);
+  const std::vector<uint8_t> still = MakeRows(40, kFrameHeight, kWidth, kStride);
+  CHECK(rc::MatchScrollUp(accumulated.data(), kAccHeight, kStride, still.data(), kFrameHeight,
+                          kStride, kWidth, hint).identical);
+  CHECK(!rc::MatchScrollUp(nullptr, kAccHeight, kStride, frame.data(), kFrameHeight, kStride,
+                           kWidth, hint).confident);
+}
+
+void TestScrollMatchRight() {
+  constexpr int kHeight = 64;
+  constexpr int kAccWidth = 120;
+  constexpr int kAccStride = kAccWidth * 4;
+  constexpr int kFrameWidth = 90;
+  constexpr int kFrameStride = kFrameWidth * 4;
+  // Accumulated covers content columns [30, 150); the viewport sat on its
+  // trailing edge [60, 150).  Scrolling right 25 columns moves it to [85, 175).
+  const std::vector<uint8_t> wide = MakeColumns(30, kAccWidth, kHeight, kAccStride);
+  const std::vector<uint8_t> frame = MakeColumns(85, kFrameWidth, kHeight, kFrameStride);
+  rc::ScrollHint hint;
+  const rc::ScrollMatch match = rc::MatchScrollRight(wide.data(), kAccWidth, kAccStride,
+                                                     frame.data(), kFrameWidth, kFrameStride,
+                                                     kHeight, hint);
+  CHECK(match.confident);
+  CHECK(match.shift == 25);
+  CHECK(match.residual <= 2.0);
+  const std::vector<uint8_t> still = MakeColumns(60, kFrameWidth, kHeight, kFrameStride);
+  CHECK(rc::MatchScrollRight(wide.data(), kAccWidth, kAccStride, still.data(), kFrameWidth,
+                             kFrameStride, kHeight, hint).identical);
+  CHECK(!rc::MatchScrollRight(wide.data(), 0, kAccStride, frame.data(), kFrameWidth,
+                              kFrameStride, kHeight, hint).confident);
+}
+
+void TestScrollMatchRepetition() {
+  // Rows repeat every 20 pixels, so offsets 10, 30, 50 ... all match equally
+  // well.  Picking the wrong one duplicates a whole band -- the classic
+  // "content repeats itself" long-screenshot bug.  The motion model decides.
+  constexpr int kWidth = 64;
+  constexpr int kStride = kWidth * 4;
+  constexpr int kAccHeight = 200;
+  constexpr int kFrameHeight = 100;
+  constexpr int kPeriod = 20;
+  const std::vector<uint8_t> accumulated =
+      MakeRows(0, kAccHeight, kWidth, kStride, kPeriod);
+  const std::vector<uint8_t> frame =
+      MakeRows(kAccHeight - kFrameHeight + 30, kFrameHeight, kWidth, kStride, kPeriod);
+  rc::ScrollHint hint;
+  hint.priorShift = 30;
+  const rc::ScrollMatch match = rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride,
+                                                    frame.data(), kFrameHeight, kStride, kWidth,
+                                                    hint);
+  CHECK(match.confident);
+  CHECK(match.shift == 30);
+  // The pixels alone really are ambiguous: the margin must say so instead of
+  // pretending the match was unambiguous.
+  CHECK(match.margin < 0.5);
+}
+
+void TestScrollMatchFixedPanel() {
+  // A fixed sidebar occupies one of four voting segments and matches at every
+  // offset.  Scoring takes the median across segments, so it is outvoted
+  // instead of dragging the whole match to a wrong offset.
+  constexpr int kWidth = 384;
+  constexpr int kStride = kWidth * 4;
+  constexpr int kAccHeight = 150;
+  constexpr int kFrameHeight = 100;
+  constexpr int kPanel = 96;
+  const std::vector<uint8_t> accumulated =
+      MakeRows(0, kAccHeight, kWidth, kStride, 0, kPanel);
+  const std::vector<uint8_t> frame =
+      MakeRows(kAccHeight - kFrameHeight + 40, kFrameHeight, kWidth, kStride, 0, kPanel);
+  rc::ScrollHint hint;
+  const rc::ScrollMatch match = rc::MatchScrollDown(accumulated.data(), kAccHeight, kStride,
+                                                    frame.data(), kFrameHeight, kStride, kWidth,
+                                                    hint);
+  CHECK(match.confident);
+  CHECK(match.shift == 40);
+}
+
+void TestScrollSettleProbe() {
+  constexpr int kWidth = 768;
+  constexpr int kHeight = 64;
+  constexpr int kStride = kWidth * 4;
+  const std::vector<uint8_t> base = MakeRows(0, kHeight, kWidth, kStride);
+  CHECK(!rc::FramesDiffer(base.data(), kStride, base.data(), kStride, kWidth, kHeight));
+  // Half the page is still moving: the capture has to wait for it.
+  std::vector<uint8_t> half = base;
+  for (int y = 0; y < kHeight; ++y)
+    for (int x = 0; x < kWidth / 2; ++x)
+      half[static_cast<size_t>(y) * kStride + static_cast<size_t>(x) * 4] ^= 0x40;
+  CHECK(rc::FramesDiffer(base.data(), kStride, half.data(), kStride, kWidth, kHeight));
+  // One animated panel out of eight: the median ignores it, so a page with a
+  // video or an ad never holds the capture hostage.
+  std::vector<uint8_t> panel = base;
+  for (int y = 0; y < kHeight; ++y)
+    for (int x = 0; x < 40; ++x)
+      panel[static_cast<size_t>(y) * kStride + static_cast<size_t>(x) * 4] ^= 0x40;
+  CHECK(!rc::FramesDiffer(base.data(), kStride, panel.data(), kStride, kWidth, kHeight));
+  CHECK(!rc::FramesDiffer(nullptr, kStride, base.data(), kStride, kWidth, kHeight));
+}
+
+void TestScrollCrop() {
+  constexpr int kWidth = 8;
+  constexpr int kHeight = 6;
+  constexpr int kStride = kWidth * 4;
+  std::vector<uint8_t> pixels(static_cast<size_t>(kStride) * kHeight, 0);
+  for (int y = 0; y < kHeight; ++y)
+    for (int x = 0; x < kWidth; ++x)
+      pixels[static_cast<size_t>(y) * kStride + static_cast<size_t>(x) * 4] =
+          static_cast<uint8_t>(y * 16 + x);
+  const rc::CroppedImage crop =
+      rc::CropStitchedPixels(pixels.data(), kWidth, kHeight, kStride, 2, 1, 6, 4);
+  CHECK(crop.width == 4);
+  CHECK(crop.height == 3);
+  CHECK(crop.stride == 16);
+  CHECK(crop.bgra.size() == 48);
+  CHECK(crop.bgra[0] == 1 * 16 + 2);
+  CHECK(crop.bgra[16 + 4] == 2 * 16 + 3);
+  // Out-of-bounds and empty requests clamp or stay empty.
+  CHECK(rc::CropStitchedPixels(pixels.data(), kWidth, kHeight, kStride, -5, -5, 100, 100).width ==
+        kWidth);
+  CHECK(rc::CropStitchedPixels(pixels.data(), kWidth, kHeight, kStride, 5, 5, 5, 5).bgra.empty());
+  CHECK(rc::CropStitchedPixels(nullptr, kWidth, kHeight, kStride, 0, 0, 4, 4).bgra.empty());
+}
+
 }  // namespace
 
 int wmain() {
@@ -677,6 +915,13 @@ int wmain() {
   TestCoordinatesAndHdrIntersection();
   TestFilenameAndHalfFloat();
   TestJpegColorLayout();
+  TestScrollMatchDown();
+  TestScrollMatchUp();
+  TestScrollMatchRight();
+  TestScrollMatchRepetition();
+  TestScrollMatchFixedPanel();
+  TestScrollSettleProbe();
+  TestScrollCrop();
   if (failures) std::cerr << failures << " test(s) failed\n";
   else std::cout << "All RC-ScreenShot core tests passed\n";
   return failures ? 1 : 0;

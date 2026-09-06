@@ -51,6 +51,24 @@ const EditCommand* EditorDocument::At(size_t index) const {
   return index < cursor_ ? &commands_[index] : nullptr;
 }
 
+void EditorDocument::Translate(float dx, float dy) {
+  for (size_t index = 0; index < cursor_; ++index) {
+    EditCommand& command = commands_[index];
+    if (auto* pen = std::get_if<PenCommand>(&command)) {
+      for (PointF& point : pen->points) { point.x += dx; point.y += dy; }
+    } else if (auto* shape = std::get_if<ShapeCommand>(&command)) {
+      shape->start.x += dx; shape->start.y += dy;
+      shape->end.x += dx; shape->end.y += dy;
+    } else if (auto* mosaic = std::get_if<MosaicCommand>(&command)) {
+      for (PointF& point : mosaic->points) { point.x += dx; point.y += dy; }
+      mosaic->bounds.left += dx; mosaic->bounds.top += dy;
+      mosaic->bounds.right += dx; mosaic->bounds.bottom += dy;
+    } else if (auto* text = std::get_if<TextCommand>(&command)) {
+      text->origin.x += dx; text->origin.y += dy;
+    }
+  }
+}
+
 RectF NormalizeRect(PointF a, PointF b) {
   return {std::min(a.x, b.x), std::min(a.y, b.y), std::max(a.x, b.x), std::max(a.y, b.y)};
 }
