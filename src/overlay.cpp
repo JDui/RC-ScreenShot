@@ -28,6 +28,7 @@ constexpr UINT_PTR kUiaTimeoutTimer = 7;
 constexpr UINT_PTR kHoverAnimationTimer = 8;
 constexpr UINT_PTR kScrollTimer = 9;
 constexpr UINT_PTR kLongPreviewTimer = 10;
+constexpr UINT_PTR kTextCaretTimer = 11;
 // Long-capture cadence: a 30 ms scheduler tick dispatches a capture+stitch
 // step every kScrollStepMs, then wheels one notch so the page keeps moving.
 constexpr UINT kScrollTickMs = 30;
@@ -547,6 +548,7 @@ CaptureOverlay::~CaptureOverlay() {
   KillTimer(hwnd_, kUiaTimeoutTimer);
   KillTimer(hwnd_, kHoverAnimationTimer);
   KillTimer(hwnd_, kSettingPreviewTimer);
+  KillTimer(hwnd_, kTextCaretTimer);
   if (unitThread_.joinable()) unitThread_.request_stop();
   if (windowThread_.joinable()) windowThread_.request_stop();
   StopUiaQuery();
@@ -558,7 +560,8 @@ CaptureOverlay::~CaptureOverlay() {
 
 bool CaptureOverlay::Show(std::wstring& error) {
   WNDCLASSEXW windowClass{sizeof(windowClass)};
-  windowClass.style = CS_HREDRAW | CS_VREDRAW;
+  // CS_DBLCLKS is required for WM_LBUTTONDBLCLK, which re-opens text editing.
+  windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
   windowClass.lpfnWndProc = WindowProc;
   windowClass.hInstance = instance_;
   windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -612,6 +615,10 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_COMMAND:
       if (textEdit_ && reinterpret_cast<HWND>(lParam) == textEdit_ &&
           HIWORD(wParam) == EN_CHANGE) {
+        // Newline insertion lands here as well, so keep the IME popups on
+        // the current caret line before the next composition starts.
+        UpdateTextImePosition();
+        ResetTextCaretBlink();
         RECT dirty = selection_;
         InflateRect(&dirty, 8, 8);
         InvalidateRect(hwnd_, &dirty, FALSE);
@@ -633,6 +640,13 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       else if (wParam == kScrollTimer) ScrollTick();
       else if (wParam == kUnitTimer && unitReady_) { KillTimer(hwnd_, kUnitTimer); InvalidateRect(hwnd_, nullptr, FALSE); }
       else if (wParam == kSettingPreviewTimer) EndSettingPreview();
+      else if (wParam == kTextCaretTimer) {
+        if (textEdit_) {
+          RECT dirty = selection_;
+          InflateRect(&dirty, 8, 8);
+          InvalidateRect(hwnd_, &dirty, FALSE);
+        } else KillTimer(hwnd_, kTextCaretTimer);
+      }
       else if (wParam == kSnapshotRestoreTimer) {
         KillTimer(hwnd_, kSnapshotRestoreTimer);
         snapshotRestorePending_ = false;
@@ -840,7 +854,12 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
           }
           return 0;
         }
-        if (textEdit_) CommitTextInput();
+        if (textEdit_) {
+          // A click inside the editing text repositions the caret; anywhere
+          // else finishes editing first so toolbar/gesture hits keep working.
+          if (TryPositionTextCaret(point)) return 0;
+          CommitTextInput();
+        }
         if (HasSizeControl() && Contains(SizeSliderRect(), point)) {
           sizeSliderDragging_ = true;
           BeginSettingPreview(point);
@@ -951,6 +970,12 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       InvalidateRect(hwnd_, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK: {
+      // While text editing is live, double-click selects the word/cluster at
+      // the pointer instead of re-opening a committed command.
+      if (textEdit_) {
+        TryPositionTextCaret({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, true);
+        return 0;
+      }
       if (editing_ && !longPreview_ && (tool_ == Tool::Select || tool_ == Tool::Text)) {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const auto hit = HitTestCommand(point, tool_ == Tool::Text ? std::optional<Tool>(Tool::Text)
@@ -1164,6 +1189,8 @@ void CaptureOverlay::DiscardDeviceResources() {
   toolbarBackdropBitmap_.Reset();
   toolbarBackdropPixels_.clear();
   toolbarBackdropValid_ = false;
+  textBackdropBitmap_.Reset();
+  textBackdropValid_ = false;
   desktopBitmap_.Reset();
   DiscardSnapshotThumbnails();
   renderTarget_.Reset();
@@ -2998,12 +3025,16 @@ void CaptureOverlay::DrawDocument() {
   };
   std::vector<EditCommand> commands;
   commands.reserve(document_.Size() + (textEdit_ ? 1u : 0u));
+  // Index in commands of the text command currently being edited (if any);
+  // its frosted backdrop is drawn immediately below that command.
+  std::optional<size_t> editingBackdropIndex;
   for (size_t index = 0; index < document_.Size(); ++index) {
     const EditCommand* command = document_.At(index);
     if (!command) continue;
     if (textEditingCommand_ && *textEditingCommand_ == index) {
       if (!liveText.empty()) commands.emplace_back(TextCommand{textOrigin_, liveText, textInputStyle_});
       else commands.emplace_back(placeholderCommand());
+      editingBackdropIndex = commands.size() - 1;
       continue;
     }
     commands.push_back(*command);
@@ -3011,6 +3042,7 @@ void CaptureOverlay::DrawDocument() {
   if (textEdit_ && !textEditingCommand_) {
     if (!liveText.empty()) commands.emplace_back(TextCommand{textOrigin_, liveText, textInputStyle_});
     else commands.emplace_back(placeholderCommand());
+    editingBackdropIndex = commands.size() - 1;
   }
   if (previewCommand_) commands.push_back(*previewCommand_);
   renderTarget_->PushAxisAlignedClip(ToD2D(selection_), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -3107,7 +3139,9 @@ void CaptureOverlay::DrawDocument() {
                   shape->style.stroke.width);
       }
     } else if (const auto* text = std::get_if<TextCommand>(&command)) {
+      if (textEdit_ && editingBackdropIndex == commandIndex) DrawTextEditBackdrop(*text);
       DrawTextCommand(*text);
+      if (textEdit_ && editingBackdropIndex == commandIndex) DrawTextCaret(*text);
     } else if (const auto* mosaic = std::get_if<MosaicCommand>(&command)) {
       // Committed mosaics live in the baked layer; the in-flight stroke (the
       // trailing preview command) always previews as a light blue trace, same
@@ -3126,7 +3160,9 @@ void CaptureOverlay::DrawDocument() {
     }
   }
   renderTarget_->PopAxisAlignedClip();
-  if (selectedCommand_) DrawCommandHandles();
+  // The selected command's move handles would overlap the frosted text panel;
+  // the crop border itself stays visible while editing.
+  if (selectedCommand_ && !textEdit_) DrawCommandHandles();
   else DrawSelectionHandles();
 }
 
@@ -3228,6 +3264,314 @@ void CaptureOverlay::DrawTextCommand(const TextCommand& command) {
     draw(offset, offset, D2D1::ColorF(0.0f, 0.0f, 0.0f, shadowAlpha * .30f));
   }
   draw(0.0f, 0.0f, ColorFromSetting(command.style.color, command.style.opacity));
+}
+
+void CaptureOverlay::EnsureTextEditBackdrop(const RECT& panel) {
+  if (!renderTarget_ || !snapshot_.IsValid()) return;
+  if (textBackdropValid_ && EqualRect(&panel, &textBackdropRect_) && textBackdropBitmap_) return;
+  textBackdropBitmap_.Reset();
+  textBackdropValid_ = false;
+  const int width = panel.right - panel.left;
+  const int height = panel.bottom - panel.top;
+  if (width <= 0 || height <= 0) return;
+  const int cropLeft = std::clamp(static_cast<int>(panel.left), 0, snapshot_.width);
+  const int cropTop = std::clamp(static_cast<int>(panel.top), 0, snapshot_.height);
+  const int cropRight = std::clamp(static_cast<int>(panel.right), cropLeft, snapshot_.width);
+  const int cropBottom = std::clamp(static_cast<int>(panel.bottom), cropTop, snapshot_.height);
+  int mipWidth = std::max(1, cropRight - cropLeft);
+  int mipHeight = std::max(1, cropBottom - cropTop);
+  std::vector<uint8_t> mip(static_cast<size_t>(mipWidth) * mipHeight * 4);
+  for (int y = 0; y < mipHeight; ++y) {
+    std::memcpy(mip.data() + static_cast<size_t>(y) * mipWidth * 4,
+                snapshot_.bgra.data() +
+                    static_cast<size_t>((cropTop + y) * snapshot_.bgraStride + cropLeft * 4),
+                static_cast<size_t>(mipWidth) * 4);
+  }
+  // Same short mip chain as the toolbar backdrop: box reductions plus a
+  // separable [1,2,1] pass yield a soft frost cheaply enough to rebuild while
+  // typing.  Three levels blur a small text panel without washing it out.
+  for (int level = 0; level < 3 && (mipWidth > 1 || mipHeight > 1); ++level) {
+    const int nextWidth = std::max(1, (mipWidth + 1) / 2);
+    const int nextHeight = std::max(1, (mipHeight + 1) / 2);
+    std::vector<uint8_t> next(static_cast<size_t>(nextWidth) * nextHeight * 4);
+    for (int y = 0; y < nextHeight; ++y) {
+      for (int x = 0; x < nextWidth; ++x) {
+        uint32_t sums[4]{};
+        int samples = 0;
+        for (int sy = 0; sy < 2; ++sy) {
+          const int sourceY = y * 2 + sy;
+          if (sourceY >= mipHeight) continue;
+          for (int sx = 0; sx < 2; ++sx) {
+            const int sourceX = x * 2 + sx;
+            if (sourceX >= mipWidth) continue;
+            const uint8_t* pixel = mip.data() +
+                (static_cast<size_t>(sourceY) * mipWidth + sourceX) * 4;
+            for (int channel = 0; channel < 4; ++channel) sums[channel] += pixel[channel];
+            ++samples;
+          }
+        }
+        uint8_t* output = next.data() + (static_cast<size_t>(y) * nextWidth + x) * 4;
+        for (int channel = 0; channel < 4; ++channel)
+          output[channel] = static_cast<uint8_t>(sums[channel] / std::max(1, samples));
+      }
+    }
+    mip.swap(next);
+    mipWidth = nextWidth;
+    mipHeight = nextHeight;
+  }
+  std::vector<uint8_t> horizontal(mip.size());
+  for (int y = 0; y < mipHeight; ++y) {
+    for (int x = 0; x < mipWidth; ++x) {
+      uint8_t* output = horizontal.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const int left = std::max(0, x - 1);
+      const int right = std::min(mipWidth - 1, x + 1);
+      const uint8_t* a = mip.data() + (static_cast<size_t>(y) * mipWidth + left) * 4;
+      const uint8_t* b = mip.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const uint8_t* c = mip.data() + (static_cast<size_t>(y) * mipWidth + right) * 4;
+      for (int channel = 0; channel < 4; ++channel)
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      output[3] = 255;
+    }
+  }
+  for (int y = 0; y < mipHeight; ++y) {
+    for (int x = 0; x < mipWidth; ++x) {
+      uint8_t* output = mip.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const int top = std::max(0, y - 1);
+      const int bottom = std::min(mipHeight - 1, y + 1);
+      const uint8_t* a = horizontal.data() + (static_cast<size_t>(top) * mipWidth + x) * 4;
+      const uint8_t* b = horizontal.data() + (static_cast<size_t>(y) * mipWidth + x) * 4;
+      const uint8_t* c = horizontal.data() + (static_cast<size_t>(bottom) * mipWidth + x) * 4;
+      for (int channel = 0; channel < 4; ++channel)
+        output[channel] = static_cast<uint8_t>((a[channel] + 2u * b[channel] + c[channel]) / 4u);
+      output[3] = 255;
+    }
+  }
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
+  for (int y = 0; y < height; ++y) {
+    const float sourceY = (y + 0.5f) * mipHeight / static_cast<float>(height) - 0.5f;
+    const int y0 = std::clamp(static_cast<int>(std::floor(sourceY)), 0, mipHeight - 1);
+    const int y1 = std::clamp(y0 + 1, 0, mipHeight - 1);
+    const float fy = std::clamp(sourceY - std::floor(sourceY), 0.0f, 1.0f);
+    for (int x = 0; x < width; ++x) {
+      const float sourceX = (x + 0.5f) * mipWidth / static_cast<float>(width) - 0.5f;
+      const int x0 = std::clamp(static_cast<int>(std::floor(sourceX)), 0, mipWidth - 1);
+      const int x1 = std::clamp(x0 + 1, 0, mipWidth - 1);
+      const float fx = std::clamp(sourceX - std::floor(sourceX), 0.0f, 1.0f);
+      uint8_t* output = pixels.data() + (static_cast<size_t>(y) * width + x) * 4;
+      for (int channel = 0; channel < 3; ++channel) {
+        const auto sample = [&](int sampleX, int sampleY) -> float {
+          return static_cast<float>(mip[(static_cast<size_t>(sampleY) * mipWidth + sampleX) * 4 + channel]);
+        };
+        const float top = sample(x0, y0) * (1.0f - fx) + sample(x1, y0) * fx;
+        const float bottom = sample(x0, y1) * (1.0f - fx) + sample(x1, y1) * fx;
+        output[channel] = static_cast<uint8_t>(
+            std::clamp(std::lround(top * (1.0f - fy) + bottom * fy), 0l, 255l));
+      }
+      output[3] = 255;
+    }
+  }
+  const auto properties = D2D1::BitmapProperties(
+      D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+  if (FAILED(renderTarget_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), static_cast<UINT32>(height)),
+                                        pixels.data(), static_cast<UINT32>(width * 4),
+                                        properties, &textBackdropBitmap_))) {
+    textBackdropBitmap_.Reset();
+    return;
+  }
+  textBackdropRect_ = panel;
+  textBackdropValid_ = true;
+}
+
+void CaptureOverlay::DrawTextEditBackdrop(const TextCommand& command) {
+  if (!renderTarget_ || !d2dFactory_) return;
+  const RectF bounds = CommandBounds(command);
+  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+  const float padX = std::clamp(command.style.size * 0.35f, 8.0f, 22.0f);
+  const float padY = std::clamp(command.style.size * 0.22f, 5.0f, 14.0f);
+  const float radius = std::clamp(command.style.size * 0.25f, 6.0f, 14.0f);
+  RECT panel{
+      static_cast<LONG>(std::floor(selection_.left + bounds.left - padX)),
+      static_cast<LONG>(std::floor(selection_.top + bounds.top - padY)),
+      static_cast<LONG>(std::ceil(selection_.left + bounds.right + padX)),
+      static_cast<LONG>(std::ceil(selection_.top + bounds.bottom + padY))};
+  // Never bleed past the captured region.
+  panel.left = std::clamp(panel.left, selection_.left, selection_.right);
+  panel.top = std::clamp(panel.top, selection_.top, selection_.bottom);
+  panel.right = std::clamp(panel.right, panel.left, selection_.right);
+  panel.bottom = std::clamp(panel.bottom, panel.top, selection_.bottom);
+  EnsureTextEditBackdrop(panel);
+  if (!textBackdropBitmap_) return;
+  const D2D1_RECT_F panelRect = ToD2D(panel);
+  const D2D1_ROUNDED_RECT rounded{
+      panelRect, std::min(radius, (panelRect.right - panelRect.left) * 0.5f),
+      std::min(radius, (panelRect.bottom - panelRect.top) * 0.5f)};
+  ComPtr<ID2D1RoundedRectangleGeometry> geometry;
+  if (FAILED(d2dFactory_->CreateRoundedRectangleGeometry(rounded, &geometry))) return;
+  // The frosted panel is deliberately a whisper: 5% blurred cover over the
+  // wallpaper plus an equally faint edge.
+  constexpr float kTextBackdropOpacity = 0.05f;
+  renderTarget_->PushLayer(D2D1::LayerParameters(panelRect, geometry.Get()), nullptr);
+  renderTarget_->DrawBitmap(textBackdropBitmap_.Get(), panelRect, kTextBackdropOpacity,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+  renderTarget_->PopLayer();
+  ComPtr<ID2D1SolidColorBrush> border;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.06f), &border);
+  renderTarget_->DrawRoundedRectangle(rounded, border.Get(), 1.0f);
+}
+
+void CaptureOverlay::DrawTextCaret(const TextCommand& command) {
+  if (!renderTarget_ || !dwriteFactory_ || !textEdit_) return;
+  UINT blink = GetCaretBlinkTime();
+  if (blink != 0 && blink != INFINITE) {
+    const bool visible = ((GetTickCount64() - textCaretBlinkStart_) / blink) % 2 == 0;
+    if (!visible) return;
+  }
+  DWORD selStart = 0, selEnd = 0;
+  SendMessageW(textEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart),
+               reinterpret_cast<LPARAM>(&selEnd));
+  (void)selEnd;
+  const float originX = selection_.left + command.origin.x;
+  const float originY = selection_.top + command.origin.y;
+  const float barWidth = std::clamp(command.style.size * 0.07f, 1.5f, 3.0f);
+  const D2D1_COLOR_F caretColor = ColorFromSetting(command.style.color, 1.0f);
+  ComPtr<ID2D1SolidColorBrush> brush;
+  if (FAILED(renderTarget_->CreateSolidColorBrush(caretColor, &brush))) return;
+  if (command.style.vertical) {
+    // Mirror the vertical glyph walk in DrawTextCommand: map the raw EDIT
+    // index (CRLF included) to a column/row cell.
+    const float advance = command.style.size * 1.16f;
+    UINT32 column = 0;
+    float row = 0.0f;
+    const UINT32 target = std::min<UINT32>(selStart, static_cast<UINT32>(command.text.size()));
+    for (UINT32 i = 0; i < target; ++i) {
+      const wchar_t ch = command.text[i];
+      if (ch == L'\r') continue;
+      if (ch == L'\n') { ++column; row = 0.0f; continue; }
+      row += 1.0f;
+    }
+    const float x = originX + column * advance;
+    const float y = originY + row * advance;
+    renderTarget_->DrawLine({x + barWidth, y}, {x + advance - barWidth, y},
+                            brush.Get(), barWidth);
+    return;
+  }
+  ComPtr<IDWriteTextFormat> format;
+  if (FAILED(dwriteFactory_->CreateTextFormat(command.style.fontFamily.c_str(), nullptr,
+      DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+      command.style.size, L"zh-CN", &format))) return;
+  format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+  format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+  format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+  ComPtr<IDWriteTextLayout> layout;
+  if (FAILED(dwriteFactory_->CreateTextLayout(command.text.c_str(),
+      static_cast<UINT32>(command.text.size()), format.Get(), 4096.0f, 4096.0f, &layout))) return;
+  const UINT32 position = std::min<UINT32>(selStart, static_cast<UINT32>(command.text.size()));
+  FLOAT pointX = 0.0f, pointY = 0.0f;
+  DWRITE_HIT_TEST_METRICS metrics{};
+  // Leading-edge hit for the insertion index; at end-of-text it resolves to
+  // the point right after the final cluster.
+  if (FAILED(layout->HitTestTextPosition(position, FALSE, &pointX, &pointY, &metrics))) return;
+  const float x = std::floor(originX + pointX) + 0.5f;
+  const D2D1_RECT_F bar{x - barWidth * 0.5f, originY + pointY,
+                        x + barWidth * 0.5f, originY + pointY + metrics.height};
+  renderTarget_->FillRectangle(bar, brush.Get());
+}
+
+bool CaptureOverlay::TryPositionTextCaret(POINT point, bool selectWord) {
+  if (!textEdit_ || !dwriteFactory_) return false;
+  const int length = GetWindowTextLengthW(textEdit_);
+  std::wstring live(static_cast<size_t>(length), L'\0');
+  if (length > 0) GetWindowTextW(textEdit_, live.data(), length + 1);
+  // The empty state measures the placeholder so the panel still catches
+  // clicks and drops the caret at index 0.
+  const TextCommand measure{
+      textOrigin_,
+      live.empty() ? std::wstring(kTextPlaceholder) : live,
+      textInputStyle_};
+  const RectF bounds = CommandBounds(measure);
+  const float padX = std::clamp(textInputStyle_.size * 0.35f, 8.0f, 22.0f);
+  const float padY = std::clamp(textInputStyle_.size * 0.22f, 5.0f, 14.0f);
+  const RECT panel{
+      static_cast<LONG>(std::floor(selection_.left + bounds.left - padX)),
+      static_cast<LONG>(std::floor(selection_.top + bounds.top - padY)),
+      static_cast<LONG>(std::ceil(selection_.left + bounds.right + padX)),
+      static_cast<LONG>(std::ceil(selection_.top + bounds.bottom + padY))};
+  if (!Contains(panel, point)) return false;
+  UINT32 anchor = 0;
+  UINT32 caret = 0;
+  if (textInputStyle_.vertical) {
+    // Same column/row walk as the vertical renderer in DrawTextCommand.
+    const float advance = textInputStyle_.size * 1.16f;
+    const int targetColumn = std::clamp(
+        static_cast<int>(std::floor((point.x - (selection_.left + textOrigin_.x)) / advance)),
+        0, 32);
+    const int targetRow = std::clamp(
+        static_cast<int>(std::floor((point.y - (selection_.top + textOrigin_.y)) / advance)),
+        0, 64);
+    UINT32 column = 0, row = 0;
+    bool resolved = false;
+    for (UINT32 i = 0; i < live.size(); ++i) {
+      const wchar_t ch = live[i];
+      if (ch == L'\r') continue;
+      if (ch == L'\n') {
+        if (column == static_cast<UINT32>(targetColumn)) { caret = i; resolved = true; break; }
+        ++column;
+        row = 0;
+        continue;
+      }
+      if (column == static_cast<UINT32>(targetColumn) &&
+          row == static_cast<UINT32>(targetRow)) {
+        caret = i;
+        resolved = true;
+        break;
+      }
+      ++row;
+    }
+    if (!resolved) caret = static_cast<UINT32>(live.size());
+    anchor = caret;
+  } else {
+    ComPtr<IDWriteTextFormat> format;
+    if (FAILED(dwriteFactory_->CreateTextFormat(textInputStyle_.fontFamily.c_str(), nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        textInputStyle_.size, L"zh-CN", &format))) return false;
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(dwriteFactory_->CreateTextLayout(live.c_str(), static_cast<UINT32>(live.size()),
+        format.Get(), 4096.0f, 4096.0f, &layout))) return false;
+    const FLOAT x = point.x - (selection_.left + textOrigin_.x);
+    const FLOAT y = point.y - (selection_.top + textOrigin_.y);
+    BOOL trailing = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    if (FAILED(layout->HitTestPoint(x, y, &trailing, &inside, &metrics))) return false;
+    caret = metrics.textPosition + (trailing ? 1u : 0u);
+    // Double-click selects the whole cluster under the pointer, expanded to
+    // word boundaries for Latin/digit runs (native EDIT convention).  CJK
+    // ideographs stay one character long.
+    anchor = caret;
+    if (selectWord) {
+      const auto isWordChar = [](wchar_t ch) {
+        return iswalnum(ch) || ch == L'_';
+      };
+      anchor = metrics.textPosition;
+      caret = metrics.textPosition + metrics.length;
+      if (anchor < live.size() && isWordChar(live[anchor])) {
+        while (anchor > 0 && isWordChar(live[anchor - 1])) --anchor;
+        while (caret < live.size() && isWordChar(live[caret])) ++caret;
+      }
+    }
+  }
+  SendMessageW(textEdit_, EM_SETSEL, anchor, caret);
+  SendMessageW(textEdit_, EM_SCROLLCARET, 0, 0);
+  // WM_LBUTTONDOWN moved focus to the overlay; typing must keep landing here.
+  SetFocus(textEdit_);
+  ResetTextCaretBlink();
+  UpdateTextImePosition();
+  RECT dirty = selection_;
+  InflateRect(&dirty, 8, 8);
+  InvalidateRect(hwnd_, &dirty, FALSE);
+  return true;
 }
 
 CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestSelectionAdjustment(POINT point) const {
@@ -6961,7 +7305,6 @@ void CaptureOverlay::BeginTextInput(POINT point, std::optional<size_t> existingC
     textOrigin_ = ToSelectionPoint(point);
     textInputStyle_ = config_.text;
   }
-  const int lineHeight = std::max(28, static_cast<int>(std::lround(textInputStyle_.size * 1.45f)));
   const int selectionLeft = static_cast<int>(selection_.left);
   const int selectionTop = static_cast<int>(selection_.top);
   const int x = std::clamp(static_cast<int>(point.x), selectionLeft,
@@ -6970,9 +7313,13 @@ void CaptureOverlay::BeginTextInput(POINT point, std::optional<size_t> existingC
                            std::max(selectionTop, static_cast<int>(selection_.bottom) - 2));
   // The EDIT is an invisible keyboard/IME host.  DrawDocument renders the
   // current value through the same DWrite path used by committed text.
+  // ES_AUTOHSCROLL keeps the multiline host on one logical column: the host
+  // window is 2px wide and only serves keyboard/IME input, so soft word wrap
+  // would scramble EM_POSFROMCHAR caret positions even though DrawDocument
+  // renders the real text.  ES_WANTRETURN makes Enter insert a CRLF.
   textEdit_ = CreateWindowExW(WS_EX_TRANSPARENT, L"EDIT", L"",
-      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN |
-          ES_NOHIDESEL,
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
+          ES_WANTRETURN | ES_NOHIDESEL,
       x, y, 2, 2, hwnd_, nullptr, instance_, nullptr);
   if (!textEdit_) return;
   LOGFONTW font{};
@@ -6987,20 +7334,49 @@ void CaptureOverlay::BeginTextInput(POINT point, std::optional<size_t> existingC
   SetWindowSubclass(textEdit_, TextEditProc, 1, reinterpret_cast<DWORD_PTR>(this));
   SetFocus(textEdit_);
   textImeComposing_ = false;
-  SendMessageW(textEdit_, EM_SETSEL, 0, -1);
+  // Re-opened text gets the caret at its end so users can append right away;
+  // Home/End and the arrow keys still reach any line.
+  const DWORD caret = static_cast<DWORD>(initialValue.size());
+  SendMessageW(textEdit_, EM_SETSEL, caret, caret);
+  UpdateTextImePosition();
+  textCaretBlinkStart_ = GetTickCount64();
+  UINT blink = GetCaretBlinkTime();
+  if (blink == 0 || blink == INFINITE) blink = 530;
+  SetTimer(hwnd_, kTextCaretTimer, blink, nullptr);
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::ResetTextCaretBlink() {
+  textCaretBlinkStart_ = GetTickCount64();
+}
+
+// Keeps the IME composition/candidate windows next to the caret line.  The
+// invisible EDIT is only 2px tall per line of its own layout, so without
+// repositioning, typing Chinese on a second line would pop the candidate
+// window back up at the first line.
+void CaptureOverlay::UpdateTextImePosition() {
+  if (!textEdit_) return;
+  DWORD selStart = 0, selEnd = 0;
+  SendMessageW(textEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart),
+               reinterpret_cast<LPARAM>(&selEnd));
+  const LRESULT packed = SendMessageW(textEdit_, EM_POSFROMCHAR, static_cast<WPARAM>(selStart), 0);
+  const int caretX = static_cast<int>(static_cast<short>(LOWORD(packed)));
+  const int caretY = static_cast<int>(static_cast<short>(HIWORD(packed)));
+  if (caretX < 0 && caretY < 0) return;
+  const int lineHeight = std::max(28, static_cast<int>(std::lround(textInputStyle_.size * 1.45f)));
+  const POINT pos{std::max(0, caretX - 8), std::max(0, caretY) + lineHeight};
   if (HIMC context = ImmGetContext(textEdit_)) {
     COMPOSITIONFORM composition{};
     composition.dwStyle = CFS_POINT;
-    composition.ptCurrentPos = {0, lineHeight};
+    composition.ptCurrentPos = pos;
     ImmSetCompositionWindow(context, &composition);
     CANDIDATEFORM candidate{};
     candidate.dwIndex = 0;
     candidate.dwStyle = CFS_CANDIDATEPOS;
-    candidate.ptCurrentPos = {0, lineHeight};
+    candidate.ptCurrentPos = pos;
     ImmSetCandidateWindow(context, &candidate);
     ImmReleaseContext(textEdit_, context);
   }
-  InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void CaptureOverlay::CommitTextInput() {
@@ -7013,6 +7389,9 @@ void CaptureOverlay::CommitTextInput() {
   RemoveWindowSubclass(edit, TextEditProc, 1);
   textEdit_ = nullptr;
   DestroyWindow(edit);
+  KillTimer(hwnd_, kTextCaretTimer);
+  textBackdropBitmap_.Reset();
+  textBackdropValid_ = false;
   if (textEditingCommand_) {
     if (!value.empty()) document_.Replace(*textEditingCommand_, TextCommand{textOrigin_, value, textInputStyle_});
     else document_.Remove(*textEditingCommand_);
@@ -7034,6 +7413,9 @@ void CaptureOverlay::CancelTextInput() {
   RemoveWindowSubclass(edit, TextEditProc, 1);
   textEdit_ = nullptr;
   DestroyWindow(edit);
+  KillTimer(hwnd_, kTextCaretTimer);
+  textBackdropBitmap_.Reset();
+  textBackdropValid_ = false;
   textEditingCommand_.reset();
   textImeComposing_ = false;
   if (textEditFont_) { DeleteObject(textEditFont_); textEditFont_ = nullptr; }
@@ -7058,6 +7440,7 @@ LRESULT CALLBACK CaptureOverlay::TextEditProc(HWND hwnd, UINT message, WPARAM wP
   if (message == WM_IME_STARTCOMPOSITION) {
     self->textImeComposing_ = true;
     const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+    self->UpdateTextImePosition();
     invalidateText();
     return result;
   }
@@ -7074,15 +7457,37 @@ LRESULT CALLBACK CaptureOverlay::TextEditProc(HWND hwnd, UINT message, WPARAM wP
     invalidateText();
     return result;
   }
+  // TranslateMessage synthesises WM_CHAR '\n' for Ctrl+Enter *before* the
+  // WM_KEYDOWN below commits.  A lone LF would be meaningless in the CRLF
+  // edit buffer, so swallow it; plain Enter arrives as '\r' and must pass.
+  if (message == WM_CHAR && wParam == L'\n' &&
+      (GetKeyState(VK_CONTROL) & 0x8000) != 0 && !self->textImeComposing_) {
+    return 0;
+  }
   if (message == WM_KEYDOWN && wParam == VK_RETURN &&
+      (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
       (GetKeyState(VK_SHIFT) & 0x8000) == 0 && !self->textImeComposing_) {
+    // Ctrl+Enter finishes editing; plain Enter (and Shift+Enter) fall through
+    // to the multiline EDIT, which inserts a line break.  While the IME has a
+    // live composition, Enter is reserved for confirming the candidates.
     HIMC context = ImmGetContext(hwnd);
     const LONG composingLength = context ? ImmGetCompositionStringW(context, GCS_COMPSTR, nullptr, 0) : 0;
     if (context) ImmReleaseContext(hwnd, context);
     if (composingLength <= 0) { self->CommitTextInput(); return 0; }
   }
   if (message == WM_KEYDOWN && wParam == VK_ESCAPE) { self->CancelTextInput(); return 0; }
-  return DefSubclassProc(hwnd, message, wParam, lParam);
+  const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+  // Arrow/Home/End movement never posts EN_CHANGE, so without an immediate
+  // repaint the custom caret would only catch up on the next 530 ms blink
+  // tick — which made keyboard movement feel laggy.  Restart the blink phase
+  // on every physical key press and redraw right away.  Key-ups do the same
+  // so auto-repeat never leaves the caret in its hidden half-cycle.
+  if (message == WM_KEYDOWN || message == WM_KEYUP) {
+    self->ResetTextCaretBlink();
+    self->UpdateTextImePosition();
+    invalidateText();
+  }
+  return result;
 }
 
 }  // namespace rc

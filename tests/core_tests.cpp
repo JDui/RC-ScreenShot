@@ -200,6 +200,26 @@ void TestTextRendering() {
   }
   CHECK(redPixels > 20);
 
+  // CRLF from the multiline text editor must render as two visual lines:
+  // red glyph pixels have to reach the second-line band near y >= 54.
+  rc::EditorDocument multilineDocument;
+  multilineDocument.Add(rc::TextCommand{{12, 10}, L"第一行\r\n第二行", style});
+  CHECK(exporter.Render(snapshot, snapshot.virtualBounds, multilineDocument, config, false,
+                        image, error));
+  bool firstLinePixels = false, secondLinePixels = false;
+  for (int y = 0; y < image.height; ++y) {
+    for (int x = 0; x < image.width; ++x) {
+      const size_t offset = static_cast<size_t>(y * image.stride + x * 4);
+      if (image.bgra[offset + 2] > 180 && image.bgra[offset + 1] < 180 &&
+          image.bgra[offset] < 180) {
+        if (y < 48) firstLinePixels = true;
+        if (y >= 54) secondLinePixels = true;
+      }
+    }
+  }
+  CHECK(firstLinePixels);
+  CHECK(secondLinePixels);
+
   // A pen path exercises the Direct2D geometry/stroke factory domain used by the editor.
   // Keep this regression test next to text rendering because both are exported vector content.
   rc::EditorDocument penDocument;

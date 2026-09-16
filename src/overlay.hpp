@@ -319,6 +319,7 @@ class CaptureOverlay {
   void BeginTextInput(POINT point, std::optional<size_t> existingCommand = std::nullopt);
   void CommitTextInput();
   void CancelTextInput();
+  void UpdateTextImePosition();
   static LRESULT CALLBACK TextEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
                                         UINT_PTR subclassId, DWORD_PTR referenceData);
   RECT ToolbarRect() const;
@@ -378,6 +379,19 @@ class CaptureOverlay {
   bool toolbarBackdropValid_ = false;
   std::vector<uint8_t> toolbarBackdropPixels_;
   int toolbarBackdropStride_ = 0;
+  // Frosted dark panel behind the text currently being edited.  Only valid
+  // while textEdit_ is open; keyed by the panel rectangle.
+  ComPtr<ID2D1Bitmap> textBackdropBitmap_;
+  RECT textBackdropRect_{};
+  bool textBackdropValid_ = false;
+  void EnsureTextEditBackdrop(const RECT& panel);
+  void DrawTextEditBackdrop(const TextCommand& command);
+  void DrawTextCaret(const TextCommand& command);
+  // Moves the EDIT caret to the glyph under point.  Returns false when the
+  // click is outside the editing text panel (caller commits the text then).
+  bool TryPositionTextCaret(POINT point, bool selectWord = false);
+  ULONGLONG textCaretBlinkStart_ = 0;
+  void ResetTextCaretBlink();
 
   SelectionMode mode_ = SelectionMode::Normal;
   Tool tool_ = Tool::Pen;

@@ -158,8 +158,58 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 100));
   HWND edit = FindWindowExW(overlay.hwnd(), nullptr, L"Edit", nullptr);
   if (!edit) return 3;
+  const auto editText = [](HWND target) {
+    const int chars = GetWindowTextLengthW(target);
+    std::wstring value(static_cast<size_t>(chars), L'\0');
+    GetWindowTextW(target, value.data(), chars + 1);
+    return value;
+  };
+  const auto pumpMessages = [] {
+    MSG pending{};
+    while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&pending);
+      DispatchMessageW(&pending);
+    }
+  };
+  // Mirror TranslateMessage: the EDIT acts on the WM_CHAR following the
+  // key-down (Enter inserts CRLF; Backspace deletes one character).
+  const auto pressEnter = [](HWND target) {
+    SendMessageW(target, WM_KEYDOWN, VK_RETURN, 0);
+    SendMessageW(target, WM_CHAR, VK_RETURN, 0);
+    SendMessageW(target, WM_KEYUP, VK_RETURN, 0);
+  };
+  const auto pressBackspace = [](HWND target) {
+    SendMessageW(target, WM_KEYDOWN, VK_BACK, 0);
+    SendMessageW(target, WM_CHAR, VK_BACK, 0);
+    SendMessageW(target, WM_KEYUP, VK_BACK, 0);
+  };
+  // Ctrl+Enter commits.  The physical modifier must be synced into the thread
+  // key-state array (which happens when a queued message is retrieved) before
+  // the direct SendMessage reaches the edit subclass.
+  const auto commitTextEdit = [&](HWND target) {
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    pumpMessages();
+    SendMessageW(target, WM_KEYDOWN, VK_RETURN, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    pumpMessages();
+  };
   SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"横竖文字"));
-  SendMessageW(edit, WM_KEYDOWN, VK_RETURN, 0);
+  // Plain Enter inserts a line break instead of committing.
+  pressEnter(edit);
+  if (editText(edit) != L"横竖文字\r\n") return 13;
+  if (FindWindowExW(overlay.hwnd(), nullptr, L"Edit", nullptr) != edit) return 14;
+  // Two backspaces remove the CRLF; Ctrl+Enter then finishes editing.
+  pressBackspace(edit);
+  pressBackspace(edit);
+  if (editText(edit) != L"横竖文字") return 15;
+  commitTextEdit(edit);
+  if (FindWindowExW(overlay.hwnd(), nullptr, L"Edit", nullptr)) return 16;
+  // Double-click re-opens the committed text for another editing pass.
+  SendMessageW(overlay.hwnd(), WM_LBUTTONDBLCLK, 0, MAKELPARAM(100, 100));
+  edit = FindWindowExW(overlay.hwnd(), nullptr, L"Edit", nullptr);
+  if (!edit || editText(edit) != L"横竖文字") return 17;
+  commitTextEdit(edit);
+  if (FindWindowExW(overlay.hwnd(), nullptr, L"Edit", nullptr)) return 18;
   // The text tool can select its own existing text.  The size slider and the
   // first color swatch then edit that command instead of changing defaults.
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 100));
