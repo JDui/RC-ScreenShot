@@ -474,6 +474,9 @@ class CaptureOverlay {
   HFONT textEditFont_ = nullptr;
   HBRUSH textEditBrush_ = nullptr;
   bool textImeComposing_ = false;
+  // After text is committed, the first blank-canvas click only releases the
+  // current text item. A second click starts the next text insertion.
+  bool textPlacementReleasePending_ = false;
   std::wstring tooltipText_;
   bool tooltipVisible_ = false;
 
