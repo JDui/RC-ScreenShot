@@ -3874,9 +3874,10 @@ void CaptureOverlay::DrawCommandHandles() {
 }
 
 void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
-  // One color ramp for every bar icon: bright when selected, muted otherwise.
-  const D2D1_COLOR_F color = active ? D2D1::ColorF(.98f, .99f, 1.0f, 1.0f)
-                                    : D2D1::ColorF(.74f, .80f, .90f, 1.0f);
+  // A cooler pearl-white inactive ink and a blue selected ink stay crisp against
+  // the flat graphite tiles used by the original floating toolbar.
+  const D2D1_COLOR_F color = active ? D2D1::ColorF(.96f, .99f, 1.0f, 1.0f)
+                                    : D2D1::ColorF(.75f, .83f, .96f, .98f);
   ComPtr<ID2D1SolidColorBrush> brush;
   renderTarget_->CreateSolidColorBrush(color, &brush);
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
@@ -3885,55 +3886,72 @@ void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
   const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   switch (tool) {
     case Tool::Pen:
-      // Diagonal pencil: closed nib triangle plus a separator across the shaft.
-      pen.Line(5.5f, 18.5f, 16.4f, 4.4f, 1.9f);
-      pen.Line(16.4f, 4.4f, 19.6f, 7.6f, 1.9f);
-      pen.Line(19.6f, 7.6f, 5.5f, 18.5f, 1.9f);
-      pen.Line(7.4f, 13.4f, 10.6f, 16.6f, 1.4f);
+      // Precision pencil with a readable cap, barrel seam and sharpened nib.
+      pen.Line(6, 17.8f, 16.1f, 5.1f, 1.75f);
+      pen.Line(16.1f, 5.1f, 19, 7.5f, 1.75f);
+      pen.Line(19, 7.5f, 8.9f, 20, 1.75f);
+      pen.Line(8.9f, 20, 5.2f, 21, 1.5f);
+      pen.Line(5.2f, 21, 6, 17.8f, 1.5f);
+      pen.Line(8.2f, 15.1f, 11.1f, 17.4f, 1.25f);
+      pen.Line(15.1f, 6.4f, 17.9f, 8.7f, 1.1f);
       break;
     case Tool::Rectangle:
-      pen.RoundedRect(5, 5, 19, 19, 2.5f, 1.8f);
+      pen.RoundedRect(4.8f, 5.2f, 19.2f, 18.8f, 2.0f, 1.75f);
+      pen.Line(8, 8, 11, 8, 1.0f);
+      pen.Line(8, 8, 8, 11, 1.0f);
       break;
     case Tool::Ellipse:
-      pen.Circle(12, 12, 7.2f, 1.8f);
+      pen.Circle(12, 12, 7.35f, 1.75f);
+      pen.Dot(12, 12, .9f);
       break;
     case Tool::Line:
-      pen.Line(5.2f, 18.8f, 18.8f, 5.2f, 2.0f);
+      pen.Line(6.8f, 17.2f, 17.2f, 6.8f, 1.75f);
+      pen.Circle(6.3f, 17.7f, 1.7f, 1.3f);
+      pen.Circle(17.7f, 6.3f, 1.7f, 1.3f);
       break;
     case Tool::Arrow:
-      // North-east arrow: shaft plus the two axis-aligned head arms.
-      pen.Line(6, 18, 17, 7, 2.0f);
-      pen.Line(9.6f, 7, 17, 7, 1.9f);
-      pen.Line(17, 7, 17, 14.4f, 1.9f);
+      pen.Line(5.2f, 18.8f, 17.5f, 6.5f, 1.8f);
+      pen.Line(10.8f, 6.5f, 17.5f, 6.5f, 1.8f);
+      pen.Line(17.5f, 6.5f, 17.5f, 13.2f, 1.8f);
+      pen.Line(5.2f, 18.8f, 9.1f, 17.4f, 1.2f);
       break;
     case Tool::Text:
-      DrawText(L"Aa", ToD2D(rect), 13.5f, color);
+      pen.Line(5.5f, 7, 18.5f, 7, 1.9f);
+      pen.Line(12, 7, 12, 18.5f, 1.9f);
+      pen.Line(8.5f, 18.5f, 15.5f, 18.5f, 1.55f);
+      pen.Line(7, 21, 17, 21, 1.0f);
       break;
     case Tool::MosaicBrush:
-      pen.Dot(5.8f, 5.8f, 1.4f);
-      pen.Dot(10.8f, 5.8f, 1.4f);
-      pen.Dot(5.8f, 10.8f, 1.4f);
-      pen.Line(9.2f, 14.8f, 16.6f, 7.4f, 2.6f);
-      pen.Dot(7.6f, 16.4f, 1.9f);
+      pen.RoundedRect(4, 4, 10, 10, 1.0f, 1.25f);
+      pen.RoundedRect(12, 4, 18, 10, 1.0f, 1.25f);
+      pen.RoundedRect(4, 12, 10, 18, 1.0f, 1.25f);
+      pen.Dot(15, 15, 2.0f);
+      pen.Line(13.6f, 16.4f, 7.8f, 20.2f, 2.2f);
       break;
     case Tool::MosaicRectangle:
-      pen.RoundedRect(4.5f, 6.5f, 19.5f, 17.5f, 2.0f, 1.6f);
-      pen.Dot(9, 10.4f, 1.5f);
-      pen.Dot(14, 10.4f, 1.5f);
-      pen.Dot(9, 14, 1.5f);
-      pen.Dot(14, 14, 1.5f);
+      pen.RoundedRect(4.4f, 5.2f, 19.6f, 18.8f, 2.0f, 1.45f);
+      pen.RoundedRect(7, 7.8f, 10.2f, 11, .5f, .9f);
+      pen.RoundedRect(13.8f, 7.8f, 17, 11, .5f, .9f);
+      pen.RoundedRect(7, 13, 10.2f, 16.2f, .5f, .9f);
+      pen.RoundedRect(13.8f, 13, 17, 16.2f, .5f, .9f);
       break;
     case Tool::Select:
-      // Lasso cursor: the angular outline of a selection pointer.
-      pen.Line(6.7f, 4.7f, 11.3f, 19.3f, 1.6f);
-      pen.Line(6.7f, 4.7f, 18.7f, 10, 1.6f);
-      pen.Line(18.7f, 10, 12, 12, 1.6f);
-      pen.Line(12, 12, 16.7f, 18, 1.6f);
-      pen.Line(16.7f, 18, 13.3f, 19.3f, 1.6f);
-      pen.Line(12, 12, 12.7f, 19.3f, 1.6f);
+      // Marching-ant selection frame paired with a small pointer nib.
+      pen.Dot(5.5f, 5.5f, .95f); pen.Dot(12, 5.5f, .95f); pen.Dot(18.5f, 5.5f, .95f);
+      pen.Dot(5.5f, 12, .95f); pen.Dot(5.5f, 18.5f, .95f); pen.Dot(18.5f, 12, .95f);
+      pen.Dot(18.5f, 18.5f, .95f); pen.Dot(12, 18.5f, .95f);
+      pen.Line(10.6f, 9.1f, 16.6f, 21, 1.55f);
+      pen.Line(10.6f, 9.1f, 20, 14.1f, 1.55f);
+      pen.Line(20, 14.1f, 15.1f, 15.2f, 1.45f);
+      pen.Line(15.1f, 15.2f, 18.3f, 20.3f, 1.45f);
       break;
     case Tool::Frame:
-      pen.RoundedRect(4.5f, 6, 19.5f, 18, 2.5f, 1.8f);
+      // Open corner brackets read as a framing tool instead of another box.
+      pen.Line(5.5f, 9.5f, 5.5f, 5.5f, 1.9f); pen.Line(5.5f, 5.5f, 9.5f, 5.5f, 1.9f);
+      pen.Line(14.5f, 5.5f, 18.5f, 5.5f, 1.9f); pen.Line(18.5f, 5.5f, 18.5f, 9.5f, 1.9f);
+      pen.Line(5.5f, 14.5f, 5.5f, 18.5f, 1.9f); pen.Line(5.5f, 18.5f, 9.5f, 18.5f, 1.9f);
+      pen.Line(14.5f, 18.5f, 18.5f, 18.5f, 1.9f); pen.Line(18.5f, 18.5f, 18.5f, 14.5f, 1.9f);
+      pen.Line(9.5f, 12, 14.5f, 12, 1.05f);
       break;
   }
 }
@@ -3944,83 +3962,130 @@ void CaptureOverlay::DrawActionIcon(bool save, const RECT& rect) {
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
   const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   if (!save) {
-    // Copy: two overlapping rounded sheets sharing the grid language.
-    pen.RoundedRect(8.5f, 4.5f, 19.5f, 15.5f, 2.0f, 1.7f);
-    pen.RoundedRect(4.5f, 8.5f, 15.5f, 19.5f, 2.0f, 1.7f);
+    // Copy: two offset sheets; the front sheet has a quiet folded corner.
+    pen.RoundedRect(8.5f, 4.5f, 18.5f, 15.5f, 1.8f, 1.5f);
+    pen.Line(14.5f, 4.5f, 18.5f, 8.5f, 1.15f);
+    pen.Line(14.5f, 4.5f, 14.5f, 8.5f, 1.05f);
+    pen.Line(14.5f, 8.5f, 18.5f, 8.5f, 1.05f);
+    pen.RoundedRect(5.5f, 8.5f, 15.5f, 19.5f, 1.8f, 1.65f);
+    pen.Line(8.2f, 12.1f, 12.8f, 12.1f, 1.05f);
+    pen.Line(8.2f, 15.4f, 12.8f, 15.4f, 1.05f);
     return;
   }
-  // Save: a down arrow dropping into an open tray.
-  pen.Line(12, 4.5f, 12, 13.4f, 1.9f);
-  pen.Line(8.8f, 10.4f, 12, 13.6f, 1.9f);
-  pen.Line(12, 13.6f, 15.2f, 10.4f, 1.9f);
-  pen.Line(4.5f, 14.5f, 4.5f, 18.5f, 1.7f);
-  pen.Line(4.5f, 18.5f, 19.5f, 18.5f, 1.7f);
-  pen.Line(19.5f, 18.5f, 19.5f, 14.5f, 1.7f);
+  // Save: document silhouette, inset label, and an arrow settling into a tray.
+  pen.Line(7, 4.8f, 14.8f, 4.8f, 1.55f);
+  pen.Line(14.8f, 4.8f, 18, 8, 1.55f);
+  pen.Line(18, 8, 18, 12.2f, 1.55f);
+  pen.Line(7, 4.8f, 7, 12.2f, 1.55f);
+  pen.Line(14.8f, 4.8f, 14.8f, 8, 1.1f);
+  pen.Line(14.8f, 8, 18, 8, 1.1f);
+  pen.Line(12, 9.4f, 12, 16.3f, 1.8f);
+  pen.Line(9.2f, 13.5f, 12, 16.3f, 1.8f);
+  pen.Line(12, 16.3f, 14.8f, 13.5f, 1.8f);
+  pen.Line(4.8f, 15.1f, 4.8f, 19, 1.7f);
+  pen.Line(4.8f, 19, 19.2f, 19, 1.7f);
+  pen.Line(19.2f, 19, 19.2f, 15.1f, 1.7f);
 }
 
 void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
   ComPtr<ID2D1SolidColorBrush> brush;
-  const D2D1_COLOR_F iconColor =
-      action == PropertyAction::TextShadow && ActiveTextStyle()->shadow
-          ? D2D1::ColorF(.36f, .67f, 1.0f, 1.0f)
-          : D2D1::ColorF(.74f, .80f, .90f, 1.0f);
+  bool enabled = false;
+  if (action == PropertyAction::TextShadow) enabled = ActiveTextStyle()->shadow;
+  else if (action == PropertyAction::FrameToggle) enabled = config_.frameEnabled;
+  else if (action == PropertyAction::FillToggle) {
+    const ShapeSetting* shape = ActiveShape();
+    enabled = shape && shape->fillOpacity > 0.0f;
+  }
+  const D2D1_COLOR_F iconColor = enabled ? D2D1::ColorF(.48f, .78f, 1.0f, 1.0f)
+                                         : D2D1::ColorF(.76f, .84f, .96f, .98f);
   renderTarget_->CreateSolidColorBrush(iconColor, &brush);
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
   const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
   switch (action) {
     case PropertyAction::SizeDown:
-      pen.Line(6.5f, 12, 17.5f, 12);
+      pen.Circle(12, 12, 7.3f, 1.45f);
+      pen.Line(8.5f, 12, 15.5f, 12, 1.8f);
+      pen.Line(16.9f, 16.9f, 19.5f, 19.5f, 1.35f);
       break;
     case PropertyAction::SizeUp:
-      pen.Line(6.5f, 12, 17.5f, 12);
-      pen.Line(12, 6.5f, 12, 17.5f);
+      pen.Circle(11.4f, 11.4f, 7.3f, 1.45f);
+      pen.Line(7.9f, 11.4f, 14.9f, 11.4f, 1.65f);
+      pen.Line(11.4f, 7.9f, 11.4f, 14.9f, 1.65f);
+      pen.Line(16.5f, 16.5f, 19.5f, 19.5f, 1.35f);
       break;
     case PropertyAction::Color:
-      pen.Dot(12, 12, 6.2f);
-      pen.Circle(12, 12, 8.4f, 1.4f);
+      // Open palette with a thumb well and three paint wells.
+      pen.Circle(12, 12.2f, 7.4f, 1.55f);
+      pen.Circle(9.3f, 9.2f, 1.0f, 1.1f);
+      pen.Circle(14.4f, 8.8f, 1.0f, 1.1f);
+      pen.Circle(16.1f, 13.2f, 1.0f, 1.1f);
+      pen.Line(5.1f, 15.2f, 8.2f, 18.2f, 1.5f);
       break;
     case PropertyAction::Opacity:
-      pen.Circle(12, 12, 7.4f);
-      pen.Line(7, 17, 17, 7, 1.5f);
+      // Half-lit lens: the divided disc suggests alpha rather than a generic slash.
+      pen.Circle(12, 12, 7.3f, 1.5f);
+      pen.Line(12, 4.9f, 12, 19.1f, 1.15f);
+      pen.Line(12.3f, 5.4f, 17.2f, 7.5f, 1.0f);
+      pen.Line(12.3f, 18.6f, 17.2f, 16.5f, 1.0f);
       break;
     case PropertyAction::FillColor:
-      renderTarget_->FillRoundedRectangle(
-          D2D1::RoundedRect(D2D1::RectF(pen.grid.ox + 6 * pen.grid.unit,
-                                        pen.grid.oy + 6 * pen.grid.unit,
-                                        pen.grid.ox + 18 * pen.grid.unit,
-                                        pen.grid.oy + 18 * pen.grid.unit),
-                            pen.Weight(2), pen.Weight(2)),
-          brush.Get());
+      // Tilted paint bucket and one paint drop.
+      pen.Line(7.2f, 11.5f, 16.2f, 11.5f, 1.7f);
+      pen.Line(7.2f, 11.5f, 8.6f, 18.3f, 1.7f);
+      pen.Line(16.2f, 11.5f, 14.8f, 18.3f, 1.7f);
+      pen.Line(8.6f, 18.3f, 14.8f, 18.3f, 1.7f);
+      pen.Line(6.2f, 10.3f, 17.2f, 10.3f, 1.7f);
+      pen.Line(8.8f, 9.7f, 11.7f, 6.8f, 1.5f);
+      pen.Line(11.7f, 6.8f, 14.6f, 9.7f, 1.5f);
+      pen.Dot(18.5f, 7.2f, 1.2f);
       break;
     case PropertyAction::FillOpacity:
-      pen.RoundedRect(6, 6, 18, 18, 2);
-      pen.Line(7.5f, 16.5f, 16.5f, 7.5f, 1.4f);
+      pen.RoundedRect(5.5f, 5.5f, 18.5f, 18.5f, 2.2f, 1.5f);
+      pen.Line(7.3f, 16.7f, 16.7f, 7.3f, 1.45f);
+      pen.Dot(8.5f, 8.5f, .7f); pen.Dot(15.5f, 15.5f, .7f);
       break;
     case PropertyAction::FillToggle:
-      pen.RoundedRect(5, 8.5f, 19, 15.5f, 3.5f, 1.6f);
+      // Eye with a positive center when the fill is enabled.
+      pen.Line(4.5f, 12, 7.5f, 8.5f, 1.5f);
+      pen.Line(7.5f, 8.5f, 12, 7, 1.5f);
+      pen.Line(12, 7, 16.5f, 8.5f, 1.5f);
+      pen.Line(16.5f, 8.5f, 19.5f, 12, 1.5f);
+      pen.Line(19.5f, 12, 16.5f, 15.5f, 1.5f);
+      pen.Line(16.5f, 15.5f, 12, 17, 1.5f);
+      pen.Line(12, 17, 7.5f, 15.5f, 1.5f);
+      pen.Line(7.5f, 15.5f, 4.5f, 12, 1.5f);
+      pen.Circle(12, 12, 2.5f, 1.4f);
       break;
     case PropertyAction::MosaicStyle:
-      pen.Line(9, 5.5f, 9, 18.5f, 1.4f);
-      pen.Line(15, 5.5f, 15, 18.5f, 1.4f);
-      pen.Line(5.5f, 9, 18.5f, 9, 1.4f);
-      pen.Line(5.5f, 15, 18.5f, 15, 1.4f);
+      pen.RoundedRect(5.2f, 5.2f, 10.4f, 10.4f, 1.0f, 1.35f);
+      pen.RoundedRect(13.6f, 5.2f, 18.8f, 10.4f, 1.0f, 1.35f);
+      pen.RoundedRect(5.2f, 13.6f, 10.4f, 18.8f, 1.0f, 1.35f);
+      pen.Dot(16.2f, 16.2f, 2.25f);
       break;
     case PropertyAction::MosaicStrength:
-      pen.Line(6, 12, 18, 12, 1.6f);
-      pen.Dot(12, 12, 2.2f);
+      pen.Circle(12, 12, 7.3f, 1.25f);
+      pen.Circle(12, 12, 4.4f, 1.15f);
+      pen.Dot(12, 12, 1.5f);
       break;
     case PropertyAction::FrameToggle:
-      pen.RoundedRect(5.5f, 6.5f, 18.5f, 17.5f, 2.0f, 1.7f);
+      pen.RoundedRect(5, 5.5f, 19, 18.5f, 2.1f, 1.45f);
+      pen.Line(8, 8.5f, 16, 8.5f, 1.0f);
+      pen.Line(8, 11.8f, 16, 11.8f, 1.0f);
+      pen.Line(8, 15.1f, 13, 15.1f, 1.0f);
       break;
     case PropertyAction::TextOrientation:
-      DrawText(L"T", ToD2D(rect), 15, iconColor);
+      pen.Line(5.3f, 6.2f, 15.8f, 6.2f, 1.65f);
+      pen.Line(10.5f, 6.2f, 10.5f, 17.8f, 1.65f);
+      pen.Line(7.7f, 17.8f, 13.3f, 17.8f, 1.3f);
+      pen.Line(18, 7.5f, 18, 17, 1.2f);
+      pen.Line(16, 9.5f, 18, 7.5f, 1.2f); pen.Line(18, 7.5f, 20, 9.5f, 1.2f);
       break;
     case PropertyAction::TextShadow:
-      DrawText(L"T",
-               D2D1::RectF(static_cast<float>(rect.left + 4), static_cast<float>(rect.top + 4),
-                           static_cast<float>(rect.right + 4), static_cast<float>(rect.bottom + 4)),
-               13, D2D1::ColorF(.05f, .08f, .12f, .85f));
-      DrawText(L"T", ToD2D(rect), 13, iconColor);
+      // Two offset typographic planes make the shadow state unmistakable.
+      pen.Line(9, 9, 19, 9, 1.65f); pen.Line(14, 9, 14, 20, 1.65f);
+      pen.Line(11.5f, 20, 16.5f, 20, 1.2f);
+      pen.Line(5, 5.8f, 15.2f, 5.8f, 1.65f); pen.Line(10.1f, 5.8f, 10.1f, 17, 1.65f);
+      pen.Line(7.6f, 17, 12.6f, 17, 1.2f);
       break;
   }
 }
@@ -4290,7 +4355,7 @@ void CaptureOverlay::DrawToolbar() {
   const RECT toolbar = ToolbarRect();
   EnsureToolbarBackdrop();
   ComPtr<ID2D1SolidColorBrush> shadow, background;
-  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, .28f), &shadow);
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, .30f), &shadow);
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.055f, .07f, .10f, .60f), &background);
   RECT shadowRect = toolbar;
   OffsetRect(&shadowRect, 0, 4);
@@ -4339,15 +4404,20 @@ void CaptureOverlay::DrawToolbar() {
     renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(rect), 4, 4), outline.Get(), 1.0f);
   };
 
+  ComPtr<ID2D1SolidColorBrush> tileFill;
+  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.11f, .14f, .19f, .95f), &tileFill);
+  const auto drawFlatTile = [&](const RECT& rect, D2D1_COLOR_F fill, float radius) {
+    const D2D1_ROUNDED_RECT tile = D2D1::RoundedRect(ToD2D(rect), radius, radius);
+    tileFill->SetColor(fill);
+    renderTarget_->FillRoundedRectangle(tile, tileFill.Get());
+  };
+
   for (size_t index = 0; index < toolButtons_.size(); ++index) {
     const auto& button = toolButtons_[index];
     const RECT item = ToolbarToolRect(index);
-    ComPtr<ID2D1SolidColorBrush> buttonBackground;
-    renderTarget_->CreateSolidColorBrush(button.tool == tool_
-                                             ? D2D1::ColorF(.12f, .55f, .95f, .95f)
-                                             : D2D1::ColorF(.11f, .14f, .19f, .95f),
-                                         &buttonBackground);
-    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(item), 9, 9), buttonBackground.Get());
+    const bool selected = button.tool == tool_;
+    drawFlatTile(item, selected ? D2D1::ColorF(.12f, .55f, .95f, .95f)
+                                : D2D1::ColorF(.11f, .14f, .19f, .95f), 9.0f);
     DrawToolIcon(button.tool, item, button.tool == tool_);
   }
   const RECT copy = ToolbarCopyRect();
@@ -4381,20 +4451,16 @@ void CaptureOverlay::DrawToolbar() {
   }
   if (longPreview_) {
     const RECT crop = ToolbarLongEntryRect();
-    ComPtr<ID2D1SolidColorBrush> cropBackground;
-    renderTarget_->CreateSolidColorBrush(
-        longPreviewStage_ == LongPreviewStage::Crop
-            ? D2D1::ColorF(.12f, .55f, .95f, .95f)
-            : D2D1::ColorF(.11f, .14f, .19f, .95f),
-        &cropBackground);
-    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(ToD2D(crop), 9, 9), cropBackground.Get());
+    drawFlatTile(crop, longPreviewStage_ == LongPreviewStage::Crop
+                           ? D2D1::ColorF(.12f, .55f, .95f, .95f)
+                           : D2D1::ColorF(.11f, .14f, .19f, .95f), 9.0f);
     const D2D1_RECT_F cropArea = ToD2D(crop);
     DrawLongPreviewGlyph(0, {cropArea.left + 7.0f, cropArea.top + 7.0f,
                              cropArea.right - 7.0f, cropArea.bottom - 7.0f});
   } else if (!IsBurstSession()) {
     // Burst captures never show the long-capture entry (see HitLongEntry).
     const RECT longEntry = ToolbarLongEntryRect();
-    DrawRainbowPanel(ToD2D(longEntry), 9.0f);
+    DrawLongEntryPanel(ToD2D(longEntry), 9.0f);
     DrawLongCaptureGlyph(ToD2D(longEntry));
   }
 
@@ -4489,24 +4555,20 @@ void CaptureOverlay::DrawToolbar() {
       const ShapeSetting* shape = ActiveShape(); enabled = shape && shape->fillOpacity > 0.0f;
     }
 
-    ComPtr<ID2D1SolidColorBrush> propertyBackground, propertyOutline;
-    renderTarget_->CreateSolidColorBrush(
-        button.pill && enabled ? D2D1::ColorF(.12f, .55f, .95f, .98f)
-                               : D2D1::ColorF(.11f, .14f, .19f, .98f),
-        &propertyBackground);
-    renderTarget_->CreateSolidColorBrush(
-        button.pill ? D2D1::ColorF(.29f, .35f, .44f, 1.0f)
-                    : D2D1::ColorF(.11f, .14f, .19f, .98f),
-        &propertyOutline);
-    const float radius = button.pill ? 18.0f : 8.0f;
-    const D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(ToD2D(button.rect), radius, radius);
-    renderTarget_->FillRoundedRectangle(rounded, propertyBackground.Get());
+    const float radius = button.pill ? 16.0f : 9.0f;
     if (button.pill) {
-      if (!enabled) renderTarget_->DrawRoundedRectangle(rounded, propertyOutline.Get(), 1.0f);
+      drawFlatTile(button.rect, enabled ? D2D1::ColorF(.12f, .55f, .95f, .98f)
+                                        : D2D1::ColorF(.11f, .14f, .19f, .98f), radius);
+      if (!enabled) {
+        ComPtr<ID2D1SolidColorBrush> outline;
+        renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.29f, .35f, .44f, 1.0f), &outline);
+        renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(button.rect), radius, radius), outline.Get(), 1.0f);
+      }
       DrawText(button.label, ToD2D(button.rect), 10,
                enabled ? D2D1::ColorF(.98f, .99f, 1.0f, 1.0f)
                        : D2D1::ColorF(.77f, .83f, .92f, 1.0f));
     } else {
+      drawFlatTile(button.rect, D2D1::ColorF(.11f, .14f, .19f, .98f), radius);
       DrawPropertyIcon(button.action, button.rect);
     }
   }
@@ -4591,10 +4653,8 @@ void CaptureOverlay::ExitLongCaptureMode() {
   InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-// Primary panel for the main-bar long-capture entry.  Flat neutral fill so the
-// entry reads as one family with the other bar buttons: long-capture controls
-// carry no highlight, matching every other icon in the toolbar.
-void CaptureOverlay::DrawRainbowPanel(const D2D1_RECT_F& rect, float radius) {
+// Flat graphite panel for the long-capture entry, matching the original bar.
+void CaptureOverlay::DrawLongEntryPanel(const D2D1_RECT_F& rect, float radius) {
   const float width = rect.right - rect.left;
   const float height = rect.bottom - rect.top;
   if (width <= 0 || height <= 0) return;
@@ -4606,9 +4666,7 @@ void CaptureOverlay::DrawRainbowPanel(const D2D1_RECT_F& rect, float radius) {
   renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
 }
 
-// Primary-action panel for the long-capture direction/finish buttons: the same
-// flat neutral family as the toolbar entry and the tool buttons, so the whole
-// control set reads consistently with no per-button highlight.
+// Flat action panel for long-capture controls (the classic graphite treatment).
 void CaptureOverlay::DrawAccentPanel(const D2D1_RECT_F& rect, float radius) {
   const float width = rect.right - rect.left;
   const float height = rect.bottom - rect.top;
@@ -4621,9 +4679,7 @@ void CaptureOverlay::DrawAccentPanel(const D2D1_RECT_F& rect, float radius) {
   renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
 }
 
-// Neutral dark companion to DrawAccentPanel, for the non-primary buttons of the
-// long-capture bars: the same quiet graphite fill as the tool buttons, flat and
-// gloss-free with a subtle outline.
+// Matte neutral companion for secondary long-capture controls.
 void CaptureOverlay::DrawNeutralPanel(const D2D1_RECT_F& rect, float radius) {
   const float width = rect.right - rect.left;
   const float height = rect.bottom - rect.top;
@@ -4636,11 +4692,9 @@ void CaptureOverlay::DrawNeutralPanel(const D2D1_RECT_F& rect, float radius) {
   renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), outline.Get(), 1.0f);
 }
 
-// White glyph shared by the rainbow toolbar entry and the primary capture
-// buttons.  The design lives in assets/scroll-capture-icon.svg (24x24 grid)
-// and is scaled proportionally into the target rect: a rounded content page
-// whose text lines taper away, a bold rounded down arrow beside it and an
-// open output tray underneath marking the stitched result.
+// White glyph shared by the long-capture toolbar entry and the primary capture
+// buttons.  It mirrors assets/scroll-capture-icon.svg on a 24x24 grid: a tall
+// content sheet and a simple down cue for continuing the capture while scrolling.
 void CaptureOverlay::DrawLongCaptureGlyph(const D2D1_RECT_F& rect) {
   const float width = rect.right - rect.left;
   const float height = rect.bottom - rect.top;
@@ -4651,18 +4705,21 @@ void CaptureOverlay::DrawLongCaptureGlyph(const D2D1_RECT_F& rect) {
   // named local: a temporary ComPtr would leave the pen holding a freed style.
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
   const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
-  // Content page with tapering text lines.
-  pen.RoundedRect(5, 3.5f, 15, 16.5f, 2.0f, 1.5f);
-  pen.Line(7, 6.8f, 13, 6.8f, 1.4f);
-  pen.Line(7, 9.6f, 11.2f, 9.6f, 1.4f);
-  pen.Line(7, 12.4f, 9.5f, 12.4f, 1.4f);
-  // Bold rounded chevron beside the page (shaftless, like the bar buttons).
-  pen.Line(14.75f, 8.75f, 18, 12, 1.9f);
-  pen.Line(18, 12, 21.25f, 8.75f, 1.9f);
-  // Output tray: a baseline with raised ends.
-  pen.Line(4.5f, 19.25f, 19.5f, 19.25f, 1.5f);
-  pen.Line(4.5f, 17.75f, 4.5f, 19.25f, 1.5f);
-  pen.Line(19.5f, 17.75f, 19.5f, 19.25f, 1.5f);
+  // Scrolling document with a folded corner and a clear continuation cue.
+  pen.Line(5, 3.8f, 13.4f, 3.8f, 1.35f);
+  pen.Line(13.4f, 3.8f, 16.1f, 6.5f, 1.35f);
+  pen.Line(16.1f, 6.5f, 16.1f, 19.7f, 1.35f);
+  pen.Line(16.1f, 19.7f, 5, 19.7f, 1.35f);
+  pen.Line(5, 19.7f, 5, 3.8f, 1.35f);
+  pen.Line(13.4f, 3.8f, 13.4f, 6.5f, 1.0f);
+  pen.Line(13.4f, 6.5f, 16.1f, 6.5f, 1.0f);
+  pen.Line(7.5f, 9.4f, 12.8f, 9.4f, 1.0f);
+  pen.Line(7.5f, 12.4f, 13.1f, 12.4f, 1.0f);
+  pen.Line(7.5f, 15.4f, 11.3f, 15.4f, 1.0f);
+  // Down-arrow sits beyond the page edge, visually separate from the content.
+  pen.Line(19.3f, 6.4f, 19.3f, 15.4f, 1.75f);
+  pen.Line(16.7f, 12.9f, 19.3f, 15.5f, 1.75f);
+  pen.Line(19.3f, 15.5f, 21.9f, 12.9f, 1.75f);
 }
 
 // Direction chevrons for the three scroll buttons: a bold open ">"-style
@@ -4677,16 +4734,19 @@ void CaptureOverlay::DrawScrollDirectionGlyph(ScrollDirection direction, const D
   const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
   switch (direction) {
     case ScrollDirection::Up:
-      pen.Line(6.5f, 14.25f, 12, 8.5f, 2.3f);
-      pen.Line(12, 8.5f, 17.5f, 14.25f, 2.3f);
+      pen.Line(12, 18.5f, 12, 6.2f, 1.9f);
+      pen.Line(7.5f, 10.8f, 12, 6.2f, 1.9f);
+      pen.Line(12, 6.2f, 16.5f, 10.8f, 1.9f);
       break;
     case ScrollDirection::Right:
-      pen.Line(9.75f, 6.5f, 15.5f, 12, 2.3f);
-      pen.Line(15.5f, 12, 9.75f, 17.5f, 2.3f);
+      pen.Line(5.5f, 12, 18, 12, 1.9f);
+      pen.Line(13.4f, 7.5f, 18, 12, 1.9f);
+      pen.Line(18, 12, 13.4f, 16.5f, 1.9f);
       break;
     case ScrollDirection::Down:
-      pen.Line(6.5f, 9.75f, 12, 15.5f, 2.3f);
-      pen.Line(12, 15.5f, 17.5f, 9.75f, 2.3f);
+      pen.Line(12, 5.5f, 12, 17.8f, 1.9f);
+      pen.Line(7.5f, 13.2f, 12, 17.8f, 1.9f);
+      pen.Line(12, 17.8f, 16.5f, 13.2f, 1.9f);
       break;
   }
 }

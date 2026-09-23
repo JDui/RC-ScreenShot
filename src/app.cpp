@@ -45,18 +45,15 @@ constexpr int IDC_BURST_COUNT_PLUS = 2021;
 constexpr int IDC_BURST_INTERVAL_MINUS = 2022;
 constexpr int IDC_BURST_INTERVAL_PLUS = 2023;
 
-constexpr int kSettingsWidth = 620;
-constexpr int kSettingsHeight = 426;
+constexpr int kSettingsWidth = 820;
+constexpr int kSettingsHeight = 690;
 
-// Cohesive blue-tinted dark palette shared by the settings chrome and the
-// owner-drawn controls.  Keeping the values in one place makes the window
-// read as a single design instead of a patchwork of ad-hoc colors.
+// Matte graphite-and-blue palette shared with the original floating toolbar.
 constexpr COLORREF kBackground = RGB(11, 16, 26);
 constexpr COLORREF kBackgroundEnd = RGB(14, 21, 34);
 constexpr COLORREF kCardStart = RGB(23, 33, 51);
 constexpr COLORREF kCardEnd = RGB(16, 24, 38);
 constexpr COLORREF kCardBorder = RGB(41, 55, 80);
-constexpr COLORREF kCardHighlight = RGB(58, 74, 104);
 constexpr COLORREF kControlFill = RGB(27, 39, 59);
 constexpr COLORREF kControlBorder = RGB(47, 65, 95);
 constexpr COLORREF kControlHover = RGB(33, 47, 70);
@@ -71,19 +68,75 @@ constexpr COLORREF kTextLabel = RGB(162, 182, 206);
 constexpr COLORREF kTextDim = RGB(120, 140, 168);
 
 // Card geometry used by both control placement and WM_PAINT chrome.
-constexpr RECT kShortcutCard = {8, 8, 612, 148};
-constexpr RECT kOutputCard = {8, 156, 306, 302};
-constexpr RECT kEditorCard = {312, 156, 612, 302};
-constexpr RECT kBehaviorCard = {8, 310, 612, 388};
+constexpr RECT kShortcutCard = {18, 92, 802, 276};
+constexpr RECT kOutputCard = {18, 292, 402, 530};
+constexpr RECT kEditorCard = {418, 292, 802, 530};
+constexpr RECT kBehaviorCard = {18, 546, 802, 628};
 
 RECT QualitySliderRect() {
-  return {118, 251, 252, 265};
+  return {130, 437, 330, 449};
 }
 
 // COLOR16 channel for GradientFill vertices.  Extracts the channel without
 // the narrowing intermediate casts that make GetXValue warn on constants.
 constexpr COLOR16 Channel16(COLORREF value, int shift) {
   return static_cast<COLOR16>(((value >> shift) & 0xFF) << 8);
+}
+
+// Blend a flat tint through GDI's alpha compositor. A one-pixel 32-bit DIB is
+// stretched over the destination for simple translucent control fills.
+void BlendFill(HDC dc, const RECT& rect, COLORREF color, BYTE opacity) {
+  const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
+  if (!dc || width <= 0 || height <= 0 || opacity == 0) return;
+
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(info.bmiHeader);
+  info.bmiHeader.biWidth = 1;
+  info.bmiHeader.biHeight = 1;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  void* pixels = nullptr;
+  HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+  HDC source = CreateCompatibleDC(dc);
+  if (!bitmap || !source || !pixels) {
+    if (source) DeleteDC(source);
+    if (bitmap) DeleteObject(bitmap);
+    HBRUSH fallback = CreateSolidBrush(color);
+    if (fallback) { FillRect(dc, &rect, fallback); DeleteObject(fallback); }
+    return;
+  }
+
+  *static_cast<DWORD*>(pixels) = 0xFF000000u |
+      (static_cast<DWORD>(GetRValue(color)) << 16) |
+      (static_cast<DWORD>(GetGValue(color)) << 8) |
+      static_cast<DWORD>(GetBValue(color));
+  HGDIOBJ oldBitmap = SelectObject(source, bitmap);
+  const BLENDFUNCTION blend{AC_SRC_OVER, 0, opacity, 0};
+  AlphaBlend(dc, rect.left, rect.top, width, height, source, 0, 0, 1, 1, blend);
+  SelectObject(source, oldBitmap);
+  DeleteDC(source);
+  DeleteObject(bitmap);
+}
+
+void DrawPanelButton(HDC dc, const RECT& rect, COLORREF fill, COLORREF border,
+                     int cornerRadius, BYTE opacity = 232) {
+  HRGN clip = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1,
+                                 cornerRadius, cornerRadius);
+  const int saved = SaveDC(dc);
+  SelectClipRgn(dc, clip);
+  BlendFill(dc, rect, fill, opacity);
+  RestoreDC(dc, saved);
+  DeleteObject(clip);
+
+  HPEN pen = CreatePen(PS_SOLID, 1, border);
+  HGDIOBJ oldPen = SelectObject(dc, pen);
+  HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+  RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, cornerRadius, cornerRadius);
+  SelectObject(dc, oldPen);
+  SelectObject(dc, oldBrush);
+  DeleteObject(pen);
 }
 
 bool IsToggleId(int id) {
@@ -140,11 +193,11 @@ RECT SettingsInputFrameRect(int id) {
     // Borderless edits get a 1px-outset rounded frame from WM_PAINT; the
     // owner-drawn hotkey buttons carry their own border so their entries just
     // describe the button bounds for focus invalidation.
-    case IDC_HOTKEY_PRIMARY: return {100, 64, 290, 96};
-    case IDC_HOTKEY_SECONDARY: return {398, 64, 588, 96};
-    case IDC_BURST_COUNT: return {114, 105, 162, 131};
-    case IDC_BURST_INTERVAL: return {422, 105, 470, 131};
-    case IDC_OUTPUT: return {117, 208, 241, 236};
+    case IDC_HOTKEY_PRIMARY: return {42, 165, 388, 211};
+    case IDC_HOTKEY_SECONDARY: return {426, 165, 772, 211};
+    case IDC_BURST_COUNT: return {171, 224, 225, 256};
+    case IDC_BURST_INTERVAL: return {551, 224, 605, 256};
+    case IDC_OUTPUT: return {112, 370, 310, 404};
     default: return {};
   }
 }
@@ -299,7 +352,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandAutoStart:
           config_.launchAtLogin = !config_.launchAtLogin; UpdateAutoStart(); SaveConfig(); break;
         case kCommandAbout: {
-      std::wstring text = L"RC-ScreenShot 0.7.0\n\n原生 C++20 / DXGI / Direct2D 截图工具\n\n";
+      std::wstring text = L"RC-ScreenShot 0.7.1\r\n\r\n原生 C++20 / DXGI / Direct2D 截图工具\r\n\r\n";
           HRSRC resource = FindResourceW(instance_, MAKEINTRESOURCEW(101), RT_RCDATA);
           if (resource) {
             HGLOBAL loaded = LoadResource(instance_, resource);
@@ -479,22 +532,22 @@ void Application::ProcessOverlayResult(std::unique_ptr<OverlayResult> result) {
 void Application::ShowSettings() {
   if (settingsWindow_) { ShowWindow(settingsWindow_, SW_RESTORE); SetForegroundWindow(settingsWindow_); return; }
   if (!settingsBackgroundBrush_) settingsBackgroundBrush_ = CreateSolidBrush(kBackground);
-  if (!settingsPanelBrush_) settingsPanelBrush_ = CreateSolidBrush(kCardStart);
+  if (!settingsPanelBrush_) settingsPanelBrush_ = CreateSolidBrush(kCardEnd);
   if (!settingsControlBrush_) settingsControlBrush_ = CreateSolidBrush(kControlFill);
   if (!settingsFont_) {
-    settingsFont_ = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsFont_ = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsTitleFont_ = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsTitleFont_ = CreateFontW(-27, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsSectionFont_ = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsSectionFont_ = CreateFontW(-17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsSmallFont_ = CreateFontW(-10, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsSmallFont_ = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH, L"Microsoft YaHei UI");
-    settingsHintFont_ = CreateFontW(-10, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    settingsHintFont_ = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                     DEFAULT_PITCH, L"Microsoft YaHei UI");
   }
@@ -507,7 +560,7 @@ void Application::ShowSettings() {
                                                        16, 16, LR_SHARED));
   windowClass.hbrBackground = settingsBackgroundBrush_; windowClass.lpszClassName = L"RC-ScreenShot.Settings";
   RegisterClassExW(&windowClass);
-  // No WS_CLIPCHILDREN: WM_PAINT paints the full card gradients underneath the
+  // No WS_CLIPCHILDREN: WM_PAINT paints the full card surfaces underneath the
   // child controls and then repaints the children on top (see the WM_PAINT
   // handler).  With WS_CLIPCHILDREN the cards would never be painted in the
   // areas under the controls, and the transparent labels would sit on bare
@@ -575,56 +628,79 @@ void Application::ShowSettings() {
   };
   const auto toggle = [&](int x, int y, int id) {
     HWND control = CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                 x, y, 44, 22, settingsWindow_,
+                                 x, y, 52, 28, settingsWindow_,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
     setFont(control, settingsSmallFont_);
     SetWindowSubclass(control, ButtonHoverProc, 2, reinterpret_cast<DWORD_PTR>(this));
     return control;
   };
-  // Card 1 — 快捷键.  Header row with a right-aligned reset action, then two
-  // vertically centered rows: hotkey capture buttons above their captions, and
-  // the burst steppers paired with their range hints.
-  label(L"快捷键", 24, 16, 140, 22, settingsTitleFont_);
-  button(L"↻  重置默认", 504, 14, 100, 26, IDC_RESET_SETTINGS);
-  label(L"截图快捷键", 100, 48, 190, 14, settingsSmallFont_);
-  hotkeyButton(100, 64, 190, 32, IDC_HOTKEY_PRIMARY);
-  label(L"连拍快捷键", 398, 48, 190, 14, settingsSmallFont_);
-  hotkeyButton(398, 64, 190, 32, IDC_HOTKEY_SECONDARY);
-  label(L"连拍张数", 24, 111, 62, 14, settingsSmallFont_);
-  button(L"−", 90, 105, 24, 26, IDC_BURST_COUNT_MINUS);
-  edit(L"", 115, 106, 46, 24, IDC_BURST_COUNT);
-  button(L"+", 162, 105, 24, 26, IDC_BURST_COUNT_PLUS);
-  label(L"2-30 张，默认 6 张", 196, 111, 108, 14, settingsHintFont_);
-  label(L"间隔（秒）", 332, 111, 62, 14, settingsSmallFont_);
-  button(L"−", 398, 105, 24, 26, IDC_BURST_INTERVAL_MINUS);
-  edit(L"", 423, 106, 46, 24, IDC_BURST_INTERVAL);
-  button(L"+", 470, 105, 24, 26, IDC_BURST_INTERVAL_PLUS);
-  label(L"0.05-0.99，默认 0.08", 502, 111, 104, 14, settingsHintFont_);
-  // Card 2 — 输出.  A fixed left label column with controls in a second
-  // column so every row shares the same baseline.
-  label(L"输出", 24, 168, 90, 22, settingsSectionFont_);
-  label(L"保存位置与导出质量", 24, 192, 150, 14, settingsHintFont_);
-  label(L"截图目录", 24, 215, 80, 14, settingsSmallFont_);
-  edit(L"", 118, 209, 122, 26, IDC_OUTPUT);
-  button(L"浏览", 244, 209, 50, 26, IDC_BROWSE);
-  label(L"JPEG 质量", 24, 251, 80, 14, settingsSmallFont_);
-  label(L"Enter 动作", 24, 283, 80, 14, settingsSmallFont_);
-  button(L"复制", 118, 278, 66, 24, IDC_ACTION_COPY);
-  button(L"保存", 190, 278, 66, 24, IDC_ACTION_SAVE);
-  // Card 3 — 编辑器.  Captions on the left, toggles flush to the card edge.
-  label(L"编辑器", 328, 168, 90, 22, settingsSectionFont_);
-  label(L"文字与截图层效果", 328, 192, 150, 14, settingsHintFont_);
-  label(L"窗口截图阴影", 328, 239, 120, 14, settingsSmallFont_); toggle(544, 235, IDC_TOGGLE_SHADOW);
-  label(L"截图外框阴影", 328, 280, 120, 14, settingsSmallFont_); toggle(544, 276, IDC_TOGGLE_FRAME);
-  // Card 4 — 行为.  Three evenly distributed label + toggle groups.
-  label(L"行为", 24, 322, 90, 22, settingsSectionFont_);
-  label(L"复制后自动保存", 24, 351, 90, 14, settingsSmallFont_); toggle(122, 347, IDC_TOGGLE_AUTOSAVE);
-  label(L"登录时启动", 249, 351, 76, 14, settingsSmallFont_); toggle(333, 347, IDC_TOGGLE_AUTOSTART);
-  label(L"自启动静默", 460, 351, 76, 14, settingsSmallFont_); toggle(544, 347, IDC_TOGGLE_SILENT);
-  // Footer — keyboard reference on the left, actions on the right.
-  label(L"V 选择对象 · Ctrl+Z/Y 撤销 · Esc 取消", 16, 400, 320, 14, settingsHintFont_);
-  button(L"取消", 452, 394, 62, 26, IDC_CANCEL_SETTINGS);
-  button(L"保存设置", 522, 394, 90, 26, IDC_SAVE_SETTINGS);
+  // Header: editorial title, one-line guidance, and a quiet secondary reset.
+  label(L"偏好设置", 27, 17, 300, 38, settingsTitleFont_);
+  label(L"精细调整捕捉、输出与工作流", 30, 58, 360, 20, settingsHintFont_);
+  button(L"恢复默认", 675, 23, 126, 36, IDC_RESET_SETTINGS);
+
+  // Capture card — shortcuts get the largest visual weight and a generous,
+  // two-column layout, with compact steppers on a separate baseline.
+  label(L"快捷键", 43, 108, 90, 24, settingsSectionFont_);
+  label(L"快速调用截图与连拍", 132, 113, 220, 18, settingsHintFont_);
+  label(L"区域截图", 43, 145, 180, 18, settingsSmallFont_);
+  hotkeyButton(42, 165, 346, 46, IDC_HOTKEY_PRIMARY);
+  label(L"连续捕捉", 427, 145, 180, 18, settingsSmallFont_);
+  hotkeyButton(426, 165, 346, 46, IDC_HOTKEY_SECONDARY);
+  label(L"连拍张数", 43, 230, 84, 20, settingsSmallFont_);
+  button(L"−", 134, 224, 32, 32, IDC_BURST_COUNT_MINUS);
+  edit(L"", 171, 224, 54, 32, IDC_BURST_COUNT);
+  button(L"+", 230, 224, 32, 32, IDC_BURST_COUNT_PLUS);
+  label(L"2–30 张 · 默认 6", 275, 231, 128, 18, settingsHintFont_);
+  label(L"拍摄间隔", 427, 230, 84, 20, settingsSmallFont_);
+  button(L"−", 514, 224, 32, 32, IDC_BURST_INTERVAL_MINUS);
+  edit(L"", 551, 224, 54, 32, IDC_BURST_INTERVAL);
+  button(L"+", 610, 224, 32, 32, IDC_BURST_INTERVAL_PLUS);
+  label(L"0.05–0.99 秒 · 默认 0.08", 654, 231, 134, 18, settingsHintFont_);
+
+  // Output card — a compact two-column form with clear affordances for path,
+  // export quality and the default Enter action.
+  label(L"输出", 43, 308, 90, 25, settingsSectionFont_);
+  label(L"保存位置与图像质量", 43, 338, 250, 18, settingsHintFont_);
+  label(L"保存位置", 43, 378, 72, 20, settingsSmallFont_);
+  edit(L"", 112, 370, 198, 34, IDC_OUTPUT);
+  button(L"浏览", 319, 370, 67, 34, IDC_BROWSE);
+  label(L"JPEG 质量", 43, 432, 76, 20, settingsSmallFont_);
+  label(L"1", 127, 451, 16, 17, settingsHintFont_);
+  label(L"100", 307, 451, 32, 17, settingsHintFont_);
+  label(L"回车默认", 43, 485, 76, 20, settingsSmallFont_);
+  button(L"复制", 128, 476, 76, 34, IDC_ACTION_COPY);
+  button(L"保存", 212, 476, 76, 34, IDC_ACTION_SAVE);
+  label(L"截图后执行", 299, 484, 88, 18, settingsHintFont_);
+
+  // Editor card — each preference is a self-contained row with an explanatory
+  // note, a hairline divider and a tactile toggle aligned to the right edge.
+  label(L"编辑器", 443, 308, 100, 25, settingsSectionFont_);
+  label(L"让成品更贴近你的使用习惯", 443, 338, 310, 18, settingsHintFont_);
+  label(L"窗口截图阴影", 443, 372, 180, 20, settingsSmallFont_);
+  label(L"为窗口边缘添加轻柔层次", 443, 396, 240, 18, settingsHintFont_);
+  toggle(738, 378, IDC_TOGGLE_SHADOW);
+  label(L"截图外框", 443, 444, 180, 20, settingsSmallFont_);
+  label(L"为导出图像添加清晰边界", 443, 468, 240, 18, settingsHintFont_);
+  toggle(738, 450, IDC_TOGGLE_FRAME);
+
+  // Workflow card — a concise title block plus three aligned preferences.
+  label(L"自动化", 43, 558, 125, 24, settingsSectionFont_);
+  label(L"少一点重复，多一点专注", 43, 584, 145, 17, settingsHintFont_);
+  label(L"复制后自动保存", 213, 559, 142, 19, settingsSmallFont_);
+  label(L"同步落盘", 213, 583, 100, 17, settingsHintFont_);
+  toggle(326, 563, IDC_TOGGLE_AUTOSAVE);
+  label(L"登录时启动", 407, 559, 108, 19, settingsSmallFont_);
+  label(L"开机即用", 407, 583, 100, 17, settingsHintFont_);
+  toggle(515, 563, IDC_TOGGLE_AUTOSTART);
+  label(L"静默启动", 594, 559, 104, 19, settingsSmallFont_);
+  label(L"后台待命", 594, 583, 100, 17, settingsHintFont_);
+  toggle(711, 563, IDC_TOGGLE_SILENT);
+
+  // Footer floats beneath the cards, rather than being boxed into another row.
+  label(L"快捷键支持 Ctrl / Alt / Shift 组合", 27, 654, 380, 18, settingsHintFont_);
+  button(L"取消", 620, 646, 78, 36, IDC_CANCEL_SETTINGS);
+  button(L"保存设置", 708, 646, 94, 36, IDC_SAVE_SETTINGS);
   BOOL darkTitle = TRUE; DwmSetWindowAttribute(settingsWindow_, 20, &darkTitle, sizeof(darkTitle));
   // Windows 11: tint the caption, frame and caption text to match the dialog
   // chrome (attributes are ignored on older systems).
@@ -668,46 +744,28 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     if (!GradientFill(dc, backgroundVertices, 2, &backgroundMesh, 1, GRADIENT_FILL_RECT_V))
       FillRect(dc, &client, settingsBackgroundBrush_);
     SetBkMode(dc, TRANSPARENT);
-    const auto gradientCard = [&](RECT rect, COLORREF start, COLORREF finish) {
-      TRIVERTEX vertices[2]{};
-      vertices[0].x = rect.left; vertices[0].y = rect.top;
-      vertices[0].Red = static_cast<COLOR16>(GetRValue(start) << 8);
-      vertices[0].Green = static_cast<COLOR16>(GetGValue(start) << 8);
-      vertices[0].Blue = static_cast<COLOR16>(GetBValue(start) << 8);
-      vertices[0].Alpha = 0xff00;
-      vertices[1].x = rect.right; vertices[1].y = rect.bottom;
-      vertices[1].Red = static_cast<COLOR16>(GetRValue(finish) << 8);
-      vertices[1].Green = static_cast<COLOR16>(GetGValue(finish) << 8);
-      vertices[1].Blue = static_cast<COLOR16>(GetBValue(finish) << 8);
-      vertices[1].Alpha = 0xff00;
-      GRADIENT_RECT mesh{0, 1};
-      HRGN clip = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 12, 12);
+    const auto flatCard = [&](RECT rect) {
+      HRGN clip = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
       const int saved = SaveDC(dc);
-      // Replacing the clip region paints the whole card even when only part of
-      // it was invalidated, and covers the child controls.  That is intended:
-      // the children repaint themselves right after EndPaint (below).
       SelectClipRgn(dc, clip);
-      if (!GradientFill(dc, vertices, 2, &mesh, 1, GRADIENT_FILL_RECT_H)) {
-        HBRUSH fallback = CreateSolidBrush(start); FillRect(dc, &rect, fallback); DeleteObject(fallback);
-      }
+      HBRUSH cardBrush = CreateSolidBrush(kCardStart);
+      FillRect(dc, &rect, cardBrush);
       RestoreDC(dc, saved);
       DeleteObject(clip);
+      DeleteObject(cardBrush);
+
       HPEN pen = CreatePen(PS_SOLID, 1, kCardBorder);
-      HGDIOBJ oldPen = SelectObject(dc, pen); HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
-      // A hairline along the card top catches the light and lifts the card
-      // off the background without needing a drop shadow.
-      HPEN highlight = CreatePen(PS_SOLID, 1, kCardHighlight);
-      SelectObject(dc, highlight);
-      MoveToEx(dc, rect.left + 14, rect.top + 1, nullptr);
-      LineTo(dc, rect.right - 14, rect.top + 1);
-      SelectObject(dc, oldPen); SelectObject(dc, oldBrush);
-      DeleteObject(pen); DeleteObject(highlight);
+      HGDIOBJ oldPen = SelectObject(dc, pen);
+      HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+      SelectObject(dc, oldPen);
+      SelectObject(dc, oldBrush);
+      DeleteObject(pen);
     };
-    gradientCard(kShortcutCard, kCardStart, kCardEnd);
-    gradientCard(kOutputCard, kCardStart, kCardEnd);
-    gradientCard(kEditorCard, kCardStart, kCardEnd);
-    gradientCard(kBehaviorCard, kCardStart, kCardEnd);
+    flatCard(kShortcutCard);
+    flatCard(kOutputCard);
+    flatCard(kEditorCard);
+    flatCard(kBehaviorCard);
     // Accent bars mark the four section titles at a glance.
     const auto sectionBar = [&](int x, int y) {
       HBRUSH brush = CreateSolidBrush(kAccent);
@@ -716,23 +774,35 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       RoundRect(dc, x, y, x + 4, y + 14, 2, 2);
       SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(brush);
     };
-    sectionBar(14, 20);    // 快捷键
-    sectionBar(14, 172);   // 输出
-    sectionBar(318, 172);  // 编辑器
-    sectionBar(14, 326);   // 行为
+    sectionBar(26, 111);
+    sectionBar(26, 315);
+    sectionBar(426, 315);
+    sectionBar(26, 565);
     const auto drawInputFrame = [&](RECT rect, HWND control) {
       const bool focused = control && GetFocus() == control;
-      HBRUSH brush = CreateSolidBrush(kControlFill);
+      HRGN clip = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 8, 8);
+      const int saved = SaveDC(dc);
+      SelectClipRgn(dc, clip);
+      BlendFill(dc, rect, kControlFill, 224);
+      RestoreDC(dc, saved);
+      DeleteObject(clip);
       HPEN pen = CreatePen(PS_SOLID, focused ? 2 : 1, focused ? kAccent : kControlBorder);
-      HGDIOBJ oldBrush = SelectObject(dc, brush); HGDIOBJ oldPen = SelectObject(dc, pen);
-      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
-      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
+      HGDIOBJ oldPen = SelectObject(dc, pen);
+      HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+      RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+      SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen);
     };
     drawInputFrame(SettingsInputFrameRect(IDC_HOTKEY_PRIMARY), GetDlgItem(hwnd, IDC_HOTKEY_PRIMARY));
     drawInputFrame(SettingsInputFrameRect(IDC_HOTKEY_SECONDARY), GetDlgItem(hwnd, IDC_HOTKEY_SECONDARY));
     drawInputFrame(SettingsInputFrameRect(IDC_BURST_COUNT), GetDlgItem(hwnd, IDC_BURST_COUNT));
     drawInputFrame(SettingsInputFrameRect(IDC_BURST_INTERVAL), GetDlgItem(hwnd, IDC_BURST_INTERVAL));
     drawInputFrame(SettingsInputFrameRect(IDC_OUTPUT), GetDlgItem(hwnd, IDC_OUTPUT));
+    HPEN dividerPen = CreatePen(PS_SOLID, 1, RGB(75, 96, 132));
+    HGDIOBJ previousPen = SelectObject(dc, dividerPen);
+    MoveToEx(dc, 442, 427, nullptr); LineTo(dc, 778, 427);
+    MoveToEx(dc, 383, 558, nullptr); LineTo(dc, 383, 616);
+    MoveToEx(dc, 580, 558, nullptr); LineTo(dc, 580, 616);
+    SelectObject(dc, previousPen); DeleteObject(dividerPen);
     const RECT track = QualitySliderRect(); const int lineY = (track.top + track.bottom) / 2;
     // Groove, accent fill and knob share rounded profiles so the slider reads
     // as one control; the knob gains an accent ring for precision.
@@ -752,9 +822,11 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     DeleteObject(trackPen); DeleteObject(trackBrush); DeleteObject(fillBrush);
     DeleteObject(thumbPen); DeleteObject(thumbBrush);
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, kTextNormal); SelectObject(dc, settingsSmallFont_);
-    RECT quality{256, 251, 298, 265};
+    RECT qualityPill{344, 429, 386, 452};
+    DrawPanelButton(dc, qualityPill, kControlFill, kControlBorder, 10, 232);
     const std::wstring qualityText = std::to_wstring(config_.jpegQuality) + L"%";
-    DrawTextW(dc, qualityText.c_str(), -1, &quality, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT quality{qualityPill.left + 2, qualityPill.top, qualityPill.right - 2, qualityPill.bottom};
+    DrawTextW(dc, qualityText.c_str(), -1, &quality, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     EndPaint(hwnd, &paint);
     // The cards were just painted over the child controls, so invalidate the
     // children to paint themselves again on top.  They repaint in the same
@@ -806,13 +878,7 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
                             : hovered ? kControlHover : kControlFill;
       const COLORREF border = state.listening ? kAccent
                               : hovered ? kControlHoverBorder : kControlBorder;
-      HBRUSH brush = CreateSolidBrush(fill);
-      HPEN pen = CreatePen(PS_SOLID, state.listening ? 2 : 1, border);
-      HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
-      HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, 8, 8);
-      SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush);
-      DeleteObject(pen); DeleteObject(brush);
+      DrawPanelButton(item->hDC, r, fill, border, 8, 238);
       std::wstring display = GetWindowString(settingsWindow_, id);
       if (state.listening && !state.submitted) {
         display = state.modifiers ? HotkeyModifierPreview(state.modifiers) : L"按下组合键…";
@@ -831,15 +897,13 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     }
     if (IsToggleId(id)) {
       const bool on = ToggleValue(config_, id); const RECT r = item->rcItem; const int height = r.bottom - r.top;
-      HBRUSH track = CreateSolidBrush(on ? (pressed ? kAccentPressed : kAccent)
-                                         : (pressed ? RGB(46, 58, 80)
-                                                     : hovered ? RGB(44, 56, 78) : RGB(40, 52, 72)));
-      HPEN border = CreatePen(PS_SOLID, 1, on ? kAccentBorder : RGB(70, 86, 112));
-      HGDIOBJ oldBrush = SelectObject(item->hDC, track); HGDIOBJ oldPen = SelectObject(item->hDC, border);
-      RoundRect(item->hDC, r.left, r.top, r.right, r.bottom, height / 2, height / 2);
-      SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(border); DeleteObject(track);
+      const COLORREF track = on ? (pressed ? kAccentPressed : kAccent)
+                                : (pressed ? RGB(46, 58, 80)
+                                           : hovered ? RGB(44, 56, 78) : RGB(40, 52, 72));
+      DrawPanelButton(item->hDC, r, track, on ? kAccentBorder : RGB(82, 101, 132), height, 244);
       const int radius = std::max(3, height / 2 - 3); const int knobX = on ? r.right - radius - 3 : r.left + radius + 3;
-      HBRUSH knob = CreateSolidBrush(on ? RGB(255, 255, 255) : RGB(196, 208, 226)); oldBrush = SelectObject(item->hDC, knob);
+      HBRUSH knob = CreateSolidBrush(on ? RGB(250, 253, 255) : RGB(196, 208, 226));
+      HGDIOBJ oldBrush = SelectObject(item->hDC, knob);
       Ellipse(item->hDC, knobX - radius, (r.top + r.bottom) / 2 - radius, knobX + radius, (r.top + r.bottom) / 2 + radius);
       SelectObject(item->hDC, oldBrush); DeleteObject(knob);
       SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, on ? RGB(255, 255, 255) : RGB(160, 176, 198));
@@ -855,16 +919,7 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
       const COLORREF fill = active ? (pressed ? kAccentPressed : kAccentHover)
                                    : (pressed ? RGB(34, 48, 72) : hovered ? RGB(38, 54, 80) : kControlFill);
       const COLORREF borderColor = active ? kAccentBorder : hovered ? kControlHoverBorder : kControlBorder;
-      HBRUSH brush = CreateSolidBrush(fill);
-      HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
-      HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
-      HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-      RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right,
-                item->rcItem.bottom, 8, 8);
-      SelectObject(item->hDC, oldPen);
-      SelectObject(item->hDC, oldBrush);
-      DeleteObject(pen);
-      DeleteObject(brush);
+      DrawPanelButton(item->hDC, item->rcItem, fill, borderColor, 8, active ? 244 : 232);
       wchar_t text[128]{};
       GetWindowTextW(item->hwndItem, text, _countof(text));
       SetBkMode(item->hDC, TRANSPARENT);
@@ -876,10 +931,8 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     }
     if (IsStepId(id)) {
       const COLORREF fill = pressed ? kAccentPressed : hovered ? kControlHover : kControlFill;
-      HBRUSH brush = CreateSolidBrush(fill); HPEN pen = CreatePen(PS_SOLID, 1, hovered ? kControlHoverBorder : kControlBorder);
-      HGDIOBJ oldBrush = SelectObject(item->hDC, brush); HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-      RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 8, 8);
-      SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
+      DrawPanelButton(item->hDC, item->rcItem, fill,
+                      hovered ? kControlHoverBorder : kControlBorder, 8, 232);
       SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, kTextNormal); SelectObject(item->hDC, settingsFont_);
       wchar_t text[8]{}; GetWindowTextW(item->hwndItem, text, _countof(text)); RECT textRect = item->rcItem;
       DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return TRUE;
@@ -888,11 +941,9 @@ LRESULT Application::HandleSettingsMessage(HWND hwnd, UINT message, WPARAM wPara
     const COLORREF fill = primary ? (pressed ? kAccentPressed : kAccent)
                                   : accent ? (pressed ? RGB(38, 56, 86) : hovered ? RGB(40, 58, 88) : RGB(32, 48, 72))
                                            : (pressed ? RGB(34, 48, 72) : hovered ? kControlHover : kControlFill);
-    HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, primary ? kAccent : hovered ? kControlHoverBorder : kControlBorder);
-    HGDIOBJ oldBrush = SelectObject(item->hDC, brush); HGDIOBJ oldPen = SelectObject(item->hDC, pen);
-    RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 8, 8);
-    SelectObject(item->hDC, oldPen); SelectObject(item->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
+    DrawPanelButton(item->hDC, item->rcItem, fill,
+                    primary ? kAccentBorder : hovered ? kControlHoverBorder : kControlBorder,
+                    8, primary ? 244 : 232);
     wchar_t text[128]{}; GetWindowTextW(item->hwndItem, text, _countof(text)); SetBkMode(item->hDC, TRANSPARENT);
     SetTextColor(item->hDC, primary ? RGB(255, 255, 255) : kTextNormal); SelectObject(item->hDC, settingsFont_); RECT textRect = item->rcItem;
     DrawTextW(item->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return TRUE;
@@ -1186,7 +1237,7 @@ void Application::UpdateQualitySlider(HWND hwnd, int x) {
   const float t = std::clamp((x - track.left) / static_cast<float>(track.right - track.left), 0.0f, 1.0f);
   config_.jpegQuality = std::clamp(static_cast<int>(std::lround(1.0f + t * 99.0f)), 1, 100);
   RECT dirty = track;
-  dirty.right = 290;  // extend past the numeric readout drawn by WM_PAINT
+  dirty.right = 390;  // extend past the numeric readout drawn by WM_PAINT
   InflateRect(&dirty, 6, 6);
   InvalidateRect(hwnd, &dirty, FALSE);
 }

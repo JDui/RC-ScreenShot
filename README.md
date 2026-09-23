@@ -22,7 +22,7 @@
 
 前往 [Latest Release](https://github.com/JDui/RC-ScreenShot/releases/latest) 下载最新版。
 
-当前版本：**0.7.0**
+当前版本：**0.7.1**
 
 发布物为 Windows x64 便携版 EXE：下载后直接运行 `RC-ScreenShot.exe`，无需安装。
 

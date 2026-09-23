@@ -127,16 +127,14 @@ class CaptureOverlay {
   bool HitUtilityClose(POINT point) const;
   void UtilityBack();
   void DrawBarUtilityButtons(float alpha = 1.0f);
-  // Long (scrolling) capture: rainbow toolbar entry, the three-direction bar,
+  // Long (scrolling) capture: flat toolbar entry, the three-direction bar,
   // the capturing bar and the live preview panel beside the selection.
   void EnterLongCaptureMode();
   void ExitLongCaptureMode();
   void DrawLongCaptureBar(const RECT& toolbar);
   void DrawCapturingBar(const RECT& toolbar);
-  void DrawRainbowPanel(const D2D1_RECT_F& rect, float radius);
-  // Primary-action panel for the long-capture controls: blue accent gradient
-  // with the same finish as the rainbow panel, which stays exclusive to the
-  // main-bar long-capture entry.
+  void DrawLongEntryPanel(const D2D1_RECT_F& rect, float radius);
+  // Matte primary-action panel for long-capture controls.
   void DrawAccentPanel(const D2D1_RECT_F& rect, float radius);
   // Neutral dark companion panel for the non-primary long-capture buttons.
   void DrawNeutralPanel(const D2D1_RECT_F& rect, float radius);
