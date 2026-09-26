@@ -373,6 +373,135 @@ void TestMosaicBlur() {
   }
 }
 
+void TestMosaicFeather() {
+  CHECK(rc::RectMosaicFeather(rc::MosaicStyle::Pixel, 16, 6.0f) == 16.0f);
+  CHECK(rc::RectMosaicFeather(rc::MosaicStyle::Blur, 16, 6.0f) == 12.0f);
+  CHECK(rc::RectMosaicFeather(rc::MosaicStyle::Pixel, 128, 64.0f) == 32.0f);
+  CHECK(rc::RectMosaicFeather(rc::MosaicStyle::Blur, 128, 64.0f) == 32.0f);
+
+  constexpr int width = 32, height = 32, stride = width * 4;
+  std::vector<uint8_t> image(static_cast<size_t>(stride * height));
+  for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+    uint8_t* p = image.data() + y * stride + x * 4;
+    p[0] = static_cast<uint8_t>(x * 7); p[1] = static_cast<uint8_t>(y * 7); p[2] = 120; p[3] = 255;
+  }
+  const auto original = image;
+
+  rc::MosaicCommand mosaic;
+  mosaic.brush = false;
+  mosaic.bounds = {8, 8, 24, 24};
+  mosaic.pixelSize = 8;
+  mosaic.feather = 8.0f;  // 4px band on either side of every edge
+  std::vector<rc::EditCommand> commands{mosaic};
+  rc::ApplyMosaics(image, width, height, stride, commands);
+
+  const auto pixel = [&](int x, int y) -> const uint8_t* {
+    return image.data() + static_cast<size_t>(y * stride + x * 4);
+  };
+  const auto sourcePixel = [&](int x, int y) -> const uint8_t* {
+    return original.data() + static_cast<size_t>(y * stride + x * 4);
+  };
+  const auto blockAverage = [&](int x0, int y0, int x1, int y1) -> std::array<int, 4> {
+    int sum[4]{}; int count = 0;
+    for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+      const uint8_t* p = sourcePixel(x, y);
+      for (int c = 0; c < 4; ++c) sum[c] += p[c];
+      ++count;
+    }
+    return {sum[0] / count, sum[1] / count, sum[2] / count, sum[3] / count};
+  };
+
+  // Deep interior (>= 4px inside the edge) is fully tiled.
+  const std::array<int, 4> innerAverage = blockAverage(8, 8, 16, 16);
+  for (int c = 0; c < 4; ++c) {
+    CHECK(pixel(12, 12)[c] == innerAverage[c]);
+    CHECK(pixel(13, 12)[c] == innerAverage[c]);
+  }
+  // A pixel in the soft band (x=7 is half a pixel outside the edge) must sit
+  // strictly between its original color and the tile average.
+  const std::array<int, 4> edgeAverage = blockAverage(0, 8, 8, 16);
+  for (int c = 0; c < 2; ++c) {
+    const int originalChannel = sourcePixel(7, 12)[c];
+    const int tileChannel = edgeAverage[c];
+    CHECK(static_cast<int>(pixel(7, 12)[c]) != originalChannel);
+    CHECK(static_cast<int>(pixel(7, 12)[c]) > std::min(tileChannel, originalChannel));
+    CHECK(static_cast<int>(pixel(7, 12)[c]) < std::max(tileChannel, originalChannel));
+  }
+  // Pixels beyond the feather band are byte-for-byte untouched.
+  for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+    if (x >= 4 && x < 28 && y >= 4 && y < 28) continue;
+    const uint8_t* p = pixel(x, y);
+    const uint8_t* o = sourcePixel(x, y);
+    CHECK(std::equal(p, p + 4, o));
+  }
+
+  // feather == 0 restores the legacy hard edge: immediately outside the
+  // rectangle nothing changes, the interior is still tiled.
+  image = original;
+  mosaic.feather = 0.0f;
+  commands[0] = mosaic;
+  rc::ApplyMosaics(image, width, height, stride, commands);
+  for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+    if (x >= 8 && x < 24 && y >= 8 && y < 24) continue;
+    const uint8_t* p = pixel(x, y);
+    const uint8_t* o = sourcePixel(x, y);
+    CHECK(std::equal(p, p + 4, o));
+  }
+  CHECK(pixel(12, 12)[0] == innerAverage[0]);
+
+  // Blur style: the soft band leaks the blurred result past the rectangle,
+  // while pixels past the band remain pristine.
+  constexpr int blurWidth = 48, blurHeight = 48, blurStride = blurWidth * 4 + 7;
+  std::vector<uint8_t> blurred(static_cast<size_t>(blurStride * blurHeight), 0xA5);
+  for (int y = 0; y < blurHeight; ++y) for (int x = 0; x < blurWidth; ++x) {
+    uint8_t* p = blurred.data() + static_cast<size_t>(y * blurStride + x * 4);
+    p[0] = (x >= 16 && x < 32) ? 200 : 50;
+    p[1] = 120; p[2] = 120; p[3] = 255;
+  }
+  const auto blurredOriginal = blurred;
+  rc::MosaicCommand blurMosaic;
+  blurMosaic.brush = false;
+  blurMosaic.bounds = {8, 8, 40, 40};
+  blurMosaic.style = rc::MosaicStyle::Blur;
+  blurMosaic.blurRadius = 5.0f;
+  blurMosaic.feather = 10.0f;  // 5px band outside the rect
+  std::vector<rc::EditCommand> blurCommands{blurMosaic};
+  rc::ApplyMosaics(blurred, blurWidth, blurHeight, blurStride, blurCommands);
+
+  int leakedPixels = 0;
+  for (int y = 16; y < 32; ++y) for (int x = 3; x < 8; ++x) {
+    const uint8_t* p = blurred.data() + static_cast<size_t>(y * blurStride + x * 4);
+    const uint8_t* o = blurredOriginal.data() + static_cast<size_t>(y * blurStride + x * 4);
+    if (!std::equal(p, p + 4, o)) ++leakedPixels;
+  }
+  CHECK(leakedPixels > 0);
+  // Everything beyond the outer edge of the band is untouched...
+  for (int y = 0; y < blurHeight; ++y) for (int x = 0; x < blurWidth; ++x) {
+    if (x >= 3 && x < 45 && y >= 3 && y < 45) continue;
+    const uint8_t* p = blurred.data() + static_cast<size_t>(y * blurStride + x * 4);
+    const uint8_t* o = blurredOriginal.data() + static_cast<size_t>(y * blurStride + x * 4);
+    CHECK(std::equal(p, p + 4, o));
+  }
+  // ...and row padding bytes are never written.
+  for (int y = 0; y < blurHeight; ++y) {
+    CHECK(std::equal(blurred.data() + static_cast<size_t>(y * blurStride + blurWidth * 4),
+                     blurred.data() + static_cast<size_t>((y + 1) * blurStride),
+                     blurredOriginal.data() + static_cast<size_t>(y * blurStride + blurWidth * 4)));
+  }
+
+  // Hard-edge blur still writes strictly inside the rectangle.
+  blurred = blurredOriginal;
+  blurMosaic.feather = 0.0f;
+  blurCommands[0] = blurMosaic;
+  rc::ApplyMosaics(blurred, blurWidth, blurHeight, blurStride, blurCommands);
+  for (int y = 0; y < blurHeight; ++y) for (int x = 0; x < blurWidth; ++x) {
+    if (x >= 8 && x < 40 && y >= 8 && y < 40) continue;
+    const uint8_t* p = blurred.data() + static_cast<size_t>(y * blurStride + x * 4);
+    const uint8_t* o = blurredOriginal.data() + static_cast<size_t>(y * blurStride + x * 4);
+    CHECK(std::equal(p, p + 4, o));
+  }
+}
+
 void TestUnitDetection() {
   constexpr int width = 480, height = 320, stride = width * 4;
   std::vector<uint8_t> image(static_cast<size_t>(stride * height), 245);
@@ -924,6 +1053,7 @@ int wmain() {
   TestExportUsesFrameAsShadow();
   TestMosaic();
   TestMosaicBlur();
+  TestMosaicFeather();
   TestUnitDetection();
   TestUnitDetectionRejectsFalseGrid();
   TestUnitDetectionAsymmetricGridOuterBounds();

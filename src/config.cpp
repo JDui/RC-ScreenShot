@@ -347,6 +347,7 @@ AppConfig ConfigStore::Load(std::wstring* warning) const {
       config.mosaicBrushSize = ReadFloat(mosaic, "brushSize", config.mosaicBrushSize, 4.0f, 256.0f);
       config.mosaicPixelSize = ReadInt(mosaic, "pixelSize", config.mosaicPixelSize, 2, 128);
       config.mosaicBlurRadius = ReadFloat(mosaic, "blurRadius", config.mosaicBlurRadius, 1.0f, 64.0f);
+      config.mosaicFeather = ReadFloat(mosaic, "feather", config.mosaicFeather, -1.0f, 32.0f);
     }
   }
   if (const Json* window = root->Find("windowCapture")) {
@@ -412,7 +413,8 @@ bool ConfigStore::Save(const AppConfig& config, std::wstring* error) const {
          << (config.mosaicStyle == MosaicStyle::Blur ? "blur" : "pixel")
          << "\", \"brushSize\": " << config.mosaicBrushSize
          << ", \"pixelSize\": " << config.mosaicPixelSize
-         << ", \"blurRadius\": " << config.mosaicBlurRadius << "}\n  },\n"
+         << ", \"blurRadius\": " << config.mosaicBlurRadius
+         << ", \"feather\": " << config.mosaicFeather << "}\n  },\n"
          << "  \"windowCapture\": {\"shadow\": " << (config.windowShadow ? "true" : "false") << "},\n"
          << "  \"scroll\": {\"speed\": " << std::clamp(config.scrollSpeed, 0.1f, 4.0f) << "},\n"
          << "  \"ui\": {\"language\": \"" << Escape(ToUtf8(config.language))

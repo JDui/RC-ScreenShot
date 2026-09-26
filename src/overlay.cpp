@@ -487,6 +487,7 @@ uint64_t MosaicSignature(std::span<const EditCommand> commands, const RECT& sele
     mixFloat(mosaic->brushSize);
     mix(static_cast<uint64_t>(mosaic->pixelSize));
     mixFloat(mosaic->blurRadius);
+    mixFloat(mosaic->feather);
     mixFloat(mosaic->bounds.left); mixFloat(mosaic->bounds.top);
     mixFloat(mosaic->bounds.right); mixFloat(mosaic->bounds.bottom);
     mix(static_cast<uint64_t>(mosaic->points.size()));
@@ -732,6 +733,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
             if (button.action == PropertyAction::Opacity) SetOpacityFromSlider(point, button.rect);
             else if (button.action == PropertyAction::FillOpacity) SetFillOpacityFromSlider(point, button.rect);
             else if (button.action == PropertyAction::MosaicStrength) SetMosaicStrengthFromSlider(point, button.rect);
+            else if (button.action == PropertyAction::MosaicFeather) SetMosaicFeatherFromSlider(point, button.rect);
             break;
           }
         } else {
@@ -786,6 +788,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
           if (button.action == PropertyAction::Opacity) SetOpacityFromSlider(point, button.rect);
           else if (button.action == PropertyAction::FillOpacity) SetFillOpacityFromSlider(point, button.rect);
           else if (button.action == PropertyAction::MosaicStrength) SetMosaicStrengthFromSlider(point, button.rect);
+          else if (button.action == PropertyAction::MosaicFeather) SetMosaicFeatherFromSlider(point, button.rect);
           break;
         }
       } else if (selecting_) ContinueSelection(point);
@@ -907,6 +910,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
           if (button.action == PropertyAction::Opacity) SetOpacityFromSlider(point, button.rect);
           else if (button.action == PropertyAction::FillOpacity) SetFillOpacityFromSlider(point, button.rect);
           else if (button.action == PropertyAction::MosaicStrength) SetMosaicStrengthFromSlider(point, button.rect);
+          else if (button.action == PropertyAction::MosaicFeather) SetMosaicFeatherFromSlider(point, button.rect);
           return 0;
         }
         if (auto preset = HitTestColorPreset(point)) {
@@ -968,7 +972,9 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
         propertySliderDragging_.reset();
         if (GetCapture() == hwnd_) ReleaseCapture();
         EndSettingPreview();
-        if (longPreview_ && releasedProperty == PropertyAction::MosaicStrength && ActiveMosaic())
+        if (longPreview_ &&
+            (releasedProperty == PropertyAction::MosaicStrength ||
+             releasedProperty == PropertyAction::MosaicFeather) && ActiveMosaic())
           RebuildLongMosaicPixels();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
@@ -1989,6 +1995,7 @@ struct GlyphPen {
   ID2D1RenderTarget* rt = nullptr;
   ID2D1SolidColorBrush* brush = nullptr;
   ID2D1StrokeStyle* style = nullptr;
+  ID2D1Factory* factory = nullptr;
   IconGrid grid;
   float Weight(float units) const { return units * grid.unit; }
   void Line(float x1, float y1, float x2, float y2, float weight = 1.7f) const {
@@ -2002,6 +2009,13 @@ struct GlyphPen {
                           Weight(radius), Weight(radius)),
         brush, Weight(weight), style);
   }
+  void FillRoundedRect(float left, float top, float right, float bottom, float radius) const {
+    rt->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(grid.ox + left * grid.unit, grid.oy + top * grid.unit,
+                                      grid.ox + right * grid.unit, grid.oy + bottom * grid.unit),
+                          Weight(radius), Weight(radius)),
+        brush);
+  }
   void Circle(float cx, float cy, float radius, float weight = 1.7f) const {
     D2D1_ELLIPSE ellipse{grid.P(cx, cy), Weight(radius), Weight(radius)};
     rt->DrawEllipse(ellipse, brush, Weight(weight), style);
@@ -2009,6 +2023,22 @@ struct GlyphPen {
   void Dot(float cx, float cy, float radius) const {
     D2D1_ELLIPSE ellipse{grid.P(cx, cy), Weight(radius), Weight(radius)};
     rt->FillEllipse(ellipse, brush);
+  }
+  // Closed/open polygon through design-grid points; this is the primitive the
+  // sharper Lucide-style glyphs (pencil, pointer, eye, folded document) use.
+  void Poly(std::initializer_list<D2D1_POINT_2F> points, float weight = 1.7f,
+            bool closed = false) const {
+    if (!factory || points.size() < 2) return;
+    ComPtr<ID2D1PathGeometry> geometry;
+    if (FAILED(factory->CreatePathGeometry(&geometry))) return;
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(geometry->Open(&sink))) return;
+    auto it = points.begin();
+    sink->BeginFigure(grid.P(it->x, it->y), D2D1_FIGURE_BEGIN_HOLLOW);
+    for (++it; it != points.end(); ++it) sink->AddLine(grid.P(it->x, it->y));
+    sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+    sink->Close();
+    rt->DrawGeometry(geometry.Get(), brush, Weight(weight), style);
   }
 };
 
@@ -2742,9 +2772,12 @@ void CaptureOverlay::BeginEditGesture(POINT point) {
     previewCommand_ = PenCommand{{local}, config_.pen, {penWidthScale_}};
   }
   else if (tool_ == Tool::MosaicBrush) previewCommand_ = MosaicCommand{true, {local}, {}, config_.mosaicStyle,
-      config_.mosaicBrushSize, config_.mosaicPixelSize, config_.mosaicBlurRadius};
+      config_.mosaicBrushSize, config_.mosaicPixelSize, config_.mosaicBlurRadius, 0.0f};
   else if (tool_ == Tool::MosaicRectangle) previewCommand_ = MosaicCommand{false, {}, {local.x, local.y, local.x, local.y},
-      config_.mosaicStyle, config_.mosaicBrushSize, config_.mosaicPixelSize, config_.mosaicBlurRadius};
+      config_.mosaicStyle, config_.mosaicBrushSize, config_.mosaicPixelSize, config_.mosaicBlurRadius,
+      config_.mosaicFeather >= 0.0f
+          ? config_.mosaicFeather
+          : RectMosaicFeather(config_.mosaicStyle, config_.mosaicPixelSize, config_.mosaicBlurRadius)};
   else {
     ShapeKind kind = tool_ == Tool::Rectangle ? ShapeKind::Rectangle : tool_ == Tool::Ellipse ? ShapeKind::Ellipse
                      : tool_ == Tool::Line ? ShapeKind::Line : ShapeKind::Arrow;
@@ -3883,67 +3916,53 @@ void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
   // Every tool glyph lives on the shared 24x24 grid so the whole toolbar
   // reads as one family: identical optical margins, stroke weights and caps.
-  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(ToD2D(rect))};
   switch (tool) {
     case Tool::Pen:
-      // Precision pencil with a readable cap, barrel seam and sharpened nib.
-      pen.Line(6, 17.8f, 16.1f, 5.1f, 1.75f);
-      pen.Line(16.1f, 5.1f, 19, 7.5f, 1.75f);
-      pen.Line(19, 7.5f, 8.9f, 20, 1.75f);
-      pen.Line(8.9f, 20, 5.2f, 21, 1.5f);
-      pen.Line(5.2f, 21, 6, 17.8f, 1.5f);
-      pen.Line(8.2f, 15.1f, 11.1f, 17.4f, 1.25f);
-      pen.Line(15.1f, 6.4f, 17.9f, 8.7f, 1.1f);
+      // Lucide pencil: one closed body polygon plus the barrel seam.
+      pen.Poly({{4, 16}, {17, 3}, {21, 7}, {8, 20}, {4, 20}}, 1.7f, true);
+      pen.Line(15, 5, 19, 9, 1.5f);
       break;
     case Tool::Rectangle:
-      pen.RoundedRect(4.8f, 5.2f, 19.2f, 18.8f, 2.0f, 1.75f);
-      pen.Line(8, 8, 11, 8, 1.0f);
-      pen.Line(8, 8, 8, 11, 1.0f);
+      pen.RoundedRect(5, 5, 19, 19, 2.2f, 1.8f);
       break;
     case Tool::Ellipse:
-      pen.Circle(12, 12, 7.35f, 1.75f);
-      pen.Dot(12, 12, .9f);
+      pen.Circle(12, 12, 7.4f, 1.8f);
       break;
     case Tool::Line:
-      pen.Line(6.8f, 17.2f, 17.2f, 6.8f, 1.75f);
-      pen.Circle(6.3f, 17.7f, 1.7f, 1.3f);
-      pen.Circle(17.7f, 6.3f, 1.7f, 1.3f);
+      // Round caps terminate the single diagonal, so no end rings are needed.
+      pen.Line(6.5f, 17.5f, 17.5f, 6.5f, 2.2f);
       break;
     case Tool::Arrow:
-      pen.Line(5.2f, 18.8f, 17.5f, 6.5f, 1.8f);
-      pen.Line(10.8f, 6.5f, 17.5f, 6.5f, 1.8f);
-      pen.Line(17.5f, 6.5f, 17.5f, 13.2f, 1.8f);
-      pen.Line(5.2f, 18.8f, 9.1f, 17.4f, 1.2f);
+      pen.Line(5, 19, 18.5f, 5.5f, 1.9f);
+      pen.Line(11, 5.5f, 18.5f, 5.5f, 1.9f);
+      pen.Line(18.5f, 5.5f, 18.5f, 13, 1.9f);
       break;
     case Tool::Text:
-      pen.Line(5.5f, 7, 18.5f, 7, 1.9f);
-      pen.Line(12, 7, 12, 18.5f, 1.9f);
-      pen.Line(8.5f, 18.5f, 15.5f, 18.5f, 1.55f);
-      pen.Line(7, 21, 17, 21, 1.0f);
+      // Plain T; the double underline made it read as a Chinese radical.
+      pen.Line(5, 6.5f, 19, 6.5f, 2.0f);
+      pen.Line(12, 6.5f, 12, 18, 2.0f);
+      pen.Line(9, 18, 15, 18, 1.6f);
       break;
     case Tool::MosaicBrush:
-      pen.RoundedRect(4, 4, 10, 10, 1.0f, 1.25f);
-      pen.RoundedRect(12, 4, 18, 10, 1.0f, 1.25f);
-      pen.RoundedRect(4, 12, 10, 18, 1.0f, 1.25f);
-      pen.Dot(15, 15, 2.0f);
-      pen.Line(13.6f, 16.4f, 7.8f, 20.2f, 2.2f);
+      // Two pixel cells, a solid cell, and a diagonal brush handle.
+      pen.RoundedRect(4.5f, 4.5f, 10.3f, 10.3f, 1.1f, 1.25f);
+      pen.RoundedRect(11.4f, 4.5f, 17.2f, 10.3f, 1.1f, 1.25f);
+      pen.RoundedRect(4.5f, 11.4f, 10.3f, 17.2f, 1.1f, 1.25f);
+      pen.Dot(14.3f, 14.3f, 2.1f);
+      pen.Line(13.2f, 15.6f, 7.4f, 20.6f, 2.3f);
       break;
     case Tool::MosaicRectangle:
-      pen.RoundedRect(4.4f, 5.2f, 19.6f, 18.8f, 2.0f, 1.45f);
-      pen.RoundedRect(7, 7.8f, 10.2f, 11, .5f, .9f);
-      pen.RoundedRect(13.8f, 7.8f, 17, 11, .5f, .9f);
-      pen.RoundedRect(7, 13, 10.2f, 16.2f, .5f, .9f);
-      pen.RoundedRect(13.8f, 13, 17, 16.2f, .5f, .9f);
+      pen.RoundedRect(4.5f, 5, 19.5f, 19, 2.0f, 1.45f);
+      pen.RoundedRect(7.2f, 7.9f, 10.8f, 11.5f, .8f, 1.0f);
+      pen.RoundedRect(13.2f, 7.9f, 16.8f, 11.5f, .8f, 1.0f);
+      pen.RoundedRect(7.2f, 12.7f, 10.8f, 16.3f, .8f, 1.0f);
+      pen.RoundedRect(13.2f, 12.7f, 16.8f, 16.3f, .8f, 1.0f);
       break;
     case Tool::Select:
-      // Marching-ant selection frame paired with a small pointer nib.
-      pen.Dot(5.5f, 5.5f, .95f); pen.Dot(12, 5.5f, .95f); pen.Dot(18.5f, 5.5f, .95f);
-      pen.Dot(5.5f, 12, .95f); pen.Dot(5.5f, 18.5f, .95f); pen.Dot(18.5f, 12, .95f);
-      pen.Dot(18.5f, 18.5f, .95f); pen.Dot(12, 18.5f, .95f);
-      pen.Line(10.6f, 9.1f, 16.6f, 21, 1.55f);
-      pen.Line(10.6f, 9.1f, 20, 14.1f, 1.55f);
-      pen.Line(20, 14.1f, 15.1f, 15.2f, 1.45f);
-      pen.Line(15.1f, 15.2f, 18.3f, 20.3f, 1.45f);
+      // A single clean pointer polygon (the marching dots vanished at 16px).
+      pen.Poly({{5, 5}, {9.3f, 19}, {11.6f, 13.7f}, {17.5f, 11.5f}}, 1.6f, true);
       break;
     case Tool::Frame:
       // Open corner brackets read as a framing tool instead of another box.
@@ -3960,31 +3979,21 @@ void CaptureOverlay::DrawActionIcon(bool save, const RECT& rect) {
   ComPtr<ID2D1SolidColorBrush> brush;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.94f, .98f, 1.0f, 1.0f), &brush);
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(ToD2D(rect))};
   if (!save) {
-    // Copy: two offset sheets; the front sheet has a quiet folded corner.
-    pen.RoundedRect(8.5f, 4.5f, 18.5f, 15.5f, 1.8f, 1.5f);
-    pen.Line(14.5f, 4.5f, 18.5f, 8.5f, 1.15f);
-    pen.Line(14.5f, 4.5f, 14.5f, 8.5f, 1.05f);
-    pen.Line(14.5f, 8.5f, 18.5f, 8.5f, 1.05f);
-    pen.RoundedRect(5.5f, 8.5f, 15.5f, 19.5f, 1.8f, 1.65f);
-    pen.Line(8.2f, 12.1f, 12.8f, 12.1f, 1.05f);
-    pen.Line(8.2f, 15.4f, 12.8f, 15.4f, 1.05f);
+    // Copy: two overlapping sheets, offset like the Lucide copy mark.
+    pen.RoundedRect(8.5f, 8.5f, 20, 20, 2.2f, 1.7f);
+    pen.RoundedRect(4, 4, 15.5f, 15.5f, 2.2f, 1.7f);
     return;
   }
-  // Save: document silhouette, inset label, and an arrow settling into a tray.
-  pen.Line(7, 4.8f, 14.8f, 4.8f, 1.55f);
-  pen.Line(14.8f, 4.8f, 18, 8, 1.55f);
-  pen.Line(18, 8, 18, 12.2f, 1.55f);
-  pen.Line(7, 4.8f, 7, 12.2f, 1.55f);
-  pen.Line(14.8f, 4.8f, 14.8f, 8, 1.1f);
-  pen.Line(14.8f, 8, 18, 8, 1.1f);
-  pen.Line(12, 9.4f, 12, 16.3f, 1.8f);
-  pen.Line(9.2f, 13.5f, 12, 16.3f, 1.8f);
-  pen.Line(12, 16.3f, 14.8f, 13.5f, 1.8f);
-  pen.Line(4.8f, 15.1f, 4.8f, 19, 1.7f);
-  pen.Line(4.8f, 19, 19.2f, 19, 1.7f);
-  pen.Line(19.2f, 19, 19.2f, 15.1f, 1.7f);
+  // Save: an arrow settling into a tray (download-to-disk convention).
+  pen.Line(12, 4.5f, 12, 15, 1.9f);
+  pen.Line(8.3f, 11.3f, 12, 15, 1.9f);
+  pen.Line(12, 15, 15.7f, 11.3f, 1.9f);
+  pen.Line(4.5f, 17.2f, 4.5f, 19.5f, 1.9f);
+  pen.Line(4.5f, 19.5f, 19.5f, 19.5f, 1.9f);
+  pen.Line(19.5f, 19.5f, 19.5f, 17.2f, 1.9f);
 }
 
 void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
@@ -4000,36 +4009,38 @@ void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
                                          : D2D1::ColorF(.76f, .84f, .96f, .98f);
   renderTarget_->CreateSolidColorBrush(iconColor, &brush);
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), IconGrid::For(ToD2D(rect))};
+  const GlyphPen pen{renderTarget_.Get(), brush.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(ToD2D(rect))};
   switch (action) {
     case PropertyAction::SizeDown:
-      pen.Circle(12, 12, 7.3f, 1.45f);
-      pen.Line(8.5f, 12, 15.5f, 12, 1.8f);
-      pen.Line(16.9f, 16.9f, 19.5f, 19.5f, 1.35f);
+      // Magnifier with a minus.
+      pen.Circle(10.7f, 10.7f, 6.2f, 1.6f);
+      pen.Line(7.5f, 10.7f, 13.9f, 10.7f, 1.6f);
+      pen.Line(15.3f, 15.3f, 19.3f, 19.3f, 1.7f);
       break;
     case PropertyAction::SizeUp:
-      pen.Circle(11.4f, 11.4f, 7.3f, 1.45f);
-      pen.Line(7.9f, 11.4f, 14.9f, 11.4f, 1.65f);
-      pen.Line(11.4f, 7.9f, 11.4f, 14.9f, 1.65f);
-      pen.Line(16.5f, 16.5f, 19.5f, 19.5f, 1.35f);
+      // Magnifier with a plus.
+      pen.Circle(10.7f, 10.7f, 6.2f, 1.6f);
+      pen.Line(7.5f, 10.7f, 13.9f, 10.7f, 1.55f);
+      pen.Line(10.7f, 7.5f, 10.7f, 13.9f, 1.55f);
+      pen.Line(15.3f, 15.3f, 19.3f, 19.3f, 1.7f);
       break;
     case PropertyAction::Color:
-      // Open palette with a thumb well and three paint wells.
-      pen.Circle(12, 12.2f, 7.4f, 1.55f);
-      pen.Circle(9.3f, 9.2f, 1.0f, 1.1f);
-      pen.Circle(14.4f, 8.8f, 1.0f, 1.1f);
-      pen.Circle(16.1f, 13.2f, 1.0f, 1.1f);
-      pen.Line(5.1f, 15.2f, 8.2f, 18.2f, 1.5f);
+      // Palette disc with three wells and a thumb notch.
+      pen.Circle(12, 12, 7.4f, 1.6f);
+      pen.Dot(9, 9.3f, 1.05f);
+      pen.Dot(12.0f, 8.2f, 1.05f);
+      pen.Dot(15, 9.6f, 1.05f);
+      pen.Dot(8.6f, 14.6f, 1.7f);
       break;
     case PropertyAction::Opacity:
-      // Half-lit lens: the divided disc suggests alpha rather than a generic slash.
-      pen.Circle(12, 12, 7.3f, 1.5f);
-      pen.Line(12, 4.9f, 12, 19.1f, 1.15f);
-      pen.Line(12.3f, 5.4f, 17.2f, 7.5f, 1.0f);
-      pen.Line(12.3f, 18.6f, 17.2f, 16.5f, 1.0f);
+      // Divided disc suggests translucency (contrast circle).
+      pen.Circle(12, 12, 7.3f, 1.6f);
+      pen.Line(12, 4.7f, 12, 19.3f, 1.5f);
+      pen.Dot(9.3f, 9.3f, 0.9f);
       break;
     case PropertyAction::FillColor:
-      // Tilted paint bucket and one paint drop.
+      // Paint bucket with a drop beside it.
       pen.Line(7.2f, 11.5f, 16.2f, 11.5f, 1.7f);
       pen.Line(7.2f, 11.5f, 8.6f, 18.3f, 1.7f);
       pen.Line(16.2f, 11.5f, 14.8f, 18.3f, 1.7f);
@@ -4037,55 +4048,61 @@ void CaptureOverlay::DrawPropertyIcon(PropertyAction action, const RECT& rect) {
       pen.Line(6.2f, 10.3f, 17.2f, 10.3f, 1.7f);
       pen.Line(8.8f, 9.7f, 11.7f, 6.8f, 1.5f);
       pen.Line(11.7f, 6.8f, 14.6f, 9.7f, 1.5f);
-      pen.Dot(18.5f, 7.2f, 1.2f);
+      pen.Dot(18.6f, 7.2f, 1.2f);
       break;
     case PropertyAction::FillOpacity:
-      pen.RoundedRect(5.5f, 5.5f, 18.5f, 18.5f, 2.2f, 1.5f);
-      pen.Line(7.3f, 16.7f, 16.7f, 7.3f, 1.45f);
+      // Rounded square crossed by a diagonal, dots in the two empty corners.
+      pen.RoundedRect(5.5f, 5.5f, 18.5f, 18.5f, 2.2f, 1.55f);
+      pen.Line(7.3f, 16.7f, 16.7f, 7.3f, 1.5f);
       pen.Dot(8.5f, 8.5f, .7f); pen.Dot(15.5f, 15.5f, .7f);
       break;
     case PropertyAction::FillToggle:
-      // Eye with a positive center when the fill is enabled.
-      pen.Line(4.5f, 12, 7.5f, 8.5f, 1.5f);
-      pen.Line(7.5f, 8.5f, 12, 7, 1.5f);
-      pen.Line(12, 7, 16.5f, 8.5f, 1.5f);
-      pen.Line(16.5f, 8.5f, 19.5f, 12, 1.5f);
-      pen.Line(19.5f, 12, 16.5f, 15.5f, 1.5f);
-      pen.Line(16.5f, 15.5f, 12, 17, 1.5f);
-      pen.Line(12, 17, 7.5f, 15.5f, 1.5f);
-      pen.Line(7.5f, 15.5f, 4.5f, 12, 1.5f);
-      pen.Circle(12, 12, 2.5f, 1.4f);
+      // Eye: one smooth polygon outline plus an iris.
+      pen.Poly({{4.5f, 12}, {7.5f, 8.6f}, {12, 7.1f}, {16.5f, 8.6f}, {19.5f, 12},
+                {16.5f, 15.4f}, {12, 16.9f}, {7.5f, 15.4f}}, 1.5f, true);
+      pen.Circle(12, 12, 2.6f, 1.5f);
       break;
     case PropertyAction::MosaicStyle:
-      pen.RoundedRect(5.2f, 5.2f, 10.4f, 10.4f, 1.0f, 1.35f);
-      pen.RoundedRect(13.6f, 5.2f, 18.8f, 10.4f, 1.0f, 1.35f);
-      pen.RoundedRect(5.2f, 13.6f, 10.4f, 18.8f, 1.0f, 1.35f);
-      pen.Dot(16.2f, 16.2f, 2.25f);
+      // Three pixel cells and a solid cell.
+      pen.RoundedRect(5.3f, 5.3f, 10.5f, 10.5f, 1.0f, 1.3f);
+      pen.RoundedRect(13.5f, 5.3f, 18.7f, 10.5f, 1.0f, 1.3f);
+      pen.RoundedRect(5.3f, 13.5f, 10.5f, 18.7f, 1.0f, 1.3f);
+      pen.Dot(16.1f, 16.1f, 2.2f);
       break;
     case PropertyAction::MosaicStrength:
-      pen.Circle(12, 12, 7.3f, 1.25f);
-      pen.Circle(12, 12, 4.4f, 1.15f);
+      // Concentric signal rings with a solid core.
+      pen.Circle(12, 12, 7.2f, 1.3f);
+      pen.Circle(12, 12, 4.3f, 1.2f);
       pen.Dot(12, 12, 1.5f);
       break;
+    case PropertyAction::MosaicFeather:
+      // Solid core inside a soft-edge band (kept two-tone so it stays legible
+      // even in the 16px slider-leading slot).
+      pen.RoundedRect(4.8f, 4.8f, 19.2f, 19.2f, 2.1f, 1.15f);
+      pen.FillRoundedRect(9.8f, 9.8f, 14.2f, 14.2f, 1.2f);
+      break;
     case PropertyAction::FrameToggle:
-      pen.RoundedRect(5, 5.5f, 19, 18.5f, 2.1f, 1.45f);
-      pen.Line(8, 8.5f, 16, 8.5f, 1.0f);
-      pen.Line(8, 11.8f, 16, 11.8f, 1.0f);
-      pen.Line(8, 15.1f, 13, 15.1f, 1.0f);
+      // Document card with three text rules.
+      pen.RoundedRect(5, 5.5f, 19, 18.5f, 2.1f, 1.5f);
+      pen.Line(8, 8.7f, 16, 8.7f, 1.1f);
+      pen.Line(8, 12, 16, 12, 1.1f);
+      pen.Line(8, 15.3f, 13, 15.3f, 1.1f);
       break;
     case PropertyAction::TextOrientation:
-      pen.Line(5.3f, 6.2f, 15.8f, 6.2f, 1.65f);
-      pen.Line(10.5f, 6.2f, 10.5f, 17.8f, 1.65f);
+      // T and a small two-headed rotate cue on the right.
+      pen.Line(5.3f, 6.2f, 15.8f, 6.2f, 1.7f);
+      pen.Line(10.5f, 6.2f, 10.5f, 17.8f, 1.7f);
       pen.Line(7.7f, 17.8f, 13.3f, 17.8f, 1.3f);
-      pen.Line(18, 7.5f, 18, 17, 1.2f);
-      pen.Line(16, 9.5f, 18, 7.5f, 1.2f); pen.Line(18, 7.5f, 20, 9.5f, 1.2f);
+      pen.Line(18, 8, 18, 16, 1.3f);
+      pen.Line(16, 10, 18, 8, 1.3f); pen.Line(18, 8, 20, 10, 1.3f);
+      pen.Line(16, 14, 18, 16, 1.3f); pen.Line(18, 16, 20, 14, 1.3f);
       break;
     case PropertyAction::TextShadow:
-      // Two offset typographic planes make the shadow state unmistakable.
-      pen.Line(9, 9, 19, 9, 1.65f); pen.Line(14, 9, 14, 20, 1.65f);
-      pen.Line(11.5f, 20, 16.5f, 20, 1.2f);
-      pen.Line(5, 5.8f, 15.2f, 5.8f, 1.65f); pen.Line(10.1f, 5.8f, 10.1f, 17, 1.65f);
-      pen.Line(7.6f, 17, 12.6f, 17, 1.2f);
+      // Two offset T planes: the rear, dimmer one reads as the cast shadow.
+      pen.Line(8.8f, 9.2f, 18.8f, 9.2f, 1.5f); pen.Line(13.8f, 9.2f, 13.8f, 19.5f, 1.5f);
+      pen.Line(11.2f, 19.5f, 16.4f, 19.5f, 1.1f);
+      pen.Line(5.2f, 5.8f, 15.2f, 5.8f, 1.7f); pen.Line(10.2f, 5.8f, 10.2f, 16.5f, 1.7f);
+      pen.Line(7.8f, 16.5f, 12.6f, 16.5f, 1.2f);
       break;
   }
 }
@@ -4274,14 +4291,14 @@ void CaptureOverlay::DrawBarUtilityButtons(float alpha) {
     // named local here -- a temporary ComPtr would be destroyed right after
     // the pen is built, leaving a dangling style pointer.
     const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-    const GlyphPen pen{renderTarget_.Get(), glyph.Get(), rounded.Get(), grid};
+    const GlyphPen pen{renderTarget_.Get(), glyph.Get(), rounded.Get(), d2dFactory_.Get(), grid};
     if (closeIcon) {
-      pen.Line(8, 8, 16, 16, 1.9f);
-      pen.Line(16, 8, 8, 16, 1.9f);
+      pen.Line(7.5f, 7.5f, 16.5f, 16.5f, 2.0f);
+      pen.Line(16.5f, 7.5f, 7.5f, 16.5f, 2.0f);
     } else {
-      pen.Line(16.5f, 12, 7.5f, 12, 1.8f);
-      pen.Line(11.5f, 7, 7.5f, 12, 1.8f);
-      pen.Line(7.5f, 12, 11.5f, 17, 1.8f);
+      pen.Line(16.5f, 12, 7.5f, 12, 2.0f);
+      pen.Line(11.5f, 7, 7.5f, 12, 2.0f);
+      pen.Line(7.5f, 12, 11.5f, 17, 2.0f);
     }
   };
   drawDisc(back, grayDisc.Get());
@@ -4519,16 +4536,36 @@ void CaptureOverlay::DrawToolbar() {
     if (button.slider) {
       const float value = button.action == PropertyAction::Opacity ? ActiveOpacity()
                          : button.action == PropertyAction::FillOpacity ? ActiveFillOpacity()
-                         : ActiveMosaicStrength();
+                         : button.action == PropertyAction::MosaicStrength ? ActiveMosaicStrength()
+                         : ActiveMosaicFeather();
       const MosaicStyle activeMosaicStyle = ActiveMosaic() ? ActiveMosaic()->style : config_.mosaicStyle;
       const float minimum = button.action == PropertyAction::MosaicStrength
                                 ? (activeMosaicStyle == MosaicStyle::Blur ? 1.0f : 2.0f)
                                 : 0.0f;
       const float maximum = button.action == PropertyAction::MosaicStrength
                                 ? (activeMosaicStyle == MosaicStyle::Blur ? 64.0f : 128.0f)
+                            : button.action == PropertyAction::MosaicFeather ? 32.0f
                                 : 1.0f;
       const float ratio = std::clamp((value - minimum) / std::max(1.0f, maximum - minimum), 0.0f, 1.0f);
       const float centerY = (button.rect.top + button.rect.bottom) / 2.0f;
+      if (button.action == PropertyAction::MosaicFeather) {
+        // Shares the secondary-row size-control slot, so mirror that slider's
+        // look exactly: grey edge-to-edge track, blue knob, and a glyph in the
+        // spot where the size slider paints its dot.
+        ComPtr<ID2D1SolidColorBrush> sizeTrack, sizeKnob;
+        renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.27f, .31f, .39f, 1), &sizeTrack);
+        renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.22f, .67f, 1.0f, 1), &sizeKnob);
+        DrawPropertyIcon(PropertyAction::MosaicFeather,
+                         {toolbar.left + 20, static_cast<int>(centerY) - 8,
+                          toolbar.left + 36, static_cast<int>(centerY) + 8});
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
+            D2D1::RectF(static_cast<float>(button.rect.left), centerY - 2,
+                        static_cast<float>(button.rect.right), centerY + 2), 2, 2), sizeTrack.Get());
+        const float knobX = static_cast<float>(button.rect.left) +
+                            ratio * (button.rect.right - button.rect.left);
+        renderTarget_->FillEllipse({{knobX, centerY}, 7, 7}, sizeKnob.Get());
+        continue;
+      }
       ComPtr<ID2D1SolidColorBrush> sliderTrack, sliderFill, sliderKnob;
       renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.22f, .28f, .37f, 1), &sliderTrack);
       renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.24f, .67f, 1.0f, 1), &sliderFill);
@@ -4704,22 +4741,19 @@ void CaptureOverlay::DrawLongCaptureGlyph(const D2D1_RECT_F& rect) {
   // The stroke style must outlive the deferred draw calls below, so it is a
   // named local: a temporary ComPtr would leave the pen holding a freed style.
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
-  // Scrolling document with a folded corner and a clear continuation cue.
-  pen.Line(5, 3.8f, 13.4f, 3.8f, 1.35f);
-  pen.Line(13.4f, 3.8f, 16.1f, 6.5f, 1.35f);
-  pen.Line(16.1f, 6.5f, 16.1f, 19.7f, 1.35f);
-  pen.Line(16.1f, 19.7f, 5, 19.7f, 1.35f);
-  pen.Line(5, 19.7f, 5, 3.8f, 1.35f);
-  pen.Line(13.4f, 3.8f, 13.4f, 6.5f, 1.0f);
-  pen.Line(13.4f, 6.5f, 16.1f, 6.5f, 1.0f);
-  pen.Line(7.5f, 9.4f, 12.8f, 9.4f, 1.0f);
-  pen.Line(7.5f, 12.4f, 13.1f, 12.4f, 1.0f);
-  pen.Line(7.5f, 15.4f, 11.3f, 15.4f, 1.0f);
-  // Down-arrow sits beyond the page edge, visually separate from the content.
-  pen.Line(19.3f, 6.4f, 19.3f, 15.4f, 1.75f);
-  pen.Line(16.7f, 12.9f, 19.3f, 15.5f, 1.75f);
-  pen.Line(19.3f, 15.5f, 21.9f, 12.9f, 1.75f);
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(rect)};
+  // Folded document as one polygon, with fold seam, three text rules, and a
+  // continuation arrow riding clear of the page edge.
+  pen.Poly({{4.5f, 4}, {12.5f, 4}, {15.5f, 7}, {15.5f, 20}, {4.5f, 20}}, 1.4f, true);
+  pen.Line(12.5f, 4, 12.5f, 7, 1.05f);
+  pen.Line(12.5f, 7, 15.5f, 7, 1.05f);
+  pen.Line(7.2f, 10, 12.8f, 10, 1.05f);
+  pen.Line(7.2f, 13, 12.8f, 13, 1.05f);
+  pen.Line(7.2f, 16, 10.8f, 16, 1.05f);
+  pen.Line(18.8f, 7.2f, 18.8f, 15.6f, 1.75f);
+  pen.Line(16.2f, 13, 18.8f, 15.6f, 1.75f);
+  pen.Line(18.8f, 15.6f, 21.4f, 13, 1.75f);
 }
 
 // Direction chevrons for the three scroll buttons: a bold open ">"-style
@@ -4731,22 +4765,23 @@ void CaptureOverlay::DrawScrollDirectionGlyph(ScrollDirection direction, const D
   ComPtr<ID2D1SolidColorBrush> white;
   if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(rect)};
   switch (direction) {
     case ScrollDirection::Up:
-      pen.Line(12, 18.5f, 12, 6.2f, 1.9f);
-      pen.Line(7.5f, 10.8f, 12, 6.2f, 1.9f);
-      pen.Line(12, 6.2f, 16.5f, 10.8f, 1.9f);
+      pen.Line(12, 18.5f, 12, 6.2f, 2.0f);
+      pen.Line(7.5f, 10.8f, 12, 6.2f, 2.0f);
+      pen.Line(12, 6.2f, 16.5f, 10.8f, 2.0f);
       break;
     case ScrollDirection::Right:
-      pen.Line(5.5f, 12, 18, 12, 1.9f);
-      pen.Line(13.4f, 7.5f, 18, 12, 1.9f);
-      pen.Line(18, 12, 13.4f, 16.5f, 1.9f);
+      pen.Line(5.5f, 12, 18, 12, 2.0f);
+      pen.Line(13.4f, 7.5f, 18, 12, 2.0f);
+      pen.Line(18, 12, 13.4f, 16.5f, 2.0f);
       break;
     case ScrollDirection::Down:
-      pen.Line(12, 5.5f, 12, 17.8f, 1.9f);
-      pen.Line(7.5f, 13.2f, 12, 17.8f, 1.9f);
-      pen.Line(12, 17.8f, 16.5f, 13.2f, 1.9f);
+      pen.Line(12, 5.5f, 12, 17.8f, 2.0f);
+      pen.Line(7.5f, 13.2f, 12, 17.8f, 2.0f);
+      pen.Line(12, 17.8f, 16.5f, 13.2f, 2.0f);
       break;
   }
 }
@@ -4760,13 +4795,14 @@ void CaptureOverlay::DrawLongActionGlyph(bool finish, const D2D1_RECT_F& rect) {
   ComPtr<ID2D1SolidColorBrush> white;
   if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(rect)};
   if (finish) {
-    pen.Line(6.75f, 12.75f, 10.25f, 16.25f, 2.3f);
-    pen.Line(10.25f, 16.25f, 17.5f, 7.75f, 2.3f);
+    pen.Line(6.75f, 12.75f, 10.25f, 16.25f, 2.2f);
+    pen.Line(10.25f, 16.25f, 17.5f, 7.75f, 2.2f);
   } else {
-    pen.Line(8, 8, 16, 16, 2.3f);
-    pen.Line(16, 8, 8, 16, 2.3f);
+    pen.Line(8, 8, 16, 16, 2.2f);
+    pen.Line(16, 8, 8, 16, 2.2f);
   }
 }
 
@@ -4779,21 +4815,22 @@ void CaptureOverlay::DrawLongPreviewGlyph(int kind, const D2D1_RECT_F& rect) {
   ComPtr<ID2D1SolidColorBrush> white;
   if (FAILED(renderTarget_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white))) return;
   const ComPtr<ID2D1StrokeStyle> rounded = RoundCapStyle(d2dFactory_.Get());
-  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), IconGrid::For(rect)};
+  const GlyphPen pen{renderTarget_.Get(), white.Get(), rounded.Get(), d2dFactory_.Get(),
+                     IconGrid::For(rect)};
   switch (kind) {
-    case 0:  // crop: the classic double-elbow mark
-      pen.Line(8.5f, 5.5f, 8.5f, 15.5f, 1.7f);
-      pen.Line(8.5f, 15.5f, 18.5f, 15.5f, 1.7f);
-      pen.Line(5.5f, 8.5f, 15.5f, 8.5f, 1.7f);
-      pen.Line(15.5f, 8.5f, 15.5f, 18.5f, 1.7f);
+    case 0:  // crop: two overlapping L-guides
+      pen.Line(6, 3, 6, 16, 1.8f);
+      pen.Line(6, 16, 21, 16, 1.8f);
+      pen.Line(18, 21, 18, 8, 1.8f);
+      pen.Line(3, 8, 18, 8, 1.8f);
       break;
     case 1:  // check
-      pen.Line(7, 12.5f, 10.5f, 16, 2.1f);
-      pen.Line(10.5f, 16, 17.25f, 7.75f, 2.1f);
+      pen.Line(7, 12.5f, 10.5f, 16, 2.2f);
+      pen.Line(10.5f, 16, 17.25f, 7.75f, 2.2f);
       break;
     default:  // cross
-      pen.Line(8.25f, 8.25f, 15.75f, 15.75f, 2.1f);
-      pen.Line(15.75f, 8.25f, 8.25f, 15.75f, 2.1f);
+      pen.Line(8.25f, 8.25f, 15.75f, 15.75f, 2.2f);
+      pen.Line(15.75f, 8.25f, 8.25f, 15.75f, 2.2f);
       break;
   }
 }
@@ -6482,6 +6519,7 @@ void CaptureOverlay::LongPreviewGestureStart(POINT point) {
     if (button.action == PropertyAction::Opacity) SetOpacityFromSlider(point, button.rect);
     else if (button.action == PropertyAction::FillOpacity) SetFillOpacityFromSlider(point, button.rect);
     else if (button.action == PropertyAction::MosaicStrength) SetMosaicStrengthFromSlider(point, button.rect);
+    else if (button.action == PropertyAction::MosaicFeather) SetMosaicFeatherFromSlider(point, button.rect);
     return;
   }
   if (auto preset = HitTestColorPreset(point)) {
@@ -6612,11 +6650,15 @@ void CaptureOverlay::LongPreviewGestureStart(POINT point) {
   } else if (longPreviewTool_ == Tool::MosaicBrush) {
     previewCommand_ = MosaicCommand{true, {local}, {}, config_.mosaicStyle,
                                     config_.mosaicBrushSize, config_.mosaicPixelSize,
-                                    config_.mosaicBlurRadius};
+                                    config_.mosaicBlurRadius, 0.0f};
   } else if (longPreviewTool_ == Tool::MosaicRectangle) {
     previewCommand_ = MosaicCommand{false, {}, {local.x, local.y, local.x, local.y},
                                     config_.mosaicStyle, config_.mosaicBrushSize,
-                                    config_.mosaicPixelSize, config_.mosaicBlurRadius};
+                                    config_.mosaicPixelSize, config_.mosaicBlurRadius,
+                                    config_.mosaicFeather >= 0.0f
+                                        ? config_.mosaicFeather
+                                        : RectMosaicFeather(config_.mosaicStyle, config_.mosaicPixelSize,
+                                                            config_.mosaicBlurRadius)};
   } else {
     ShapeKind kind = longPreviewTool_ == Tool::Rectangle ? ShapeKind::Rectangle
                      : longPreviewTool_ == Tool::Ellipse ? ShapeKind::Ellipse
@@ -6915,6 +6957,7 @@ void CaptureOverlay::UpdateTooltip(POINT point) {
       case PropertyAction::FillOpacity: tooltipText_ = L"填充透明度"; break;
       case PropertyAction::MosaicStyle: tooltipText_ = L"马赛克模式"; break;
       case PropertyAction::MosaicStrength: tooltipText_ = L"马赛克强度"; break;
+      case PropertyAction::MosaicFeather: tooltipText_ = L"边缘羽化"; break;
       case PropertyAction::TextOrientation: tooltipText_ = L"文字方向"; break;
       case PropertyAction::TextShadow: tooltipText_ = L"文字阴影开关"; break;
       case PropertyAction::FrameToggle: tooltipText_ = L"截图外框阴影开关"; break;
@@ -6983,6 +7026,12 @@ std::vector<CaptureOverlay::PropertyButton> CaptureOverlay::PropertyButtons() co
     const MosaicStyle style = ActiveMosaic() ? ActiveMosaic()->style : config_.mosaicStyle;
     add(PropertyAction::MosaicStyle, style == MosaicStyle::Pixel ? L"像素" : L"模糊", true);
     add(PropertyAction::MosaicStrength, L"", false, true, 180);
+    if (tool_ == Tool::MosaicRectangle) {
+      // The feather control lives on the secondary control row, using the very
+      // same slot the other tools use for their size slider.
+      const RECT secondary = SizeSliderRect();
+      result.push_back({PropertyAction::MosaicFeather, secondary, L"", false, true});
+    }
     return result;
   }
   add(PropertyAction::Opacity, L"", false, true, 140);
@@ -7046,6 +7095,7 @@ void CaptureOverlay::ActivateProperty(PropertyAction action) {
       if (configChanged_) configChanged_();
       break;
     case PropertyAction::MosaicStrength:
+    case PropertyAction::MosaicFeather:
       break;
     case PropertyAction::FrameToggle:
       config_.frameEnabled = !config_.frameEnabled;
@@ -7289,6 +7339,38 @@ void CaptureOverlay::SetMosaicStrengthFromSlider(POINT point, const RECT& slider
   const float ratio = std::clamp((point.x - slider.left - 5.0f) /
                                  std::max(1.0f, static_cast<float>(slider.right - slider.left - 10)), 0.0f, 1.0f);
   SetActiveMosaicStrength(std::round(minimum + ratio * (maximum - minimum)));
+}
+
+float CaptureOverlay::ActiveMosaicFeather() const {
+  if (const MosaicCommand* mosaic = ActiveMosaic()) {
+    if (!mosaic->brush) return mosaic->feather;
+  } else if (config_.mosaicFeather >= 0.0f) {
+    return config_.mosaicFeather;
+  }
+  // No explicit override yet: keep the strength-derived default visible.
+  const MosaicStyle style = ActiveMosaic() ? ActiveMosaic()->style : config_.mosaicStyle;
+  const int pixelSize = ActiveMosaic() ? ActiveMosaic()->pixelSize : config_.mosaicPixelSize;
+  const float blurRadius = ActiveMosaic() ? ActiveMosaic()->blurRadius : config_.mosaicBlurRadius;
+  return RectMosaicFeather(style, pixelSize, blurRadius);
+}
+
+void CaptureOverlay::SetActiveMosaicFeather(float value) {
+  value = std::clamp(value, 0.0f, 32.0f);
+  if (MosaicCommand* mosaic = ActiveMosaic()) {
+    if (mosaic->brush) return;
+    mosaic->feather = value;
+    if (longPreview_) RebuildLongMosaicPixels();
+  } else {
+    config_.mosaicFeather = value;
+  }
+  if (configChanged_) configChanged_();
+  InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::SetMosaicFeatherFromSlider(POINT point, const RECT& slider) {
+  const float ratio = std::clamp((point.x - slider.left - 5.0f) /
+                                 std::max(1.0f, static_cast<float>(slider.right - slider.left - 10)), 0.0f, 1.0f);
+  SetActiveMosaicFeather(std::round(ratio * 32.0f));
 }
 
 bool CaptureOverlay::HasSizeControl() const {

@@ -54,6 +54,10 @@ struct MosaicCommand {
   float brushSize = 32.0f;
   int pixelSize = 16;
   float blurRadius = 6.0f;
+  // Rectangle mosaics only. Total width (in image pixels) of the soft edge band:
+  // coverage fades from 0 half a feather outside the rect to 1 half inside it.
+  // 0 keeps the legacy hard edge; brush strokes always ignore this value.
+  float feather = 0.0f;
 };
 
 struct TextCommand {
@@ -94,6 +98,10 @@ float DistanceToSegment(PointF point, PointF a, PointF b);
 float PenWidthScaleForSpeed(float pixelsPerSecond);
 float PenPointWidth(const PenCommand& command, size_t index);
 float PenMaximumWidth(const PenCommand& command);
+
+// Default soft-edge width for a freshly drawn rectangle mosaic, derived from
+// its current strength so the band always matches the pixel block / blur look.
+float RectMosaicFeather(MosaicStyle style, int pixelSize, float blurRadius);
 
 // Applies only the destructive pixel/blur operations. Vector commands are rendered by Direct2D.
 void ApplyMosaics(std::vector<uint8_t>& bgra, int width, int height, int stride,

@@ -107,10 +107,28 @@ float PenMaximumWidth(const PenCommand& command) {
   return width;
 }
 
+float RectMosaicFeather(MosaicStyle style, int pixelSize, float blurRadius) {
+  // One pixel tile / roughly one blur diameter reads as a natural soft edge;
+  // cap it so a high strength slider cannot wash out the whole rectangle.
+  const float feather = style == MosaicStyle::Blur
+                            ? std::clamp(blurRadius, 1.0f, 64.0f) * 2.0f
+                            : static_cast<float>(std::clamp(pixelSize, 2, 128));
+  return std::clamp(feather, 0.0f, 32.0f);
+}
+
 namespace {
 
 RectF MosaicAffectBounds(const MosaicCommand& command, int width, int height) {
-  if (!command.brush) return command.bounds;
+  if (!command.brush) {
+    // The feather band reaches half a feather outside every edge, so pixels
+    // just outside the rectangle are touched by the soft blend as well.
+    const float half = std::clamp(command.feather, 0.0f, 256.0f) * 0.5f;
+    if (half <= 0.0f) return command.bounds;
+    return {std::clamp(command.bounds.left - half, 0.0f, static_cast<float>(width)),
+            std::clamp(command.bounds.top - half, 0.0f, static_cast<float>(height)),
+            std::clamp(command.bounds.right + half, 0.0f, static_cast<float>(width)),
+            std::clamp(command.bounds.bottom + half, 0.0f, static_cast<float>(height))};
+  }
   if (command.points.empty()) return {};
   RectF bounds{command.points.front().x, command.points.front().y,
                command.points.front().x, command.points.front().y};
@@ -127,6 +145,8 @@ RectF MosaicAffectBounds(const MosaicCommand& command, int width, int height) {
           std::clamp(bounds.bottom + radius, 0.0f, static_cast<float>(height))};
 }
 
+// Per-pixel coverage of a mosaic: 0 = untouched, 255 = fully covered,
+// intermediate values mark the feathered edge band of rectangle mosaics.
 struct MosaicMask {
   int left = 0;
   int top = 0;
@@ -136,13 +156,14 @@ struct MosaicMask {
 
   int width() const { return right - left; }
   bool empty() const { return right <= left || bottom <= top || pixels.empty(); }
-  bool At(int x, int y) const {
-    if (x < left || x >= right || y < top || y >= bottom) return false;
-    return pixels[static_cast<size_t>((y - top) * width() + (x - left))] != 0;
+  bool At(int x, int y) const { return Coverage(x, y) != 0; }
+  uint8_t Coverage(int x, int y) const {
+    if (x < left || x >= right || y < top || y >= bottom) return 0;
+    return pixels[static_cast<size_t>((y - top) * width() + (x - left))];
   }
   void Mark(int x, int y) {
     if (x < left || x >= right || y < top || y >= bottom) return;
-    pixels[static_cast<size_t>((y - top) * width() + (x - left))] = 1;
+    pixels[static_cast<size_t>((y - top) * width() + (x - left))] = 255;
   }
 };
 
@@ -159,7 +180,28 @@ MosaicMask BuildMosaicMask(const MosaicCommand& command, int width, int height) 
   mask.pixels.resize(static_cast<size_t>(mask.width() * (mask.bottom - mask.top)));
 
   if (!command.brush) {
-    std::fill(mask.pixels.begin(), mask.pixels.end(), static_cast<uint8_t>(1));
+    const float feather = std::clamp(command.feather, 0.0f, 256.0f);
+    if (feather <= 0.0f) {
+      std::fill(mask.pixels.begin(), mask.pixels.end(), static_cast<uint8_t>(255));
+      return mask;
+    }
+    // Coverage ramps along a smoothstep over the feather band: the geometric
+    // rect edge sits at 50%, the band extends half a feather in and out.
+    const float half = feather * 0.5f;
+    const RectF rect = command.bounds;
+    for (int y = mask.top; y < mask.bottom; ++y) {
+      const float py = y + 0.5f;
+      const float dy = std::min(py - rect.top, rect.bottom - py);
+      for (int x = mask.left; x < mask.right; ++x) {
+        const float px = x + 0.5f;
+        const float dx = std::min(px - rect.left, rect.right - px);
+        const float distance = std::min(dx, dy);
+        const float t = std::clamp((distance + half) / feather, 0.0f, 1.0f);
+        const float smooth = t * t * (3.0f - 2.0f * t);
+        mask.pixels[static_cast<size_t>((y - mask.top) * mask.width() + (x - mask.left))] =
+            static_cast<uint8_t>(std::lround(smooth * 255.0f));
+      }
+    }
     return mask;
   }
   if (command.points.empty()) return mask;
@@ -209,9 +251,18 @@ void Pixelate(std::vector<uint8_t>& image, int width, int height, int stride,
           static_cast<uint8_t>(r / count), static_cast<uint8_t>(a / count)};
       for (int y = by; y < blockBottom; ++y) {
         for (int x = bx; x < blockRight; ++x) {
-          if (!mask.At(x, y)) continue;
+          const uint8_t coverage = mask.Coverage(x, y);
+          if (coverage == 0) continue;
           uint8_t* pixel = image.data() + static_cast<size_t>(y * stride + x * 4);
-          std::copy(average.begin(), average.end(), pixel);
+          if (coverage == 255) {
+            std::copy(average.begin(), average.end(), pixel);
+          } else {
+            // Feathered edge: blend the tiled color with the pixel beneath.
+            for (int channel = 0; channel < 4; ++channel) {
+              const int blended = average[channel] * coverage + pixel[channel] * (255 - coverage);
+              pixel[channel] = static_cast<uint8_t>((blended + 127) / 255);
+            }
+          }
         }
       }
     }
@@ -326,7 +377,8 @@ void MipmapBlur(std::vector<uint8_t>& image, int width, int height, int stride,
   const float scaleY = static_cast<float>(sourceHeight) / static_cast<float>(mip.height);
   for (int y = mask.top; y < mask.bottom; ++y) {
     for (int x = mask.left; x < mask.right; ++x) {
-      if (!mask.At(x, y)) continue;
+      const uint8_t coverage = mask.Coverage(x, y);
+      if (coverage == 0) continue;
       const float sampleX = (x + 0.5f - sourceLeft) / scaleX - 0.5f;
       const float sampleY = (y + 0.5f - sourceTop) / scaleY - 0.5f;
       const float clampedX = std::clamp(sampleX, 0.0f, static_cast<float>(mip.width - 1));
@@ -345,8 +397,16 @@ void MipmapBlur(std::vector<uint8_t>& image, int width, int height, int stride,
         };
         const float top = sample(x0, y0) * (1.0f - fx) + sample(x1, y0) * fx;
         const float bottom = sample(x0, y1) * (1.0f - fx) + sample(x1, y1) * fx;
-        output[channel] = static_cast<uint8_t>(std::clamp(
-            std::lround(top * (1.0f - fy) + bottom * fy), 0l, 255l));
+        const float blurred = static_cast<float>(
+            std::clamp(std::lround(top * (1.0f - fy) + bottom * fy), 0l, 255l));
+        if (coverage == 255) {
+          output[channel] = static_cast<uint8_t>(blurred);
+        } else {
+          // Feathered edge: fade the blur out over the original pixels.
+          const int blended = static_cast<int>(blurred) * coverage +
+                              output[channel] * (255 - coverage);
+          output[channel] = static_cast<uint8_t>((blended + 127) / 255);
+        }
       }
     }
   }

@@ -74,6 +74,9 @@ struct AppConfig {
   float mosaicBrushSize = 32.0f;
   int mosaicPixelSize = 16;
   float mosaicBlurRadius = 6.0f;
+  // Rectangle mosaic soft-edge width in pixels. -1 means "auto": follow the
+  // current strength (pixel block / blur radius); 0 is a hard edge.
+  float mosaicFeather = -1.0f;
 
   bool windowShadow = true;
   // Relative scroll-capture step interval.  1.0 is the historical default;

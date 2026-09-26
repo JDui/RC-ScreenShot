@@ -263,7 +263,7 @@ class CaptureOverlay {
   std::optional<Tool> HitTestTool(POINT point) const;
   enum class PropertyAction {
     SizeDown, SizeUp, Color, Opacity, FillColor, FillOpacity, FillToggle,
-    MosaicStyle, MosaicStrength, FrameToggle, TextOrientation, TextShadow
+    MosaicStyle, MosaicStrength, MosaicFeather, FrameToggle, TextOrientation, TextShadow
   };
   struct PropertyButton {
     PropertyAction action;
@@ -279,6 +279,7 @@ class CaptureOverlay {
   void SetOpacityFromSlider(POINT point, const RECT& slider);
   void SetFillOpacityFromSlider(POINT point, const RECT& slider);
   void SetMosaicStrengthFromSlider(POINT point, const RECT& slider);
+  void SetMosaicFeatherFromSlider(POINT point, const RECT& slider);
   bool HitCopy(POINT point) const;
   bool HitSave(POINT point) const;
   PointF ToSelectionPoint(POINT point) const;
@@ -303,6 +304,8 @@ class CaptureOverlay {
   void SetActiveFillOpacity(float opacity);
   float ActiveMosaicStrength() const;
   void SetActiveMosaicStrength(float value);
+  float ActiveMosaicFeather() const;
+  void SetActiveMosaicFeather(float value);
   bool HasSizeControl() const;
   RECT SizeSliderRect() const;
   void SetSizeFromSlider(POINT point);
