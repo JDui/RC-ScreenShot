@@ -63,6 +63,7 @@ class CaptureOverlay {
     return snapshotsExpanded_ || snapshotsAnimationProgress_ > 0.01f;
   }
   bool EditingForTest() const { return editing_; }
+  const EditorDocument& DocumentForTest() const { return document_; }
 
  private:
   // Preview float window stages and the drag gestures they support.  Declared

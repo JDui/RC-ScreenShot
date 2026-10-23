@@ -434,7 +434,9 @@ void TransformCommand(EditCommand& command, const RectF& before, const RectF& af
 
 bool CommandMatchesTool(const EditCommand& command, Tool tool) {
   if (tool == Tool::Select) return true;
-  if (tool == Tool::Pen) return std::holds_alternative<PenCommand>(command);
+  // Pen always draws new strokes. Existing ink is picked only by Select,
+  // including when returning to Pen with a command already selected.
+  if (tool == Tool::Pen) return false;
   if (tool == Tool::Text) return std::holds_alternative<TextCommand>(command);
   if (tool == Tool::MosaicBrush || tool == Tool::MosaicRectangle) {
     const auto* mosaic = std::get_if<MosaicCommand>(&command);

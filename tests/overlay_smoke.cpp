@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
   const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   rc::ScopeExit uninitialize{[&] { if (SUCCEEDED(com)) CoUninitialize(); }};
   rc::DesktopSnapshot snapshot;
@@ -46,6 +46,58 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (!overlay.Show(error)) {
     std::cerr << "overlayError=" << rc::ToUtf8(error) << '\n';
     return 1;
+  }
+  if (std::wstring_view(commandLine) == L"--pen") {
+    SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(40, 40));
+    SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(520, 250));
+    SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(520, 250));
+    if (!overlay.EditingForTest()) return 22;
+    const auto drag = [&](POINT start, POINT end) {
+      SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(start.x, start.y));
+      SendMessageW(overlay.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(end.x, end.y));
+      SendMessageW(overlay.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(end.x, end.y));
+    };
+    const auto penPointsMatch = [&](size_t index, rc::PointF first, rc::PointF last) {
+      const auto* command = overlay.DocumentForTest().At(index);
+      const auto* pen = command ? std::get_if<rc::PenCommand>(command) : nullptr;
+      return pen && pen->points.size() == 2 &&
+             std::abs(pen->points.front().x - first.x) < 0.01f &&
+             std::abs(pen->points.front().y - first.y) < 0.01f &&
+             std::abs(pen->points.back().x - last.x) < 0.01f &&
+             std::abs(pen->points.back().y - last.y) < 0.01f;
+    };
+    // Drawing over an existing stroke must add ink instead of moving/resizing it.
+    SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'P', 0);
+    drag({180, 120}, {260, 180});
+    drag({220, 150}, {240, 130});
+    if (overlay.DocumentForTest().Size() != 2 ||
+        !penPointsMatch(0, {140, 80}, {220, 140}) ||
+        !penPointsMatch(1, {180, 110}, {200, 90})) return 19;
+    // Select can still move the first stroke from an unoccluded interior point.
+    SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'V', 0);
+    drag({200, 135}, {210, 145});
+    if (overlay.DocumentForTest().Size() != 2 ||
+        !penPointsMatch(0, {150, 90}, {230, 150})) return 20;
+    // Switching back to Pen must also release the selection and its bounding box.
+    SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'P', 0);
+    drag({210, 145}, {230, 125});
+    if (overlay.DocumentForTest().Size() != 3 ||
+        !penPointsMatch(0, {150, 90}, {230, 150}) ||
+        !penPointsMatch(2, {170, 105}, {190, 85})) return 21;
+    // Select also retains corner-handle resizing for existing ink.
+    SendMessageW(overlay.hwnd(), WM_KEYDOWN, 'V', 0);
+    drag({250, 175}, {250, 175});
+    const auto& beforeResize = std::get<rc::PenCommand>(*overlay.DocumentForTest().At(0));
+    const float padding = std::max(4.0f, rc::PenMaximumWidth(beforeResize) * 0.5f + 2.0f);
+    const POINT corner{static_cast<LONG>(std::lround(270.0f + padding)),
+                       static_cast<LONG>(std::lround(130.0f - padding))};
+    drag(corner, {corner.x + 20, corner.y - 20});
+    const auto& resized = std::get<rc::PenCommand>(*overlay.DocumentForTest().At(0));
+    if (overlay.DocumentForTest().Size() != 3 || resized.points.front().y >= 90.0f ||
+        resized.points.back().x <= 230.0f ||
+        !penPointsMatch(1, {180, 110}, {200, 90}) ||
+        !penPointsMatch(2, {170, 105}, {190, 85})) return 23;
+    return 0;
   }
   SendMessageW(overlay.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(524, 284));
   // Expansion uses the 280 ms ease-out transition; leave a little headroom so
