@@ -20,6 +20,42 @@ int failures = 0;
   std::cerr << __FILE__ << ':' << __LINE__ << " CHECK failed: " #condition "\n"; ++failures; \
 } } while (false)
 
+void TestHdrWhiteLevelAndHighlights() {
+  // A desktop gray must retain its sRGB code value regardless of the Windows
+  // SDR brightness slider (80 to 480 nits). Previously the midtone boost and
+  // a fixed white level washed it out as the slider increased.
+  const float grayLinear = std::pow((128.0f / 255.0f + 0.055f) / 1.055f, 2.4f);
+  for (float white : {80.0f, 160.0f, 203.0f, 320.0f, 480.0f}) {
+    const float gray = grayLinear * white / 203.0f;
+    const auto mapped = rc::HdrToSdr(gray, gray, gray, white, 1000.0f);
+    for (float channel : mapped) CHECK(std::abs(channel * 255.0f - 128.0f) < 0.01f);
+    const auto black = rc::HdrToSdr(0, 0, 0, white, 1000.0f);
+    CHECK(black[0] == 0.0f && black[1] == 0.0f && black[2] == 0.0f);
+    const auto paper = rc::HdrToSdr(white / 203.0f, white / 203.0f, white / 203.0f,
+                                   white, 1000.0f);
+    const auto highlight = rc::HdrToSdr(700.0f / 203.0f, 700.0f / 203.0f, 700.0f / 203.0f,
+                                       white, 1000.0f);
+    CHECK(paper[0] > 0.9f && paper[0] < highlight[0]);
+    CHECK(highlight[0] < 1.0f);
+    float previous = 0.0f;
+    for (int nits = 0; nits <= 1000; ++nits) {
+      const float value = nits / 203.0f;
+      const auto ramp = rc::HdrToSdr(value, value, value, white, 1000.0f);
+      CHECK(std::isfinite(ramp[0]) && ramp[0] >= previous && ramp[0] <= 1.0f);
+      previous = ramp[0];
+    }
+  }
+  // Bright saturated colors retain channel ratios in linear light instead of
+  // clipping individual channels to white.
+  const auto color = rc::HdrToSdr(3.0f, 1.5f, 0.0f, 203.0f, 1000.0f);
+  const auto linear = [](float value) { return std::pow((value + 0.055f) / 1.055f, 2.4f); };
+  CHECK(color[0] < 1.0f && color[0] > color[1] && color[2] == 0.0f);
+  CHECK(std::abs(linear(color[0]) / linear(color[1]) - 2.0f) < 0.0001f);
+  CHECK(rc::HdrToSdr(-1, -1, -1, 203, 1000)[0] == 0.0f);
+  CHECK(rc::HdrToSdr(0.2f, 0.2f, 0.2f, 0, 0) ==
+        rc::HdrToSdr(0.2f, 0.2f, 0.2f, 203, 1000));
+}
+
 bool LoadBgra(const std::filesystem::path& path, std::vector<uint8_t>& pixels,
               int& width, int& height) {
   rc::ComPtr<IWICImagingFactory> factory;
@@ -1043,6 +1079,7 @@ void TestScrollCrop() {
 int wmain() {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   rc::ScopeExit uninitialize{[] { CoUninitialize(); }};
+  TestHdrWhiteLevelAndHighlights();
   TestHotkeys();
   TestConfigRoundTrip();
   TestConfigDamagedFieldRecovery();

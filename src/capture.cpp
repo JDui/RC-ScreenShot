@@ -13,6 +13,7 @@ struct OutputInfo {
   ComPtr<IDXGIAdapter1> adapter;
   ComPtr<IDXGIOutput> output;
   DXGI_OUTPUT_DESC1 description{};
+  float sdrWhiteNits = 203.0f;
 };
 
 struct BurstOutput {
@@ -42,8 +43,45 @@ struct BurstSession {
   bool anyHdr = false;
 };
 
+std::map<std::wstring, float> QuerySdrWhiteLevels() {
+  std::map<std::wstring, float> levels;
+  // Display topology can change between the size query and the actual read.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+      break;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    const LONG status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
+                                           &modeCount, modes.data(), nullptr);
+    if (status == ERROR_INSUFFICIENT_BUFFER) continue;
+    if (status != ERROR_SUCCESS) break;
+    for (UINT32 i = 0; i < pathCount; ++i) {
+      const auto& path = paths[i];
+      DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+      source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+      source.header.size = sizeof(source);
+      source.header.adapterId = path.sourceInfo.adapterId;
+      source.header.id = path.sourceInfo.id;
+      if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+      DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+      white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+      white.header.size = sizeof(white);
+      white.header.adapterId = path.targetInfo.adapterId;
+      white.header.id = path.targetInfo.id;
+      if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) {
+        // Windows specifies an 80-nit multiplier scaled by 1000.
+        levels.emplace(source.viewGdiDeviceName, white.SDRWhiteLevel * (80.0f / 1000.0f));
+      }
+    }
+    break;
+  }
+  return levels;
+}
+
 std::vector<OutputInfo> EnumerateOutputs() {
   std::vector<OutputInfo> outputs;
+  const auto whiteLevels = QuerySdrWhiteLevels();
   ComPtr<IDXGIFactory1> factory;
   if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return outputs;
   for (UINT ai = 0;; ++ai) {
@@ -55,7 +93,9 @@ std::vector<OutputInfo> EnumerateOutputs() {
       ComPtr<IDXGIOutput6> output6;
       DXGI_OUTPUT_DESC1 desc{};
       if (FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&desc)) || !desc.AttachedToDesktop) continue;
-      outputs.push_back({adapter, output, desc});
+      const auto white = whiteLevels.find(desc.DeviceName);
+      outputs.push_back({adapter, output, desc,
+                         white != whiteLevels.end() ? white->second : 203.0f});
     }
   }
   return outputs;
@@ -176,21 +216,10 @@ std::array<float, 3> Rec2020To709(float r, float g, float b) {
      -0.0182f * r - 0.1006f * g + 1.1187f * b};
 }
 
-std::array<float, 3> ToneMap(float r203, float g203, float b203, float peakNits) {
-  const float white = std::max(1.5f, peakNits / 203.0f);
-  const float whiteSquared = white * white;
-  const float normalize = 2.0f / (1.0f + 1.0f / whiteSquared);
-  const float luminance = std::max(0.00001f, 0.2126f * r203 + 0.7152f * g203 + 0.0722f * b203);
-  const float mappedLuminance = luminance * (1.0f + luminance / whiteSquared) /
-                                (1.0f + luminance) * normalize;
-  const float scale = mappedLuminance / luminance;
-  return {LinearToSrgb(r203 * scale), LinearToSrgb(g203 * scale), LinearToSrgb(b203 * scale)};
-}
-
 void StorePixel(DesktopSnapshot& snapshot, int x, int y, float r203, float g203, float b203,
-                float peakNits) {
+                float peakNits, float sdrWhiteNits) {
   if (x < 0 || y < 0 || x >= snapshot.width || y >= snapshot.height) return;
-  auto sdr = ToneMap(r203, g203, b203, peakNits);
+  auto sdr = HdrToSdr(r203, g203, b203, sdrWhiteNits, peakNits);
   uint8_t* pixel = snapshot.bgra.data() + static_cast<size_t>(y * snapshot.bgraStride + x * 4);
   pixel[0] = ClampByte(sdr[2] * 255.0f);
   pixel[1] = ClampByte(sdr[1] * 255.0f);
@@ -347,7 +376,8 @@ bool CaptureBurstOutput(BurstSession& session, BurstOutput& output, bool firstFr
           const uint16_t* pixel = reinterpret_cast<const uint16_t*>(row) + source.x * 4;
           StorePixel(converted, dx, dy, HalfToFloat(pixel[0]) * (80.0f / 203.0f),
                      HalfToFloat(pixel[1]) * (80.0f / 203.0f),
-                     HalfToFloat(pixel[2]) * (80.0f / 203.0f), output.peakLuminanceNits);
+                     HalfToFloat(pixel[2]) * (80.0f / 203.0f), output.peakLuminanceNits,
+                     output.info.sdrWhiteNits);
         } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
           const uint32_t packed = reinterpret_cast<const uint32_t*>(row)[source.x];
           const float pr = static_cast<float>(packed & 0x3FF) / 1023.0f;
@@ -355,7 +385,8 @@ bool CaptureBurstOutput(BurstSession& session, BurstOutput& output, bool firstFr
           const float pb = static_cast<float>((packed >> 20) & 0x3FF) / 1023.0f;
           const auto rgb = Rec2020To709(PqToNits(pr) / 203.0f, PqToNits(pg) / 203.0f,
                                         PqToNits(pb) / 203.0f);
-          StorePixel(converted, dx, dy, rgb[0], rgb[1], rgb[2], output.peakLuminanceNits);
+          StorePixel(converted, dx, dy, rgb[0], rgb[1], rgb[2], output.peakLuminanceNits,
+                     output.info.sdrWhiteNits);
         } else {
           const uint8_t* pixel = row + source.x * 4;
           if (session.anyHdr) StoreSdrPixel(converted, dx, dy, pixel[2], pixel[1], pixel[0]);
@@ -492,6 +523,31 @@ bool SnapshotIsBlankImpl(const DesktopSnapshot& snapshot) {
 }
 
 }  // namespace
+
+std::array<float, 3> HdrToSdr(float r203, float g203, float b203,
+                             float sdrWhiteNits, float peakNits) {
+  if (!std::isfinite(sdrWhiteNits) || sdrWhiteNits <= 0.0f) sdrWhiteNits = 203.0f;
+  if (!std::isfinite(peakNits) || peakNits <= 0.0f) peakNits = 1000.0f;
+  const float exposure = 203.0f / sdrWhiteNits;
+  const auto normalize = [exposure](float value) {
+    return std::isfinite(value) ? std::max(0.0f, value) * exposure : 0.0f;
+  };
+  const float r = normalize(r203), g = normalize(g203), b = normalize(b203);
+  const float maximum = std::max({r, g, b});
+  // Preserve shadows/midtones; apply an extended Reinhard shoulder only to
+  // highlights. Max-RGB scaling preserves ratios without clipping saturated
+  // colors. The old white-normalized curve boosted every midtone toward white.
+  constexpr float knee = 0.75f;
+  float scale = 1.0f;
+  if (maximum > knee) {
+    const float white = (std::max(1.0f, peakNits / sdrWhiteNits) - knee) / (1.0f - knee);
+    const float highlight = (maximum - knee) / (1.0f - knee);
+    const float mapped = knee + (1.0f - knee) * highlight *
+        (1.0f + highlight / (white * white)) / (1.0f + highlight);
+    scale = std::min(mapped, 1.0f) / maximum;
+  }
+  return {LinearToSrgb(r * scale), LinearToSrgb(g * scale), LinearToSrgb(b * scale)};
+}
 
 bool SnapshotIsBlank(const DesktopSnapshot& snapshot) {
   return SnapshotIsBlankImpl(snapshot);
@@ -765,7 +821,7 @@ bool DesktopCapture::CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error)
               const float r = HalfToFloat(pixel[0]) * (80.0f / 203.0f);
               const float g = HalfToFloat(pixel[1]) * (80.0f / 203.0f);
               const float b = HalfToFloat(pixel[2]) * (80.0f / 203.0f);
-              StorePixel(snapshot, vx, vy, r, g, b, peakNits);
+              StorePixel(snapshot, vx, vy, r, g, b, peakNits, info.sdrWhiteNits);
             } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
               const uint32_t packed = reinterpret_cast<const uint32_t*>(row)[source.x];
               const float pr = static_cast<float>(packed & 0x3FF) / 1023.0f;
@@ -773,7 +829,7 @@ bool DesktopCapture::CaptureDxgi(DesktopSnapshot& snapshot, std::wstring& error)
               const float pb = static_cast<float>((packed >> 20) & 0x3FF) / 1023.0f;
               const auto rgb = Rec2020To709(PqToNits(pr) / 203.0f, PqToNits(pg) / 203.0f,
                                             PqToNits(pb) / 203.0f);
-              StorePixel(snapshot, vx, vy, rgb[0], rgb[1], rgb[2], peakNits);
+              StorePixel(snapshot, vx, vy, rgb[0], rgb[1], rgb[2], peakNits, info.sdrWhiteNits);
             } else {
               const uint8_t* pixel = row + source.x * 4;
               if (anyHdr) StoreSdrPixel(snapshot, vx, vy, pixel[2], pixel[1], pixel[0]);
@@ -834,6 +890,36 @@ bool CaptureScreenRegion(const RECT& virtualRect, DesktopSnapshot& snapshot, std
   const int width = virtualRect.right - virtualRect.left;
   const int height = virtualRect.bottom - virtualRect.top;
   if (width <= 0 || height <= 0) { error = L"长截图区域无效。"; return false; }
+  const auto outputs = EnumerateOutputs();
+  const bool intersectsHdr = std::any_of(outputs.begin(), outputs.end(), [&](const OutputInfo& output) {
+    RECT intersection{};
+    return IsHdrColorSpace(output.description.ColorSpace) &&
+           IntersectRect(&intersection, &virtualRect, &output.description.DesktopCoordinates);
+  });
+  if (intersectsHdr) {
+    // Reuse the regular HDR conversion instead of BitBlt's clipped HDR pixels.
+    // The stitcher consumes only the resulting SDR preview.
+    DesktopCapture capture;
+    DesktopSnapshot desktop;
+    if (!capture.Capture(desktop, error)) return false;
+    if (virtualRect.left < desktop.virtualBounds.left || virtualRect.top < desktop.virtualBounds.top ||
+        virtualRect.right > desktop.virtualBounds.right || virtualRect.bottom > desktop.virtualBounds.bottom) {
+      error = L"长截图区域超出当前桌面。";
+      return false;
+    }
+    snapshot = {};
+    snapshot.virtualBounds = virtualRect;
+    snapshot.width = width; snapshot.height = height; snapshot.bgraStride = width * 4;
+    snapshot.bgra.resize(static_cast<size_t>(snapshot.bgraStride) * height);
+    const int sourceX = virtualRect.left - desktop.virtualBounds.left;
+    const int sourceY = virtualRect.top - desktop.virtualBounds.top;
+    for (int y = 0; y < height; ++y) {
+      std::memcpy(snapshot.bgra.data() + static_cast<size_t>(y) * snapshot.bgraStride,
+                  desktop.bgra.data() + static_cast<size_t>(sourceY + y) * desktop.bgraStride + sourceX * 4,
+                  static_cast<size_t>(snapshot.bgraStride));
+    }
+    return true;
+  }
   HDC screen = GetDC(nullptr);
   if (!screen) { error = L"GetDC 失败。"; return false; }
   ScopeExit releaseScreen{[&] { ReleaseDC(nullptr, screen); }};

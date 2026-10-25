@@ -7,6 +7,7 @@
 ## 功能特色
 
 - 支持 SDR、WCG 和 HDR 桌面捕获；HDR 场景优先使用 DXGI，SDR 场景提供 GDI 兜底。
+- HDR 预览和剪贴板按每块屏幕的 Windows SDR 内容亮度校正白点，仅压缩高光，避免桌面中间亮度被抬高；Ultra HDR 导出保留原始 HDR 亮度。
 - 支持普通框选、窗口吸附和原图单元识别，快速定位需要截取的内容。
 - 支持长截图：按内容逐帧对齐的滚动拼接（上/下/右三个方向），无重影、无重复内容。
 - 支持 GPU 加速标注：画笔、矩形、椭圆、直线、箭头、文字、马赛克和外框。
@@ -22,7 +23,7 @@
 
 前往 [Latest Release](https://github.com/JDui/RC-ScreenShot/releases/latest) 下载最新版。
 
-当前版本：**0.7.3**
+当前版本：**0.7.4**
 
 发布物为 Windows x64 便携版 EXE：下载后直接运行 `RC-ScreenShot.exe`，无需安装。
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RC-ScreenShot VERSION 0.7.3 LANGUAGES C CXX)
+project(RC-ScreenShot VERSION 0.7.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -83,7 +83,7 @@ if(RC_BUILD_TESTS)
   target_compile_definitions(rc_core_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(rc_core_tests PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
   target_link_libraries(rc_core_tests PRIVATE
-    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 uuid gdi32 user32 imm32 uiautomationcore
+    d3d11 dxgi d2d1 dwrite windowscodecs dwmapi shlwapi shell32 ole32 oleaut32 uuid gdi32 user32 imm32 uiautomationcore
   )
   add_test(NAME rc_core_tests COMMAND rc_core_tests)
 

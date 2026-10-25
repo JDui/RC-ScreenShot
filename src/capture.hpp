@@ -48,9 +48,9 @@ class DesktopCapture {
 // ignored because desktop duplication leaves it undefined on SDR outputs.
 bool SnapshotIsBlank(const DesktopSnapshot& snapshot);
 
-// GDI capture of an arbitrary virtual-desktop rectangle, used by the scrolling
-// long-screenshot engine to grab frames while the overlay is shrunk to its
-// preview strip.  Always produces SDR BGRA pixels.
+// Capture an arbitrary virtual-desktop rectangle for the scrolling stitcher.
+// HDR regions reuse DXGI + white-level correction; SDR regions use GDI.
+// Always produces SDR BGRA pixels.
 bool CaptureScreenRegion(const RECT& virtualRect, DesktopSnapshot& snapshot, std::wstring& error);
 
 // Fills snapshot.windows with candidate windows that overlap the virtual desktop. Only needed
@@ -59,5 +59,10 @@ void EnumerateWindows(DesktopSnapshot& snapshot);
 
 float HalfToFloat(uint16_t half);
 uint16_t FloatToHalf(float value);
+
+// Convert linear 203-nit-reference HDR to an SDR preview using this output's
+// Windows SDR white level. The original HDR buffer keeps its absolute luminance.
+std::array<float, 3> HdrToSdr(float r203, float g203, float b203,
+                             float sdrWhiteNits, float peakNits);
 
 }  // namespace rc
