@@ -86,6 +86,37 @@ float DistanceToSegment(PointF point, PointF a, PointF b) {
   return std::hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
 }
 
+PointF ConstrainShapeEnd(ShapeKind kind, PointF start, PointF end, const RectF& canvas,
+                         bool shift) {
+  end.x = std::clamp(end.x, canvas.left, canvas.right);
+  end.y = std::clamp(end.y, canvas.top, canvas.bottom);
+  if (!shift) return end;
+  float dx = end.x - start.x;
+  float dy = end.y - start.y;
+  if (kind == ShapeKind::Rectangle || kind == ShapeKind::Ellipse) {
+    const float side = std::max(std::abs(dx), std::abs(dy));
+    dx = std::copysign(side, dx);
+    dy = std::copysign(side, dy);
+  } else {
+    constexpr float step = 3.14159265358979323846f / 12.0f;
+    const float length = std::hypot(dx, dy);
+    const float angle = std::round(std::atan2(dy, dx) / step) * step;
+    dx = std::cos(angle) * length;
+    dy = std::sin(angle) * length;
+    if (std::abs(dx) < 0.0001f) dx = 0.0f;
+    if (std::abs(dy) < 0.0001f) dy = 0.0f;
+  }
+  // Shorten along the constrained direction at a canvas edge so clipping does
+  // not turn a circle into an ellipse or undo an angle snap.
+  float scale = 1.0f;
+  if (dx > 0) scale = std::min(scale, (canvas.right - start.x) / dx);
+  if (dx < 0) scale = std::min(scale, (canvas.left - start.x) / dx);
+  if (dy > 0) scale = std::min(scale, (canvas.bottom - start.y) / dy);
+  if (dy < 0) scale = std::min(scale, (canvas.top - start.y) / dy);
+  return {std::clamp(start.x + dx * scale, canvas.left, canvas.right),
+          std::clamp(start.y + dy * scale, canvas.top, canvas.bottom)};
+}
+
 float PenWidthScaleForSpeed(float pixelsPerSecond) {
   // Slow movement deposits a wider stroke while quick movement produces a lighter line. The
   // square-root response keeps normal handwriting in the expressive part of the curve.

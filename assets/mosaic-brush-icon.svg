@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <title>马赛克画笔</title>
+  <g fill="currentColor" stroke="none">
+    <rect x="3.5" y="5.5" width="3.5" height="3.5" rx=".6"/>
+    <rect x="8.75" y="5.5" width="2.75" height="2.75" rx=".5"/>
+    <rect x="3.5" y="10.5" width="2.75" height="2.75" rx=".5"/>
+  </g>
+  <path d="m8 13.25 2.75-.75L18 5.25l2.5 2.5L13.25 15l-1.75 2.75L8.5 19H5l1.75-2.5Z"/>
+  <path d="m10.75 12.5 2.5 2.5"/>
+</svg>

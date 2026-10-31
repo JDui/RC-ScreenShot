@@ -103,19 +103,22 @@ class CaptureOverlay {
   void BeginEditGesture(POINT point);
   void ContinueEditGesture(POINT point);
   void EndEditGesture(POINT point);
+  void RefreshShapeConstraint();
   void SelectTool(Tool tool);
   void Complete(CaptureCompletion completion);
   void Cancel();
   void DrawDocument();
   bool DrawMosaicLayer(std::span<const EditCommand> commands);
   enum class SelectionAdjustment {
-    None, Move, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight
+    None, Move, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight,
+    StartPoint, EndPoint
   };
   SelectionAdjustment HitTestSelectionAdjustment(POINT point) const;
   SelectionAdjustment HitTestSelectionHandle(POINT point) const;
   void ContinueSelectionAdjustment(POINT point);
   void DrawSelectionHandles();
   void DrawCommandHandles();
+  void DrawCommandHandlesTransformed(D2D1_POINT_2F origin, float scale);
   void DrawToolIcon(Tool tool, const RECT& rect, bool active);
   void DrawActionIcon(bool save, const RECT& rect);
   void DrawToolbar();
@@ -316,6 +319,8 @@ class CaptureOverlay {
   std::optional<size_t> HitTestCommand(POINT point,
                                        std::optional<Tool> toolFilter = std::nullopt) const;
   SelectionAdjustment HitTestCommandAdjustment(POINT point) const;
+  SelectionAdjustment HitCommandAdjustment(PointF local, float scale) const;
+  bool ContinueLineAdjustment(PointF delta, const RectF& canvas);
   RectF SelectedCommandBounds() const;
   void ContinueCommandAdjustment(POINT point);
   void BeginTextInput(POINT point, std::optional<size_t> existingCommand = std::nullopt);

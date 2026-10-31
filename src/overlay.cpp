@@ -271,6 +271,12 @@ RectF Inflate(RectF bounds, float amount) {
   return {bounds.left - amount, bounds.top - amount, bounds.right + amount, bounds.bottom + amount};
 }
 
+const ShapeCommand* EndpointShape(const EditCommand* command) {
+  const auto* shape = command ? std::get_if<ShapeCommand>(command) : nullptr;
+  return shape && (shape->kind == ShapeKind::Line || shape->kind == ShapeKind::Arrow)
+             ? shape : nullptr;
+}
+
 RectF CommandBounds(const EditCommand& command) {
   if (const auto* pen = std::get_if<PenCommand>(&command)) {
     if (pen->points.empty()) return {};
@@ -434,13 +440,13 @@ void TransformCommand(EditCommand& command, const RectF& before, const RectF& af
 
 bool CommandMatchesTool(const EditCommand& command, Tool tool) {
   if (tool == Tool::Select) return true;
-  // Pen always draws new strokes. Existing ink is picked only by Select,
-  // including when returning to Pen with a command already selected.
-  if (tool == Tool::Pen) return false;
+  // Freehand tools always draw new strokes. Existing strokes are picked only
+  // by Select, including when returning with a command already selected.
+  if (tool == Tool::Pen || tool == Tool::MosaicBrush) return false;
   if (tool == Tool::Text) return std::holds_alternative<TextCommand>(command);
-  if (tool == Tool::MosaicBrush || tool == Tool::MosaicRectangle) {
+  if (tool == Tool::MosaicRectangle) {
     const auto* mosaic = std::get_if<MosaicCommand>(&command);
-    return mosaic && mosaic->brush == (tool == Tool::MosaicBrush);
+    return mosaic && !mosaic->brush;
   }
   const auto* shape = std::get_if<ShapeCommand>(&command);
   if (!shape) return false;
@@ -1078,6 +1084,7 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
     case WM_KEYDOWN: {
       const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+      if (wParam == VK_SHIFT) { RefreshShapeConstraint(); return 0; }
       if (wParam == VK_ESCAPE) { HandleEscape(); return 0; }
       if (scrollCapturing_) {
         // Enter ends the live preview and completes with the default action.
@@ -1187,6 +1194,9 @@ LRESULT CaptureOverlay::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam
       }
       return 0;
     }
+    case WM_KEYUP:
+      if (wParam == VK_SHIFT) RefreshShapeConstraint();
+      return 0;
     case WM_DESTROY: hwnd_ = nullptr; return 0;
   }
   return DefWindowProcW(hwnd_, message, wParam, lParam);
@@ -2689,9 +2699,8 @@ void CaptureOverlay::EndSelection(POINT point) {
 
 void CaptureOverlay::BeginEditGesture(POINT point) {
   if (tool_ == Tool::Select) {
-    const PointF local = ToSelectionPoint(point);
     std::optional<size_t> hit = HitTestCommand(point);
-    if (selectedCommand_ && NearRect(SelectedCommandBounds(), local, 10.0f)) hit = selectedCommand_;
+    if (HitTestCommandAdjustment(point) != SelectionAdjustment::None) hit = selectedCommand_;
     if (hit) {
       selectedCommand_ = *hit;
       commandAdjustment_ = HitTestCommandAdjustment(point);
@@ -2722,19 +2731,23 @@ void CaptureOverlay::BeginEditGesture(POINT point) {
   const SelectionAdjustment selectionHandle = tool_ == Tool::Select
       ? SelectionAdjustment::None
       : HitTestSelectionHandle(point);
-  if (selectionHandle != SelectionAdjustment::None) {
+  const EditCommand* selected = selectedCommand_ ? document_.At(*selectedCommand_) : nullptr;
+  const SelectionAdjustment commandHandle = selected && EndpointShape(selected) &&
+      CommandMatchesTool(*selected, tool_) ? HitTestCommandAdjustment(point) : SelectionAdjustment::None;
+  const bool endpointHandle = commandHandle == SelectionAdjustment::StartPoint ||
+                              commandHandle == SelectionAdjustment::EndPoint;
+  if (selectionHandle != SelectionAdjustment::None && !endpointHandle) {
     selectionAdjustment_ = selectionHandle;
     drawing_ = true; dragStart_ = point; currentPoint_ = point;
     selectionBeforeAdjust_ = selection_; SetCapture(hwnd_);
     return;
   }
-  if (!Contains(selection_, point) || tool_ == Tool::Frame) return;
+  if ((!Contains(selection_, point) && !endpointHandle) || tool_ == Tool::Frame) return;
   const PointF local = ToSelectionPoint(point);
   std::optional<size_t> hit = HitTestCommand(point, tool_);
   if (selectedCommand_) {
-    const EditCommand* selected = document_.At(*selectedCommand_);
     if (selected && CommandMatchesTool(*selected, tool_) &&
-        NearRect(SelectedCommandBounds(), local, 10.0f)) hit = selectedCommand_;
+        HitTestCommandAdjustment(point) != SelectionAdjustment::None) hit = selectedCommand_;
   }
   if (tool_ == Tool::Text && textPlacementReleasePending_ && !hit) {
     selectedCommand_.reset();
@@ -2818,8 +2831,12 @@ void CaptureOverlay::ContinueEditGesture(POINT point) {
       pen->widthScales.push_back(penWidthScale_);
       penLastSampleTime_ = now;
     }
-  } else if (auto* shape = std::get_if<ShapeCommand>(&*previewCommand_)) shape->end = local;
-  else if (auto* mosaic = std::get_if<MosaicCommand>(&*previewCommand_)) {
+  } else if (auto* shape = std::get_if<ShapeCommand>(&*previewCommand_)) {
+    shape->end = ConstrainShapeEnd(shape->kind, shape->start, local,
+        {0.0f, 0.0f, static_cast<float>(selection_.right - selection_.left),
+         static_cast<float>(selection_.bottom - selection_.top)},
+        (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+  } else if (auto* mosaic = std::get_if<MosaicCommand>(&*previewCommand_)) {
     if (mosaic->brush) mosaic->points.push_back(local);
     else mosaic->bounds = NormalizeRect({static_cast<float>(dragStart_.x - selection_.left), static_cast<float>(dragStart_.y - selection_.top)}, local);
   }
@@ -2840,6 +2857,16 @@ void CaptureOverlay::EndEditGesture(POINT point) {
   }
   if (previewCommand_) document_.Add(std::move(*previewCommand_));
   previewCommand_.reset(); InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CaptureOverlay::RefreshShapeConstraint() {
+  if (!drawing_) return;
+  const bool shapePreview = previewCommand_ && std::holds_alternative<ShapeCommand>(*previewCommand_);
+  if (!shapePreview && commandAdjustment_ != SelectionAdjustment::StartPoint &&
+      commandAdjustment_ != SelectionAdjustment::EndPoint) return;
+  if (longPreview_) LongPreviewGestureMove(currentPoint_);
+  else ContinueEditGesture(currentPoint_);
+  InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void CaptureOverlay::SelectTool(Tool tool) {
@@ -3750,10 +3777,23 @@ RectF CaptureOverlay::SelectedCommandBounds() const {
 }
 
 CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestCommandAdjustment(POINT point) const {
+  return HitCommandAdjustment(ToSelectionPoint(point), 1.0f);
+}
+
+CaptureOverlay::SelectionAdjustment CaptureOverlay::HitCommandAdjustment(PointF local, float scale) const {
   if (!selectedCommand_) return SelectionAdjustment::None;
+  const EditCommand* command = document_.At(*selectedCommand_);
+  if (const auto* shape = EndpointShape(command)) {
+    const float radius = 9.0f / std::max(0.001f, scale);
+    const float startDistance = std::hypot(local.x - shape->start.x, local.y - shape->start.y);
+    const float endDistance = std::hypot(local.x - shape->end.x, local.y - shape->end.y);
+    if (std::min(startDistance, endDistance) <= radius)
+      return startDistance <= endDistance ? SelectionAdjustment::StartPoint : SelectionAdjustment::EndPoint;
+    return HitCommandGeometry(*command, local)
+               ? SelectionAdjustment::Move : SelectionAdjustment::None;
+  }
   const RectF bounds = SelectedCommandBounds();
   if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return SelectionAdjustment::None;
-  const PointF local = ToSelectionPoint(point);
   // Corners keep a generous grab area, but edge bands stay tight (and shrink
   // with small annotations) so most of the interior still starts a move
   // instead of an accidental resize.
@@ -3778,10 +3818,37 @@ CaptureOverlay::SelectionAdjustment CaptureOverlay::HitTestCommandAdjustment(POI
   return Contains(bounds, local) ? SelectionAdjustment::Move : SelectionAdjustment::None;
 }
 
+bool CaptureOverlay::ContinueLineAdjustment(PointF delta, const RectF& canvas) {
+  if (!selectedCommand_ || !commandBeforeAdjust_ || !EndpointShape(&*commandBeforeAdjust_)) return false;
+  EditCommand updated = *commandBeforeAdjust_;
+  auto& shape = std::get<ShapeCommand>(updated);
+  if (commandAdjustment_ == SelectionAdjustment::Move) {
+    // Clamp the endpoints themselves: stroke padding can make the bounding
+    // box wider than the canvas for an edge-to-edge line.
+    const RectF bounds = NormalizeRect(shape.start, shape.end);
+    delta.x = std::clamp(delta.x, canvas.left - bounds.left, canvas.right - bounds.right);
+    delta.y = std::clamp(delta.y, canvas.top - bounds.top, canvas.bottom - bounds.bottom);
+    shape.start.x += delta.x; shape.start.y += delta.y;
+    shape.end.x += delta.x; shape.end.y += delta.y;
+  } else if (commandAdjustment_ == SelectionAdjustment::StartPoint ||
+             commandAdjustment_ == SelectionAdjustment::EndPoint) {
+    const bool atStart = commandAdjustment_ == SelectionAdjustment::StartPoint;
+    PointF& moving = atStart ? shape.start : shape.end;
+    const PointF fixed = atStart ? shape.end : shape.start;
+    moving = ConstrainShapeEnd(shape.kind, fixed, {moving.x + delta.x, moving.y + delta.y},
+                              canvas, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+  } else return false;
+  document_.Replace(*selectedCommand_, std::move(updated));
+  return true;
+}
+
 void CaptureOverlay::ContinueCommandAdjustment(POINT point) {
   if (!selectedCommand_ || !commandBeforeAdjust_) return;
   const int dx = point.x - dragStart_.x;
   const int dy = point.y - dragStart_.y;
+  if (ContinueLineAdjustment({static_cast<float>(dx), static_cast<float>(dy)},
+        {0.0f, 0.0f, static_cast<float>(selection_.right - selection_.left),
+         static_cast<float>(selection_.bottom - selection_.top)})) return;
   RectF next = selectedCommandBeforeBounds_;
   const bool left = commandAdjustment_ == SelectionAdjustment::Left ||
                     commandAdjustment_ == SelectionAdjustment::TopLeft ||
@@ -3871,16 +3938,32 @@ void CaptureOverlay::DrawSelectionHandles() {
 }
 
 void CaptureOverlay::DrawCommandHandles() {
+  DrawCommandHandlesTransformed(
+      {static_cast<float>(selection_.left), static_cast<float>(selection_.top)}, 1.0f);
+}
+
+void CaptureOverlay::DrawCommandHandlesTransformed(D2D1_POINT_2F origin, float scale) {
   const RectF bounds = SelectedCommandBounds();
   if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
-  const RECT screenBounds{
-      static_cast<LONG>(std::lround(selection_.left + bounds.left)),
-      static_cast<LONG>(std::lround(selection_.top + bounds.top)),
-      static_cast<LONG>(std::lround(selection_.left + bounds.right)),
-      static_cast<LONG>(std::lround(selection_.top + bounds.bottom))};
+  const D2D1_RECT_F screenBounds{
+      origin.x + bounds.left * scale, origin.y + bounds.top * scale,
+      origin.x + bounds.right * scale, origin.y + bounds.bottom * scale};
   ComPtr<ID2D1SolidColorBrush> border, fill;
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.20f, .75f, 1.0f, .95f), &border);
   renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.95f, .98f, 1.0f, 1.0f), &fill);
+  const auto drawHandle = [&](D2D1_POINT_2F point) {
+    const D2D1_RECT_F handle = D2D1::RectF(point.x - 4.0f, point.y - 4.0f,
+                                         point.x + 4.0f, point.y + 4.0f);
+    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), fill.Get());
+    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), border.Get(), 1.0f);
+  };
+  if (selectedCommand_) {
+    if (const auto* shape = EndpointShape(document_.At(*selectedCommand_))) {
+      drawHandle({origin.x + shape->start.x * scale, origin.y + shape->start.y * scale});
+      drawHandle({origin.x + shape->end.x * scale, origin.y + shape->end.y * scale});
+      return;
+    }
+  }
   ComPtr<ID2D1StrokeStyle> dashed;
   if (d2dFactory_) {
     d2dFactory_->CreateStrokeStyle(
@@ -3888,8 +3971,8 @@ void CaptureOverlay::DrawCommandHandles() {
                                     D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER,
                                     10.0f, D2D1_DASH_STYLE_DASH, 0.0f), nullptr, 0, &dashed);
   }
-  renderTarget_->DrawRectangle(ToD2D(screenBounds), border.Get(), 1.5f, dashed.Get());
-  const std::array<POINT, 8> points{{
+  renderTarget_->DrawRectangle(screenBounds, border.Get(), 1.5f, dashed.Get());
+  const std::array<D2D1_POINT_2F, 8> points{{
       {screenBounds.left, screenBounds.top},
       {(screenBounds.left + screenBounds.right) / 2, screenBounds.top},
       {screenBounds.right, screenBounds.top},
@@ -3898,14 +3981,7 @@ void CaptureOverlay::DrawCommandHandles() {
       {(screenBounds.left + screenBounds.right) / 2, screenBounds.bottom},
       {screenBounds.left, screenBounds.bottom},
       {screenBounds.left, (screenBounds.top + screenBounds.bottom) / 2}}};
-  for (const POINT point : points) {
-    const D2D1_RECT_F handle = D2D1::RectF(static_cast<float>(point.x - 4),
-                                           static_cast<float>(point.y - 4),
-                                           static_cast<float>(point.x + 4),
-                                           static_cast<float>(point.y + 4));
-    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), fill.Get());
-    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), border.Get(), 1.0f);
-  }
+  for (const D2D1_POINT_2F point : points) drawHandle(point);
 }
 
 void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
@@ -3942,25 +4018,34 @@ void CaptureOverlay::DrawToolIcon(Tool tool, const RECT& rect, bool active) {
       pen.Line(18.5f, 5.5f, 18.5f, 13, 1.9f);
       break;
     case Tool::Text:
-      // Plain T; the double underline made it read as a Chinese radical.
-      pen.Line(5, 6.5f, 19, 6.5f, 2.0f);
-      pen.Line(12, 6.5f, 12, 18, 2.0f);
-      pen.Line(9, 18, 15, 18, 1.6f);
+      // T with an insertion caret; see assets/text-tool-icon.svg.
+      pen.Poly({{4.5f, 8}, {4.5f, 5.5f}, {15.5f, 5.5f}, {15.5f, 8}}, 1.8f);
+      pen.Line(10, 5.5f, 10, 18.5f, 1.8f);
+      pen.Line(7, 18.5f, 13, 18.5f, 1.8f);
+      pen.Line(19.5f, 9, 19.5f, 18.5f, 1.55f);
+      pen.Line(18, 9, 21, 9, 1.55f);
+      pen.Line(18, 18.5f, 21, 18.5f, 1.55f);
       break;
     case Tool::MosaicBrush:
-      // Two pixel cells, a solid cell, and a diagonal brush handle.
-      pen.RoundedRect(4.5f, 4.5f, 10.3f, 10.3f, 1.1f, 1.25f);
-      pen.RoundedRect(11.4f, 4.5f, 17.2f, 10.3f, 1.1f, 1.25f);
-      pen.RoundedRect(4.5f, 11.4f, 10.3f, 17.2f, 1.1f, 1.25f);
-      pen.Dot(14.3f, 14.3f, 2.1f);
-      pen.Line(13.2f, 15.6f, 7.4f, 20.6f, 2.3f);
+      // A brush silhouette beside pixels; see assets/mosaic-brush-icon.svg.
+      pen.FillRoundedRect(3.5f, 5.5f, 7, 9, .6f);
+      pen.FillRoundedRect(8.75f, 5.5f, 11.5f, 8.25f, .5f);
+      pen.FillRoundedRect(3.5f, 10.5f, 6.25f, 13.25f, .5f);
+      pen.Poly({{8, 13.25f}, {10.75f, 12.5f}, {18, 5.25f}, {20.5f, 7.75f},
+                {13.25f, 15}, {11.5f, 17.75f}, {8.5f, 19}, {5, 19}, {6.75f, 16.5f}},
+               1.7f, true);
+      pen.Line(10.75f, 12.5f, 13.25f, 15, 1.7f);
       break;
     case Tool::MosaicRectangle:
-      pen.RoundedRect(4.5f, 5, 19.5f, 19, 2.0f, 1.45f);
-      pen.RoundedRect(7.2f, 7.9f, 10.8f, 11.5f, .8f, 1.0f);
-      pen.RoundedRect(13.2f, 7.9f, 16.8f, 11.5f, .8f, 1.0f);
-      pen.RoundedRect(7.2f, 12.7f, 10.8f, 16.3f, .8f, 1.0f);
-      pen.RoundedRect(13.2f, 12.7f, 16.8f, 16.3f, .8f, 1.0f);
+      // Open selection corners around pixels; see assets/mosaic-rectangle-icon.svg.
+      pen.Poly({{4, 8}, {4, 4}, {8, 4}}, 1.7f);
+      pen.Poly({{16, 4}, {20, 4}, {20, 8}}, 1.7f);
+      pen.Poly({{20, 16}, {20, 20}, {16, 20}}, 1.7f);
+      pen.Poly({{8, 20}, {4, 20}, {4, 16}}, 1.7f);
+      pen.FillRoundedRect(7.5f, 7.5f, 11, 11, .6f);
+      pen.FillRoundedRect(13, 7.5f, 16.5f, 11, .6f);
+      pen.FillRoundedRect(7.5f, 13, 11, 16.5f, .6f);
+      pen.FillRoundedRect(13, 13, 16.5f, 16.5f, .6f);
       break;
     case Tool::Select:
       // A single clean pointer polygon (the marching dots vanished at 16px).
@@ -6259,28 +6344,7 @@ std::optional<size_t> CaptureOverlay::HitLongCommand(PointF image, Tool toolFilt
 }
 
 CaptureOverlay::SelectionAdjustment CaptureOverlay::HitLongCommandAdjustment(PointF image) const {
-  if (!selectedCommand_) return SelectionAdjustment::None;
-  const RectF bounds = SelectedCommandBounds();
-  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return SelectionAdjustment::None;
-  const float minimum = std::min(bounds.right - bounds.left, bounds.bottom - bounds.top);
-  const float cornerRadius = std::clamp(minimum * 0.28f, 2.5f, 9.0f);
-  const float edgeRadius = std::clamp(minimum * 0.16f, 2.0f, 4.0f);
-  const auto isNearCommand = [&](float x, float y, float radius) {
-    return std::abs(image.x - x) <= radius && std::abs(image.y - y) <= radius;
-  };
-  if (isNearCommand(bounds.left, bounds.top, cornerRadius)) return SelectionAdjustment::TopLeft;
-  if (isNearCommand(bounds.right, bounds.top, cornerRadius)) return SelectionAdjustment::TopRight;
-  if (isNearCommand(bounds.left, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomLeft;
-  if (isNearCommand(bounds.right, bounds.bottom, cornerRadius)) return SelectionAdjustment::BottomRight;
-  if (std::abs(image.x - bounds.left) <= edgeRadius && image.y >= bounds.top && image.y <= bounds.bottom)
-    return SelectionAdjustment::Left;
-  if (std::abs(image.x - bounds.right) <= edgeRadius && image.y >= bounds.top && image.y <= bounds.bottom)
-    return SelectionAdjustment::Right;
-  if (std::abs(image.y - bounds.top) <= edgeRadius && image.x >= bounds.left && image.x <= bounds.right)
-    return SelectionAdjustment::Top;
-  if (std::abs(image.y - bounds.bottom) <= edgeRadius && image.x >= bounds.left && image.x <= bounds.right)
-    return SelectionAdjustment::Bottom;
-  return Contains(bounds, image) ? SelectionAdjustment::Move : SelectionAdjustment::None;
+  return HitCommandAdjustment(image, LongPreviewScale());
 }
 
 void CaptureOverlay::ContinueLongCommandAdjustment(POINT point) {
@@ -6288,6 +6352,9 @@ void CaptureOverlay::ContinueLongCommandAdjustment(POINT point) {
   const PointF image = LongPreviewToImage(point);
   const float dx = image.x - longPreviewDragStart_.x;
   const float dy = image.y - longPreviewDragStart_.y;
+  if (ContinueLineAdjustment({dx, dy},
+        {0.0f, 0.0f, static_cast<float>(longCaptureResult_->width),
+         static_cast<float>(longCaptureResult_->height)})) return;
   RectF next = selectedCommandBeforeBounds_;
   const bool left = commandAdjustment_ == SelectionAdjustment::Left ||
                     commandAdjustment_ == SelectionAdjustment::TopLeft ||
@@ -6326,39 +6393,7 @@ void CaptureOverlay::ContinueLongCommandAdjustment(POINT point) {
 }
 
 void CaptureOverlay::DrawLongCommandHandles() {
-  const RectF bounds = SelectedCommandBounds();
-  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
-  const float scale = LongPreviewScale();
-  const D2D1_POINT_2F origin = LongPreviewImageOrigin();
-  const D2D1_RECT_F screenBounds{
-      origin.x + bounds.left * scale, origin.y + bounds.top * scale,
-      origin.x + bounds.right * scale, origin.y + bounds.bottom * scale};
-  ComPtr<ID2D1SolidColorBrush> border, fill;
-  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.20f, .75f, 1.0f, .95f), &border);
-  renderTarget_->CreateSolidColorBrush(D2D1::ColorF(.95f, .98f, 1.0f, 1.0f), &fill);
-  ComPtr<ID2D1StrokeStyle> dashed;
-  if (d2dFactory_) {
-    d2dFactory_->CreateStrokeStyle(
-        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
-                                    D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER,
-                                    10.0f, D2D1_DASH_STYLE_DASH, 0.0f), nullptr, 0, &dashed);
-  }
-  renderTarget_->DrawRectangle(screenBounds, border.Get(), 1.5f, dashed.Get());
-  const std::array<D2D1_POINT_2F, 8> points{{
-      {screenBounds.left, screenBounds.top},
-      {(screenBounds.left + screenBounds.right) / 2, screenBounds.top},
-      {screenBounds.right, screenBounds.top},
-      {screenBounds.right, (screenBounds.top + screenBounds.bottom) / 2},
-      {screenBounds.right, screenBounds.bottom},
-      {(screenBounds.left + screenBounds.right) / 2, screenBounds.bottom},
-      {screenBounds.left, screenBounds.bottom},
-      {screenBounds.left, (screenBounds.top + screenBounds.bottom) / 2}}};
-  for (const D2D1_POINT_2F point : points) {
-    const D2D1_RECT_F handle = D2D1::RectF(point.x - 4.0f, point.y - 4.0f,
-                                           point.x + 4.0f, point.y + 4.0f);
-    renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), fill.Get());
-    renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(handle, 2, 2), border.Get(), 1.0f);
-  }
+  DrawCommandHandlesTransformed(LongPreviewImageOrigin(), LongPreviewScale());
 }
 
 void CaptureOverlay::BeginLongCrop() {
@@ -6589,10 +6624,10 @@ void CaptureOverlay::LongPreviewGestureStart(POINT point) {
 
   const Tool hitFilter = longPreviewTool_ == Tool::Select ? Tool::Select : longPreviewTool_;
   std::optional<size_t> hit = HitLongCommand(image, hitFilter);
-  if (!hit && selectedCommand_) {
+  if (selectedCommand_) {
     const EditCommand* selected = document_.At(*selectedCommand_);
     if (selected && CommandMatchesTool(*selected, hitFilter) &&
-        NearRect(CommandBounds(*selected), image, 10.0f)) hit = selectedCommand_;
+        HitLongCommandAdjustment(image) != SelectionAdjustment::None) hit = selectedCommand_;
   }
 
   if (longPreviewTool_ == Tool::Text && textPlacementReleasePending_ && !hit) {
@@ -6704,7 +6739,10 @@ void CaptureOverlay::LongPreviewGestureMove(POINT point) {
         penLastSampleTime_ = now;
       }
     } else if (auto* shape = std::get_if<ShapeCommand>(&*previewCommand_)) {
-      shape->end = local;
+      shape->end = ConstrainShapeEnd(shape->kind, shape->start, local,
+          {0.0f, 0.0f, static_cast<float>(longCaptureResult_->width),
+           static_cast<float>(longCaptureResult_->height)},
+          (GetKeyState(VK_SHIFT) & 0x8000) != 0);
     } else if (auto* mosaic = std::get_if<MosaicCommand>(&*previewCommand_)) {
       if (mosaic->brush) mosaic->points.push_back(local);
       else mosaic->bounds = NormalizeRect(longPreviewDragStart_, local);
@@ -6764,6 +6802,7 @@ void CaptureOverlay::LongPreviewGestureMove(POINT point) {
 void CaptureOverlay::LongPreviewGestureEnd(POINT point) {
   if (longPreviewDrag_ == LongPreviewDrag::None) return;
   if (longPreviewDrag_ == LongPreviewDrag::CommandAdjust) {
+    LongPreviewGestureMove(point);
     // Moving/scaling a mosaic must re-bake its pixels from the pristine base.
     if (selectedCommand_) {
       const EditCommand* command = document_.At(*selectedCommand_);

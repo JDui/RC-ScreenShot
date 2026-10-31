@@ -95,6 +95,9 @@ class EditorDocument {
 RectF NormalizeRect(PointF a, PointF b);
 bool Contains(const RectF& rect, PointF point);
 float DistanceToSegment(PointF point, PointF a, PointF b);
+// Clamp a drag to the canvas; Shift keeps equal sides or snaps to 15-degree angles.
+PointF ConstrainShapeEnd(ShapeKind kind, PointF start, PointF end, const RectF& canvas,
+                         bool shift);
 float PenWidthScaleForSpeed(float pixelsPerSecond);
 float PenPointWidth(const PenCommand& command, size_t index);
 float PenMaximumWidth(const PenCommand& command);
